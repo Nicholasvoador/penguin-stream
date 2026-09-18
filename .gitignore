@@ -1,0 +1,8 @@
+node_modules/
+media/build/
+artifacts/*.log
+artifacts/*.raw
+artifacts/*.h264
+artifacts/*.mp4
+*.tmp
+.venv/

@@ -1,0 +1,27 @@
+{
+  "name": "penguin-stream",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Low-friction peer-to-peer remote desktop with CGNAT relay fallback",
+  "bin": {
+    "penguin-stream": "./node/src/cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test node/test/",
+    "test:unit": "node --test node/test/unit/",
+    "test:integration": "node --test --test-timeout=120000 node/test/integration/",
+    "host": "node node/src/cli.mjs host",
+    "connect": "node node/src/cli.mjs connect",
+    "rendezvous": "node node/src/cli.mjs rendezvous",
+    "turn": "node turn/src/server.mjs"
+  },
+  "dependencies": {
+    "node-datachannel": "^0.33.4",
+    "ws": "^8.21.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
