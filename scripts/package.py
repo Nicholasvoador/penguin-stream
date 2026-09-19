@@ -6,7 +6,7 @@ root = Path(__file__).resolve().parents[1]
 files = []
 for folder in ['node/src', 'node/test', 'media/src', 'turn/src', 'scripts', 'docs', 'tests']:
     files.extend(p for p in (root/folder).rglob('*') if p.is_file() and not p.is_symlink() and 'artifacts' not in p.parts and p.suffix in {'.sh','.mjs','.js','.html','.css','.cpp','.h','.py','.md','.ps1'})
-for name in ['README.md','SECURITY.md','LIMITATIONS.md','LICENSE','THIRD-PARTY.md','package.json','package-lock.json','media/CMakeLists.txt','penguin-stream.bat']:
+for name in ['README.md','SECURITY.md','LIMITATIONS.md','LICENSE','THIRD-PARTY.md','package.json','package-lock.json','media/CMakeLists.txt','penguin-stream','penguin-stream.bat','setup.sh']:
     p = root/name
     if not p.is_file() or p.is_symlink(): raise SystemExit(f'Missing or unsafe file: {name}')
     files.append(p)
@@ -21,7 +21,7 @@ with tarfile.open(out,'w') as tar:
     for name,data in sorted(items.items()):
         entry=tarfile.TarInfo('penguin-stream/'+name)
         entry.size=len(data); entry.mtime=0
-        entry.mode=0o755 if name in ['media/build/ps-media','scripts/package.py'] else 0o644
+        entry.mode=0o755 if name in ['media/build/ps-media','scripts/package.py','setup.sh','penguin-stream'] else 0o644
         tar.addfile(entry,io.BytesIO(data))
 with tarfile.open(out) as tar:
     for member in tar.getmembers():

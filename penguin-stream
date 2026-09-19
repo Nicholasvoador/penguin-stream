@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#
+# Penguin Stream - Desktop Remote Streaming Launcher
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if [ ! -d "node_modules" ] || [ ! -f "media/build/ps-media" ]; then
+  echo "[INFO] Running first-time setup..."
+  ./setup.sh
+fi
+
+if [ $# -eq 0 ]; then
+  exec node node/src/cli.mjs ui
+else
+  exec node node/src/cli.mjs "$@"
+fi

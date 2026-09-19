@@ -8,6 +8,22 @@
  */
 
 import { WebSocket } from 'ws';
+import os from 'node:os';
+import { startRendezvous } from './server.mjs';
+
+function getLocalIp() {
+  try {
+    const ifaces = os.networkInterfaces();
+    for (const name of Object.keys(ifaces)) {
+      for (const iface of ifaces[name]) {
+        if (iface.family === 'IPv4' && !iface.internal) {
+          return iface.address;
+        }
+      }
+    }
+  } catch { /* fallback */ }
+  return '127.0.0.1';
+}
 
 import {
   generateShareCode, normalizeShareCode, roomIdFor,
@@ -42,7 +58,27 @@ async function run({
   const room = roomIdFor(canonical);
   const prologue = noisePrologue(canonical);
 
-  const ws = await openSocket(rendezvousUrl);
+  let ws;
+  let embeddedRendezvous = null;
+  const isLoopback = rendezvousUrl.includes('127.0.0.1') || rendezvousUrl.includes('localhost');
+
+  try {
+    ws = await openSocket(rendezvousUrl);
+  } catch (err) {
+    if (role === 'host' && isLoopback) {
+      try {
+        const u = new URL(rendezvousUrl);
+        const port = u.port ? Number(u.port) : 8787;
+        embeddedRendezvous = await startRendezvous({ port, host: '0.0.0.0' });
+        ws = await openSocket(`ws://127.0.0.1:${embeddedRendezvous.port}`);
+      } catch {
+        throw err;
+      }
+    } else {
+      throw err;
+    }
+  }
+
   const status = (s, detail) => onStatus?.(s, detail);
 
   const peer = new Peer({
@@ -76,6 +112,10 @@ async function run({
 
   const cleanup = () => {
     try { ws.close(); } catch { /* already closed */ }
+    if (embeddedRendezvous) {
+      try { void embeddedRendezvous.close(); } catch { /* ignore */ }
+      embeddedRendezvous = null;
+    }
     peer.close('session ended');
   };
 
@@ -151,7 +191,17 @@ async function run({
   });
 
   ws.send(JSON.stringify({ t: role === 'host' ? 'host' : 'join', room }));
-  if (role === 'host') onCode?.(canonical);
+  if (role === 'host') {
+    let inviteCode = canonical;
+    if (embeddedRendezvous) {
+      const lanIp = getLocalIp();
+      const port = embeddedRendezvous.port;
+      inviteCode = lanIp !== '127.0.0.1' ? `${canonical}@ws://${lanIp}:${port}` : `${canonical}@ws://127.0.0.1:${port}`;
+    } else if (!isLoopback) {
+      inviteCode = `${canonical}@${rendezvousUrl}`;
+    }
+    onCode?.(inviteCode);
+  }
 
   try {
     const info = await secure;

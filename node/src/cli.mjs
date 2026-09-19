@@ -65,7 +65,7 @@ async function cmdHost(args) {
   }
 
   const host = new Host({
-    rendezvousUrl: rendezvousUrl || DEFAULT_RENDEZVOUS,
+    rendezvousUrl: args.rendezvous || DEFAULT_RENDEZVOUS,
     source: args.source,
     fps: args.fps ? Number(args.fps) : undefined,
     bitrateKbps: args.bitrate ? Number(args.bitrate) : undefined,
@@ -160,7 +160,7 @@ async function cmdConnect(args) {
 
   const viewer = new Viewer({
     code,
-    rendezvousUrl: rendezvousUrl || DEFAULT_RENDEZVOUS,
+    rendezvousUrl: args.rendezvous || DEFAULT_RENDEZVOUS,
     forceRelay: Boolean(args['force-relay']),
     noInput: !args['allow-input'] || Boolean(args['no-input']),
     audio: Boolean(args.audio),
