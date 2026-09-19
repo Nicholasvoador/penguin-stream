@@ -78,6 +78,7 @@ async function cmdHost(args) {
     sessionTimeoutMs: args.timeout ? Number(args.timeout) * 1000 : undefined,
   });
 
+  let lastPrinted = 0;
   host.on('code', (code) => {
     console.log();
     banner(`Share code:  ${code}`);
@@ -88,15 +89,27 @@ async function cmdHost(args) {
   host.on('log', (m) => console.log(`${c.dim}  ${m}${c.reset}`));
   host.on('error', (e) => console.error(`${c.red}error: ${e.message}${c.reset}`));
 
+  let lastHostStats = null;
   host.on('stats', (s) => {
-    if (!process.stdout.isTTY) return;
+    lastHostStats = s;
     const fps = Number(s.fps || 0).toFixed(1);
     const kbps = Number(s.kbps || 0).toFixed(0);
-    process.stdout.write(`\r${c.dim}  streaming: ${fps} fps, ${kbps} kbps, ${s.framesSent} frames sent${c.reset}   `);
+    const line = `streaming: ${fps} fps, ${kbps} kbps, ${s.framesSent} frames sent`;
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r${c.dim}  ${line}${c.reset}   `);
+    } else if (Date.now() - lastPrinted > 10_000) {
+      // Redirected to a log: periodic lines instead of a rewritten one.
+      lastPrinted = Date.now();
+      console.log(`  ${line}`);
+    }
   });
 
   host.on('closed', (reason) => {
-    console.log(`\n${c.yellow}session ended: ${reason}${c.reset}`);
+    if (lastHostStats) {
+      console.log(`\n  session summary: ${lastHostStats.framesSent} frames sent, ` +
+        `${((lastHostStats.bytesSent || 0) / 1e6).toFixed(1)} MB encoded`);
+    }
+    console.log(`${c.yellow}session ended: ${reason}${c.reset}`);
     cleanupTransport();
     process.exit(0);
   });
@@ -166,13 +179,27 @@ async function cmdConnect(args) {
     console.log(`${c.dim}  stream: ${cfg.width}x${cfg.height} ${cfg.codec}, host encoder ${cfg.encoder}${c.reset}`);
     console.log(`${c.dim}  press Ctrl+Shift+Q in the window to disconnect${c.reset}`);
   });
+  let lastViewerStats = null;
+  let lastViewerPrint = 0;
   viewer.on('stats', (s) => {
-    if (!process.stdout.isTTY) return;
-    process.stdout.write(`\r${c.dim}  ${s.framesShown} frames, ${(s.bytesReceived / 1e6).toFixed(1)} MB${c.reset}   `);
+    lastViewerStats = s;
+    const line = `${s.framesShown} frames, ${(s.bytesReceived / 1e6).toFixed(1)} MB` +
+      (s.dropped ? `, ${s.dropped} dropped` : '');
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r${c.dim}  ${line}${c.reset}   `);
+    } else if (Date.now() - lastViewerPrint > 10_000) {
+      lastViewerPrint = Date.now();
+      console.log(`  ${line}`);
+    }
   });
   viewer.on('error', (e) => console.error(`${c.red}error: ${e.message}${c.reset}`));
   viewer.on('closed', (reason) => {
-    console.log(`\n${c.yellow}disconnected: ${reason}${c.reset}`);
+    if (lastViewerStats) {
+      console.log(`\n  session summary: ${lastViewerStats.framesShown} frames decoded, ` +
+        `${(lastViewerStats.bytesReceived / 1e6).toFixed(1)} MB received` +
+        (lastViewerStats.dropped ? `, ${lastViewerStats.dropped} frames dropped` : ''));
+    }
+    console.log(`${c.yellow}disconnected: ${reason}${c.reset}`);
     cleanupTransport();
     process.exit(0);
   });
