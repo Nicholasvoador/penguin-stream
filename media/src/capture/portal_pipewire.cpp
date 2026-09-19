@@ -225,10 +225,12 @@ class PortalSource : public CaptureSource {
     if (nextDue_ > now) cv_.wait_until(lock, nextDue_, [&] { return !running_; });
     if (!running_) { error = captureError_.empty() ? "capture stopped" : captureError_; return false; }
     nextDue_ = std::chrono::steady_clock::now() + std::chrono::microseconds(1000000 / fps_);
-    if (frontBuffer_.empty()) { error = "no mapped compositor frame"; return false; }
-    frameReady_ = false;
-    // Own a consumer buffer until nextFrame; producer must never overwrite an encoder input.
-    consumerBuffer_ = frontBuffer_;
+    if (frontBuffer_.empty() && consumerBuffer_.empty()) { error = "no mapped compositor frame"; return false; }
+    if (frameReady_) {
+      // O(1) buffer swap: eliminates copying full-resolution frame (~15 MB) on every frame.
+      consumerBuffer_.swap(frontBuffer_);
+      frameReady_ = false;
+    }
     out.bgra = consumerBuffer_.data();
     out.stride = width_ * 4;
     out.width = width_;

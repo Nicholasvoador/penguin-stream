@@ -13,6 +13,7 @@
 import { EventEmitter } from 'node:events';
 
 import { hostSession, joinSession } from '../signal/client.mjs';
+import { parseInvitation } from '../signal/code.mjs';
 import { loadOrCreateIdentity, TrustStore, fingerprint } from '../crypto/identity.mjs';
 import { CHANNEL } from '../crypto/session.mjs';
 import { MAX_PAYLOAD } from '../transport/peer.mjs';
@@ -23,13 +24,27 @@ import { createInputValidator } from '../media/input.mjs';
 
 export const DEFAULT_RENDEZVOUS = process.env.PENGUIN_RENDEZVOUS || 'ws://127.0.0.1:8787';
 
+export const DEFAULT_STUN_SERVERS = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun1.l.google.com:19302',
+  'stun:stun2.l.google.com:19302',
+  'stun:stun.cloudflare.com:3478',
+];
+
 /** Builds the ICE server list from config/env. */
 export function resolveIceServers(opts = {}) {
   const servers = [];
   const stun = opts.stun ?? process.env.PENGUIN_STUN;
-  if (stun) {
+  if (stun === 'none' || stun === 'off' || stun === false || opts.noStun) {
+    // Explicitly disabled by user (offline LAN / air-gapped)
+  } else if (stun) {
     for (const s of String(stun).split(',').map((x) => x.trim()).filter(Boolean)) {
       servers.push({ urls: s.startsWith('stun:') ? s : `stun:${s}` });
+    }
+  } else {
+    // Default high-availability public STUN servers for direct P2P NAT traversal
+    for (const s of DEFAULT_STUN_SERVERS) {
+      servers.push({ urls: s });
     }
   }
   const turn = opts.turn ?? process.env.PENGUIN_TURN;
@@ -131,6 +146,12 @@ export class Host extends EventEmitter {
 
     this.engine.on('video', (v) => {
       if (peer.state !== 'secure') return;
+      // Low-latency pacing: if SCTP queue has built up (>128KB), drop intermediate
+      // non-keyframes immediately to prevent bufferbloat and latency buildup.
+      if (!v.keyframe && peer.bufferedAmount > 128 * 1024) {
+        this.stats.dropped++;
+        return;
+      }
       const chunks = this.chunker.split(v.data, { ptsUs: v.ptsUs, keyframe: v.keyframe });
       for (const chunk of chunks) {
         try {
@@ -262,9 +283,26 @@ export class Viewer extends EventEmitter {
       }
     });
 
+    let lastKeyframeReq = 0;
+    const requestKeyframeImmediate = () => {
+      const now = Date.now();
+      if (now - lastKeyframeReq > 100 && peer.state === 'secure') {
+        lastKeyframeReq = now;
+        try {
+          peer.sendControl({ t: 'keyframe-request' });
+          this.reassembler.acknowledgeKeyframe();
+        } catch { /* closing */ }
+      }
+    };
+
     peer.on('video', (payload) => {
       this.stats.bytesReceived += payload.length;
       const done = this.reassembler.push(payload);
+      // Fast recovery: if chunks were lost, request a fresh keyframe immediately (<100ms)
+      // rather than waiting for the 1-second background poll.
+      if (this.reassembler.needsKeyframe) {
+        requestKeyframeImmediate();
+      }
       if (!done) return;
       this.stats.framesShown++;
       this.engine.sendVideo({ ptsUs: done.ptsUs, keyframe: done.keyframe, frame: done.frame });

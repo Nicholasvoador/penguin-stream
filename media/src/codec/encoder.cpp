@@ -116,12 +116,17 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     ctx_->pix_fmt = AV_PIX_FMT_VAAPI;
     ctx_->hw_frames_ctx = av_buffer_ref(framesRef);
     av_buffer_unref(&framesRef);
+    // Pipeline depth 1 avoids multi-frame driver buffering.
+    av_opt_set_int(ctx_->priv_data, "async_depth", 1, 0);
+    av_opt_set_int(ctx_->priv_data, "b_depth", 1, 0);
   } else if (encoderName == "h264_nvenc") {
     ctx_->pix_fmt = AV_PIX_FMT_NV12;
     av_opt_set(ctx_->priv_data, "preset", "p1", 0);      // fastest
     av_opt_set(ctx_->priv_data, "tune", "ull", 0);       // ultra-low latency
     av_opt_set(ctx_->priv_data, "rc", "cbr", 0);
     av_opt_set(ctx_->priv_data, "delay", "0", 0);
+    av_opt_set(ctx_->priv_data, "zerolatency", "1", 0);
+    av_opt_set(ctx_->priv_data, "forced-idr", "1", 0);
   } else if (encoderName == "h264_qsv" || encoderName == "h264_amf") {
     ctx_->pix_fmt = AV_PIX_FMT_NV12;
     av_opt_set(ctx_->priv_data, "usage", "ultralowlatency", 0);
@@ -130,6 +135,7 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     av_opt_set(ctx_->priv_data, "preset", "ultrafast", 0);
     av_opt_set(ctx_->priv_data, "tune", "zerolatency", 0);
     av_opt_set(ctx_->priv_data, "profile", "baseline", 0);
+    av_opt_set(ctx_->priv_data, "x264-params", "no-mbtree=1:sync-lookahead=0:rc-lookahead=0:sliced-threads=1", 0);
   }
 
   int ret = avcodec_open2(ctx_, codec, nullptr);

@@ -12,7 +12,8 @@ import path from 'node:path';
 
 import { startRendezvous } from '../../src/signal/server.mjs';
 import { hostSession, joinSession } from '../../src/signal/client.mjs';
-import { generateShareCode, normalizeShareCode, roomIdFor, signalingKey, sealSignal, openSignal } from '../../src/signal/code.mjs';
+import { generateShareCode, normalizeShareCode, parseInvitation, roomIdFor, signalingKey, sealSignal, openSignal } from '../../src/signal/code.mjs';
+import { resolveIceServers, DEFAULT_STUN_SERVERS } from '../../src/app/session.mjs';
 import { loadOrCreateIdentity } from '../../src/crypto/identity.mjs';
 import { cleanupTransport, PeerState } from '../../src/transport/peer.mjs';
 import { CHANNEL } from '../../src/crypto/session.mjs';
@@ -204,6 +205,42 @@ test('rendezvous server never sees the share code or plaintext signaling', async
   let other = generateShareCode();
   while (other === code) other = generateShareCode();
   assert.throws(() => openSignal(signalingKey(other), payload));
+});
+
+test('parseInvitation extracts codes and optional embedded rendezvous URLs', () => {
+  const code = 'K7QA-3ZM2-K7QA-3ZM2-K7QA-3ZM2-K7QA-3ZM2';
+  // Bare code
+  assert.deepEqual(parseInvitation(code), { code, rendezvousUrl: undefined });
+  // With @ws://
+  assert.deepEqual(parseInvitation(`${code}@ws://192.168.1.50:8787`), {
+    code,
+    rendezvousUrl: 'ws://192.168.1.50:8787',
+  });
+  // With penguin:// scheme
+  assert.deepEqual(parseInvitation(`penguin://relay.example.com:8787/${code}`), {
+    code,
+    rendezvousUrl: 'ws://relay.example.com:8787',
+  });
+  // normalizeShareCode also tolerates embedded URL
+  assert.equal(normalizeShareCode(`${code}@ws://1.2.3.4:8787`), code);
+});
+
+test('resolveIceServers provides resilient STUN defaults for P2P and respects overrides', () => {
+  // Default provides public STUN servers
+  const def = resolveIceServers({});
+  assert.ok(def.length >= 3);
+  assert.ok(def.some(s => s.urls.includes('google.com')));
+  assert.ok(def.some(s => s.urls.includes('cloudflare.com')));
+
+  // Explicit no-stun / off
+  assert.deepEqual(resolveIceServers({ noStun: true }), []);
+  assert.deepEqual(resolveIceServers({ stun: 'none' }), []);
+  assert.deepEqual(resolveIceServers({ stun: 'off' }), []);
+
+  // Custom STUN
+  const custom = resolveIceServers({ stun: 'stun:custom.relay:3478' });
+  assert.equal(custom.length, 1);
+  assert.equal(custom[0].urls, 'stun:custom.relay:3478');
 });
 
 test('invitations have 160-bit space and normalize without accepting legacy codes', () => {

@@ -37,7 +37,15 @@ export function generateShareCode() {
  */
 export function normalizeShareCode(input) {
   if (typeof input !== 'string') throw new Error('share code must be a string');
-  const raw = input.toUpperCase().replace(/[^0-9A-Z]/g, '');
+  let text = input.trim();
+  if (text.startsWith('penguin://')) {
+    text = text.slice(text.lastIndexOf('/') + 1);
+  } else if (text.includes('@')) {
+    text = text.slice(0, text.indexOf('@'));
+  } else if (text.includes('#')) {
+    text = text.slice(0, text.indexOf('#'));
+  }
+  const raw = text.toUpperCase().replace(/[^0-9A-Z]/g, '');
   if (raw.length !== CODE_CHARS) {
     throw new Error(`share code must be ${CODE_CHARS} characters, got ${raw.length}`);
   }
@@ -110,4 +118,37 @@ export function openSignal(key, b64) {
   const d = crypto.createDecipheriv('chacha20-poly1305', key, iv, { authTagLength: 16 });
   d.setAuthTag(tag);
   return JSON.parse(Buffer.concat([d.update(ct), d.final()]).toString('utf8'));
+}
+
+
+/**
+ * Extracts the canonical share code and an optional embedded rendezvous URL.
+ * Supports:
+ *   - "K7QA-3ZM2-...@ws://host:port"
+ *   - "penguin://host:port/K7QA-3ZM2-..."
+ *   - "K7QA-3ZM2-...#ws://host:port"
+ *   - Standard bare invitation "K7QA-3ZM2-..."
+ */
+export function parseInvitation(input) {
+  if (typeof input !== 'string') throw new Error('invitation must be a string');
+  let raw = input.trim();
+  let rendezvousUrl = undefined;
+  if (raw.startsWith('penguin://')) {
+    const after = raw.slice('penguin://'.length);
+    const slash = after.lastIndexOf('/');
+    if (slash !== -1) {
+      rendezvousUrl = `ws://${after.slice(0, slash)}`;
+      raw = after.slice(slash + 1);
+    }
+  } else if (raw.includes('@')) {
+    const at = raw.indexOf('@');
+    rendezvousUrl = raw.slice(at + 1).trim();
+    raw = raw.slice(0, at);
+  } else if (raw.includes('#')) {
+    const hash = raw.indexOf('#');
+    rendezvousUrl = raw.slice(hash + 1).trim();
+    raw = raw.slice(0, hash);
+  }
+  const code = normalizeShareCode(raw);
+  return { code, rendezvousUrl };
 }

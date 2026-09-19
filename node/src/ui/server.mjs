@@ -21,7 +21,7 @@ import { spawn } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 
 import { Host, Viewer, DEFAULT_RENDEZVOUS } from '../app/session.mjs';
-import { normalizeShareCode } from '../signal/code.mjs';
+import { normalizeShareCode, parseInvitation } from '../signal/code.mjs';
 import { loadOrCreateIdentity, TrustStore } from '../crypto/identity.mjs';
 import { cleanupTransport } from '../transport/peer.mjs';
 
@@ -192,16 +192,19 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
     if (!opts.code) throw new Error('a share code is required');
     // Validate up front: viewer.start() runs detached, so a bad code would
     // otherwise be reported as success and only fail asynchronously.
-    let code;
+    let code = opts.code;
+    let rendezvous = opts.rendezvous;
     try {
-      code = normalizeShareCode(opts.code);
+      const parsed = parseInvitation(opts.code);
+      code = parsed.code;
+      if (!rendezvous && parsed.rendezvousUrl) rendezvous = parsed.rendezvousUrl;
     } catch (err) {
       throw new Error(`that share code does not look right: ${err.message}`);
     }
 
     const viewer = new ViewerClass({
       code,
-      rendezvousUrl: opts.rendezvous || DEFAULT_RENDEZVOUS,
+      rendezvousUrl: rendezvous || DEFAULT_RENDEZVOUS,
       forceRelay: Boolean(opts.forceRelay),
       noInput: opts.allowInput !== true,
       turn: opts.turn || undefined,

@@ -36,6 +36,17 @@ let loggerReady = false;
 function initLogger(level = 'error') {
   if (loggerReady) return;
   try { dc.initLogger(level); } catch { /* signature varies by build; non-fatal */ }
+  try {
+    // Ultra-low latency SCTP settings:
+    // delayedSackTime: 0 disables delayed SACK timers (eliminating up to 200ms of ACK delay)
+    // 4MB send/recv buffers prevent keyframe bursts from stalling the SCTP queue
+    dc.setSctpSettings({
+      recvBufferSize: 4 * 1024 * 1024,
+      sendBufferSize: 4 * 1024 * 1024,
+      maxChunksOnQueue: 8192,
+      delayedSackTime: 0,
+    });
+  } catch { /* non-fatal on non-supported libdatachannel builds */ }
   loggerReady = true;
 }
 

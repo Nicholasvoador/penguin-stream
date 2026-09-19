@@ -13,6 +13,7 @@ import readline from 'node:readline';
 import process from 'node:process';
 
 import { Host, Viewer, DEFAULT_RENDEZVOUS } from './app/session.mjs';
+import { parseInvitation } from './signal/code.mjs';
 import { startRendezvous } from './signal/server.mjs';
 import { startTurnServer } from '../../turn/src/server.mjs';
 import { loadOrCreateIdentity, TrustStore, configDir } from './crypto/identity.mjs';
@@ -64,7 +65,7 @@ async function cmdHost(args) {
   }
 
   const host = new Host({
-    rendezvousUrl: args.rendezvous || DEFAULT_RENDEZVOUS,
+    rendezvousUrl: rendezvousUrl || DEFAULT_RENDEZVOUS,
     source: args.source,
     fps: args.fps ? Number(args.fps) : undefined,
     bitrateKbps: args.bitrate ? Number(args.bitrate) : undefined,
@@ -159,7 +160,7 @@ async function cmdConnect(args) {
 
   const viewer = new Viewer({
     code,
-    rendezvousUrl: args.rendezvous || DEFAULT_RENDEZVOUS,
+    rendezvousUrl: rendezvousUrl || DEFAULT_RENDEZVOUS,
     forceRelay: Boolean(args['force-relay']),
     noInput: !args['allow-input'] || Boolean(args['no-input']),
     audio: Boolean(args.audio),

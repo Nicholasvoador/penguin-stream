@@ -15,6 +15,7 @@
 #include <cmath>
 #include <memory>
 #include <atomic>
+#include <condition_variable>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -36,6 +37,7 @@ std::atomic<bool> g_quit{false};
 // Decoded frame handed from the reader thread to the render loop.
 struct SharedFrame {
   std::mutex mu;
+  std::condition_variable cv;
   std::vector<uint8_t> pixels;
   int width = 0;
   int height = 0;
@@ -75,10 +77,15 @@ int runView(int argc, char** argv) {
   _setmode(_fileno(stdout), _O_BINARY);
 #endif
   bool sendInput = true;
+  bool vsync = true;
   std::string title = "penguin-stream";
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--no-input") sendInput = false;
     if (std::string(argv[i]) == "--title" && i + 1 < argc) title = argv[i + 1];
+    if (std::string(argv[i]) == "--no-vsync" || std::string(argv[i]) == "--low-latency") vsync = false;
+  }
+  if (!vsync) {
+    SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
   }
 
   if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -144,6 +151,7 @@ int runView(int argc, char** argv) {
           shared.width = f.width;
           shared.height = f.height;
           shared.dirty = true;
+          shared.cv.notify_one();
         }, derr);
       } else if (msg.type == MsgType::Shutdown) {
         g_quit = true;
@@ -181,7 +189,9 @@ int runView(int argc, char** argv) {
       fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
       g_quit = true;
     } else {
-      renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+      Uint32 rflags = SDL_RENDERER_ACCELERATED;
+      if (vsync) rflags |= SDL_RENDERER_PRESENTVSYNC;
+      renderer = SDL_CreateRenderer(window, -1, rflags);
       if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     }
   }
@@ -250,7 +260,10 @@ int runView(int argc, char** argv) {
 
     bool present = false;
     {
-      std::lock_guard<std::mutex> lock(shared.mu);
+      std::unique_lock<std::mutex> lock(shared.mu);
+      if (!shared.dirty && !g_quit) {
+        shared.cv.wait_for(lock, std::chrono::milliseconds(4), [&] { return shared.dirty || g_quit; });
+      }
       if (shared.dirty && renderer) {
         if (!texture || texW != shared.width || texH != shared.height) {
           if (texture) SDL_DestroyTexture(texture);
@@ -273,8 +286,6 @@ int runView(int argc, char** argv) {
       SDL_RenderClear(renderer);
       SDL_RenderCopy(renderer, texture, nullptr, nullptr);
       SDL_RenderPresent(renderer);
-    } else {
-      SDL_Delay(2);
     }
   }
 
