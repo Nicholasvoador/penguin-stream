@@ -231,4 +231,14 @@ void Encoder::flush(const std::function<void(const EncodedPacket&)>& sink) {
   drain(sink, ignored);
 }
 
+void Encoder::setBitrate(int bitrateKbps) {
+  if (!ctx_ || bitrateKbps < 100 || bitrateKbps > 200000) return;
+  cfg_.bitrateKbps = bitrateKbps;
+  ctx_->bit_rate = static_cast<int64_t>(bitrateKbps) * 1000;
+  ctx_->rc_max_rate = ctx_->bit_rate;
+  ctx_->rc_buffer_size = static_cast<int>(ctx_->bit_rate / (cfg_.fps > 0 ? cfg_.fps : 60) * 2);
+}
+
 }  // namespace ps
+
+

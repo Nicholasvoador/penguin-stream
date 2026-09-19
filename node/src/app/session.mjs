@@ -176,9 +176,12 @@ export class Host extends EventEmitter {
       this.close('capture ended');
     });
 
-    // The viewer asks for a keyframe when it loses one; honour it.
+    // Handle control messages from viewer (keyframe requests, dynamic bitrate adjustments)
     peer.on('control', (msg) => {
       if (msg?.t === 'keyframe-request') this.engine?.requestKeyframe();
+      if (msg?.t === 'set-bitrate' && Number.isFinite(msg.kbps) && msg.kbps >= 500 && msg.kbps <= 200000) {
+        this.engine?.setBitrate(Math.round(msg.kbps));
+      }
     });
 
     const validateInput = createInputValidator();

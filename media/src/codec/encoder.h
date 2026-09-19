@@ -56,6 +56,7 @@ class Encoder {
   // Asks for a keyframe on the next encodeBGRA call. Used when a viewer joins
   // or reports corruption.
   void requestKeyframe() { forceKeyframe_ = true; }
+  void setBitrate(int bitrateKbps);
 
   // Flushes buffered frames at end of stream.
   void flush(const std::function<void(const EncodedPacket&)>& sink);
