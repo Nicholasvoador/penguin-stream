@@ -1,3 +1,8 @@
+/* Hidden elements must never be displayed regardless of display property */
+[hidden], .overlay[hidden] {
+  display: none !important;
+}
+
 :root {
   --bg: #12141a;
   --panel: #1b1e26;
@@ -146,7 +151,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 
 .overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,.7);
-  display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 10;
+  display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 100;
+}
+.overlay[hidden] {
+  display: none !important;
 }
 .modal {
   background: var(--panel); border: 1px solid var(--panel-2); border-radius: var(--radius);

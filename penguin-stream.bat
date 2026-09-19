@@ -4,19 +4,15 @@ cd /d "%~dp0"
 
 where node >nul 2>nul
 if %errorlevel% neq 0 (
-    echo [ERROR] Node.js is not found on your PATH. Please install Node.js 20 or newer.
-    pause
-    exit /b 1
+    echo [ERROR] Node.js is not found on your PATH.
+    echo Running automated setup...
+    call setup.bat
+    exit /b
 )
 
 if not exist "node_modules" (
-    echo Installing node dependencies...
-    call npm ci
-    if %errorlevel% neq 0 (
-        echo [ERROR] npm ci failed.
-        pause
-        exit /b 1
-    )
+    echo Running first-time setup...
+    call setup.bat
 )
 
 if "%~1"=="" (

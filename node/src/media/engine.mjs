@@ -29,6 +29,21 @@ export const MsgType = Object.freeze({
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 
 /** Locates the built ps-media binary, or returns null with a build hint. */
+export function findExecutable(name) {
+  const isWin = process.platform === 'win32';
+  const binName = isWin && !name.toLowerCase().endsWith('.exe') ? `${name}.exe` : name;
+  const pathEnv = process.env.PATH || '';
+  const dirs = pathEnv.split(path.delimiter);
+  for (const dir of dirs) {
+    const full = path.join(dir, binName);
+    try {
+      fs.accessSync(full, fs.constants.X_OK);
+      return full;
+    } catch { /* continue */ }
+  }
+  return null;
+}
+
 export function findMediaBinary() {
   const exe = process.platform === 'win32' ? 'ps-media.exe' : 'ps-media';
   const candidates = [

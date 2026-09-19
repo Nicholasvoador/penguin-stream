@@ -167,7 +167,11 @@ function render(state) {
       showView('idle');
   }
 
-  if (state.pendingConsent) showConsent(state.pendingConsent);
+  if (state.pendingConsent) {
+    showConsent(state.pendingConsent);
+  } else {
+    $('consent-overlay').hidden = true;
+  }
 }
 
 function showConsent(req) {
