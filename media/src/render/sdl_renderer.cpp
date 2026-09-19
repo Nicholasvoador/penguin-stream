@@ -58,6 +58,39 @@ void emitInput(const std::string& json) {
   writeJson(stdout, MsgType::Input, json);
 }
 
+const char* controllerButtonName(Uint8 button) {
+  switch (button) {
+    case SDL_CONTROLLER_BUTTON_A: return "a";
+    case SDL_CONTROLLER_BUTTON_B: return "b";
+    case SDL_CONTROLLER_BUTTON_X: return "x";
+    case SDL_CONTROLLER_BUTTON_Y: return "y";
+    case SDL_CONTROLLER_BUTTON_BACK: return "back";
+    case SDL_CONTROLLER_BUTTON_GUIDE: return "guide";
+    case SDL_CONTROLLER_BUTTON_START: return "start";
+    case SDL_CONTROLLER_BUTTON_LEFTSTICK: return "ls";
+    case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return "rs";
+    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: return "lb";
+    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return "rb";
+    case SDL_CONTROLLER_BUTTON_DPAD_UP: return "dpad_up";
+    case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return "dpad_down";
+    case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return "dpad_left";
+    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return "dpad_right";
+    default: return "unknown";
+  }
+}
+
+const char* controllerAxisName(Uint8 axis) {
+  switch (axis) {
+    case SDL_CONTROLLER_AXIS_LEFTX: return "ls_x";
+    case SDL_CONTROLLER_AXIS_LEFTY: return "ls_y";
+    case SDL_CONTROLLER_AXIS_RIGHTX: return "rs_x";
+    case SDL_CONTROLLER_AXIS_RIGHTY: return "rs_y";
+    case SDL_CONTROLLER_AXIS_TRIGGERLEFT: return "lt";
+    case SDL_CONTROLLER_AXIS_TRIGGERRIGHT: return "rt";
+    default: return "unknown";
+  }
+}
+
 const char* mouseButtonName(Uint8 button) {
   switch (button) {
     case SDL_BUTTON_LEFT: return "left";
@@ -88,7 +121,7 @@ int runView(int argc, char** argv) {
     SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
   }
 
-  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) {
     fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
     return 1;
   }
@@ -201,6 +234,9 @@ int runView(int argc, char** argv) {
     SDL_GetWindowSize(window, &w, &h);
     nx = w > 0 ? double(x) / double(w) : 0.0;
     ny = h > 0 ? double(y) / double(h) : 0.0;
+    for (int i = 0; i < SDL_NumJoysticks(); ++i) {
+      if (SDL_IsGameController(i)) SDL_GameControllerOpen(i);
+    }
     nx = std::min(1.0, std::max(0.0, nx));
     ny = std::min(1.0, std::max(0.0, ny));
   };
@@ -235,6 +271,44 @@ int runView(int argc, char** argv) {
           if (!sendInput) break;
           emitInput("{\"t\":\"wheel\",\"dx\":" + std::to_string(ev.wheel.x) +
                     ",\"dy\":" + std::to_string(ev.wheel.y) + "}");
+          break;
+        }
+        case SDL_CONTROLLERDEVICEADDED: {
+          if (SDL_IsGameController(ev.cdevice.which)) SDL_GameControllerOpen(ev.cdevice.which);
+          break;
+        }
+        case SDL_CONTROLLERDEVICEREMOVED: {
+          SDL_GameController* c = SDL_GameControllerFromInstanceID(ev.cdevice.which);
+          if (c) SDL_GameControllerClose(c);
+          break;
+        }
+        case SDL_CONTROLLERBUTTONDOWN:
+        case SDL_CONTROLLERBUTTONUP: {
+          if (!sendInput) break;
+          const char* btn = controllerButtonName(ev.cbutton.button);
+          if (strcmp(btn, "unknown") != 0) {
+            emitInput(std::string("{\"t\":\"gamepad_button\",\"id\":") +
+                      std::to_string(ev.cbutton.which) + ",\"button\":\"" + btn +
+                      "\",\"down\":" + (ev.type == SDL_CONTROLLERBUTTONDOWN ? "true" : "false") + "}");
+          }
+          break;
+        }
+        case SDL_CONTROLLERAXISMOTION: {
+          if (!sendInput) break;
+          const char* axis = controllerAxisName(ev.caxis.axis);
+          if (strcmp(axis, "unknown") != 0) {
+            double norm = 0.0;
+            if (ev.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT ||
+                ev.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT) {
+              norm = std::clamp(double(ev.caxis.value) / 32767.0, 0.0, 1.0);
+            } else {
+              norm = std::clamp(double(ev.caxis.value) / 32767.0, -1.0, 1.0);
+              if (std::abs(norm) < 0.05) norm = 0.0;
+            }
+            emitInput(std::string("{\"t\":\"gamepad_axis\",\"id\":") +
+                      std::to_string(ev.caxis.which) + ",\"axis\":\"" + axis +
+                      "\",\"value\":" + std::to_string(norm) + "}");
+          }
           break;
         }
         case SDL_KEYDOWN:

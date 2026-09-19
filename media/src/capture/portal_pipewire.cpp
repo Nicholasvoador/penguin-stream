@@ -255,7 +255,61 @@ class PortalSource : public CaptureSource {
       y *= inputHeight_ - 1;
     }
     bool ok = false;
-    if (t == "mousemove" && fields.size() == 3) {
+    if (t == "gamepad_button") {
+      const auto button = fields.find("button");
+      const auto down = fields.find("down");
+      if (button == fields.end() || down == fields.end() ||
+          button->second.kind != InputValue::String || down->second.kind != InputValue::Boolean) return false;
+      const bool pressed = down->second.number == 1;
+      const std::string& btn = button->second.text;
+
+      // Map controller buttons to standard navigation keys/buttons
+      static const std::map<std::string, int> btnMap{
+        {"a", 32},         // Space / Select
+        {"b", 0xff1b},     // Esc / Back
+        {"x", 101},        // 'e' / Action
+        {"y", 102},        // 'f' / Secondary
+        {"start", 0xff0d}, // Enter / Pause
+        {"back", 0xff1b},  // Esc
+        {"dpad_up", 0xff52},   // Up
+        {"dpad_down", 0xff54}, // Down
+        {"dpad_left", 0xff51}, // Left
+        {"dpad_right", 0xff53},// Right
+      };
+      const auto it = btnMap.find(btn);
+      if (it != btnMap.end()) {
+        ok = keyEvent(it->second, pressed);
+      } else if (btn == "lb") {
+        ok = buttonEvent(0x110, pressed); // Left click
+      } else if (btn == "rb") {
+        ok = buttonEvent(0x111, pressed); // Right click
+      } else {
+        ok = true; // Handled
+      }
+      return ok;
+    } else if (t == "gamepad_axis") {
+      const auto axis = fields.find("axis");
+      double val = 0;
+      if (axis == fields.end() || axis->second.kind != InputValue::String ||
+          !inputNumber(fields, "value", -1, 1, val)) return false;
+      const std::string& ax = axis->second.text;
+
+      // Left stick maps to WASD movement; triggers map to click
+      if (ax == "ls_x") {
+        if (val > 0.3) keyEvent(100, true);  // 'd'
+        else if (val < -0.3) keyEvent(97, true); // 'a'
+        else { keyEvent(100, false); keyEvent(97, false); }
+      } else if (ax == "ls_y") {
+        if (val < -0.3) keyEvent(119, true); // 'w'
+        else if (val > 0.3) keyEvent(115, true); // 's'
+        else { keyEvent(119, false); keyEvent(115, false); }
+      } else if (ax == "lt") {
+        buttonEvent(0x110, val > 0.5); // Left trigger -> left click
+      } else if (ax == "rt") {
+        buttonEvent(0x111, val > 0.5); // Right trigger -> right click
+      }
+      return true;
+    } else if (t == "mousemove" && fields.size() == 3) {
       ok = motion(x, y);
     } else if ((t == "mousebutton" && fields.size() == 5) || (t == "key" && fields.size() == 3)) {
       const auto down = fields.find("down");

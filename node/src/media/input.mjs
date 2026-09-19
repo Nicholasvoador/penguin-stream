@@ -33,6 +33,12 @@ export function sdlKeycodeToKeysym(keycode) {
 const finite = (v, min, max) => typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
 const coords = (e) => finite(e.x, 0, 1) && finite(e.y, 0, 1);
 const buttons = new Set(['left', 'middle', 'right', 'x1', 'x2']);
+const gamepadButtons = new Set([
+  'a', 'b', 'x', 'y', 'lb', 'rb', 'back', 'start', 'guide',
+  'ls', 'rs', 'dpad_up', 'dpad_down', 'dpad_left', 'dpad_right',
+]);
+const gamepadAxes = new Set(['ls_x', 'ls_y', 'rs_x', 'rs_y', 'lt', 'rt']);
+
 const schema = (e, required, optional = []) => required.every((k) => Object.hasOwn(e, k)) &&
   Object.keys(e).every((k) => required.includes(k) || optional.includes(k));
 
@@ -64,6 +70,14 @@ export function validateInputEvent(event) {
       const keysym = sdlKeycodeToKeysym(event.keycode);
       return keysym === null ? null : { t: event.t, keysym, down: event.down };
     }
+    case 'gamepad_button':
+      return schema(event, ['t', 'button', 'down'], ['id']) &&
+        gamepadButtons.has(event.button) && typeof event.down === 'boolean'
+        ? { t: event.t, button: event.button, down: event.down, id: event.id ?? 0 } : null;
+    case 'gamepad_axis':
+      return schema(event, ['t', 'axis', 'value'], ['id']) &&
+        gamepadAxes.has(event.axis) && finite(event.value, -1, 1)
+        ? { t: event.t, axis: event.axis, value: Math.max(-1, Math.min(1, event.value)), id: event.id ?? 0 } : null;
     default: return null;
   }
 }
@@ -82,7 +96,7 @@ export function createInputValidator({ rate = 240, burst = 120, now = () => perf
   return (event) => {
     const valid = validateInputEvent(event);
     if (!valid) return null;
-    if ((valid.t === 'key' || valid.t === 'mousebutton') && !valid.down) return valid;
+    if ((valid.t === 'key' || valid.t === 'mousebutton' || valid.t === 'gamepad_button') && !valid.down) return valid;
     const time = now();
     if (!Number.isFinite(time)) return null;
     tokens = Math.min(burst, tokens + Math.max(0, time - last) * rate / 1000);

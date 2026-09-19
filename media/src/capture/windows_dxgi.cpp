@@ -263,6 +263,72 @@ class DxgiSource final : public CaptureSource {
       return true;
     }
 
+    if (t == "gamepad_button") {
+      std::string btn;
+      if (!jsonGetString(json, "button", btn)) return false;
+      const bool down = json.find("\"down\":true") != std::string::npos;
+      WORD vk = 0;
+      if (btn == "a") vk = VK_SPACE;
+      else if (btn == "b") vk = VK_ESCAPE;
+      else if (btn == "x") vk = 'E';
+      else if (btn == "y") vk = 'F';
+      else if (btn == "start") vk = VK_RETURN;
+      else if (btn == "back") vk = VK_ESCAPE;
+      else if (btn == "dpad_up") vk = VK_UP;
+      else if (btn == "dpad_down") vk = VK_DOWN;
+      else if (btn == "dpad_left") vk = VK_LEFT;
+      else if (btn == "dpad_right") vk = VK_RIGHT;
+      else if (btn == "lb") {
+        INPUT in{}; in.type = INPUT_MOUSE; in.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+        SendInput(1, &in, sizeof(INPUT));
+        return true;
+      } else if (btn == "rb") {
+        INPUT in{}; in.type = INPUT_MOUSE; in.mi.dwFlags = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+        SendInput(1, &in, sizeof(INPUT));
+        return true;
+      }
+      if (vk != 0) {
+        INPUT in{}; in.type = INPUT_KEYBOARD; in.ki.wVk = vk;
+        in.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+        SendInput(1, &in, sizeof(INPUT));
+      }
+      return true;
+    }
+
+    if (t == "gamepad_axis") {
+      std::string axis;
+      double val = 0;
+      if (!jsonGetString(json, "axis", axis) || !jsonGetNumber(json, "value", val)) return false;
+      if (axis == "ls_x") {
+        INPUT in{}; in.type = INPUT_KEYBOARD;
+        if (val > 0.3) { in.ki.wVk = 'D'; SendInput(1, &in, sizeof(INPUT)); }
+        else if (val < -0.3) { in.ki.wVk = 'A'; SendInput(1, &in, sizeof(INPUT)); }
+        else {
+          in.ki.dwFlags = KEYEVENTF_KEYUP;
+          in.ki.wVk = 'D'; SendInput(1, &in, sizeof(INPUT));
+          in.ki.wVk = 'A'; SendInput(1, &in, sizeof(INPUT));
+        }
+      } else if (axis == "ls_y") {
+        INPUT in{}; in.type = INPUT_KEYBOARD;
+        if (val < -0.3) { in.ki.wVk = 'W'; SendInput(1, &in, sizeof(INPUT)); }
+        else if (val > 0.3) { in.ki.wVk = 'S'; SendInput(1, &in, sizeof(INPUT)); }
+        else {
+          in.ki.dwFlags = KEYEVENTF_KEYUP;
+          in.ki.wVk = 'W'; SendInput(1, &in, sizeof(INPUT));
+          in.ki.wVk = 'S'; SendInput(1, &in, sizeof(INPUT));
+        }
+      } else if (axis == "lt") {
+        INPUT in{}; in.type = INPUT_MOUSE;
+        in.mi.dwFlags = val > 0.5 ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+        SendInput(1, &in, sizeof(INPUT));
+      } else if (axis == "rt") {
+        INPUT in{}; in.type = INPUT_MOUSE;
+        in.mi.dwFlags = val > 0.5 ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+        SendInput(1, &in, sizeof(INPUT));
+      }
+      return true;
+    }
+
     if (t == "mousemove") {
       double x = 0, y = 0;
       if (!jsonGetNumber(json, "x", x) || !jsonGetNumber(json, "y", y)) return false;

@@ -97,3 +97,25 @@ test('optional per-peer rate cap refills and always permits releases', () => {
     assert.throws(() => createInputValidator(opts), TypeError);
   }
 });
+
+
+test('gamepad buttons and axes validate correctly and bypass rate limits on release', () => {
+  const btnDown = { t: 'gamepad_button', button: 'a', down: true };
+  const btnUp = { t: 'gamepad_button', button: 'a', down: false };
+  assert.deepEqual(validateInputEvent(btnDown), { t: 'gamepad_button', button: 'a', down: true, id: 0 });
+  assert.deepEqual(validateInputEvent(btnUp), { t: 'gamepad_button', button: 'a', down: false, id: 0 });
+
+  const axis = { t: 'gamepad_axis', axis: 'ls_x', value: 0.75 };
+  assert.deepEqual(validateInputEvent(axis), { t: 'gamepad_axis', axis: 'ls_x', value: 0.75, id: 0 });
+
+  // Invalid buttons and axes
+  assert.equal(validateInputEvent({ t: 'gamepad_button', button: 'invalid', down: true }), null);
+  assert.equal(validateInputEvent({ t: 'gamepad_axis', axis: 'invalid', value: 0.5 }), null);
+  assert.equal(validateInputEvent({ t: 'gamepad_axis', axis: 'ls_x', value: 1.5 }), null);
+
+  // Rate limiter permits releases
+  const validate = createInputValidator({ rate: 10, burst: 1, now: () => 0 });
+  assert.ok(validate(btnDown));
+  assert.equal(validate(btnDown), null); // exhausted burst
+  assert.ok(validate(btnUp)); // release always allowed
+});
