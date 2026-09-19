@@ -8,9 +8,9 @@
     "penguin-stream": "./node/src/cli.mjs"
   },
   "scripts": {
-    "test": "node --test node/test/",
+    "test": "node --test --test-concurrency=1 --test-timeout=65000 node/test/",
     "test:unit": "node --test node/test/unit/",
-    "test:integration": "node --test --test-timeout=120000 node/test/integration/",
+    "test:integration": "node --test --test-concurrency=1 --test-timeout=120000 node/test/integration/",
     "host": "node node/src/cli.mjs host",
     "connect": "node node/src/cli.mjs connect",
     "rendezvous": "node node/src/cli.mjs rendezvous",

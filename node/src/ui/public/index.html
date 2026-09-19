@@ -15,26 +15,27 @@
 </header>
 
 <main>
+  <p id="support-notice">Experimental: Fedora Wayland video tested. Remote input and Linux CLI audio are implemented but not live-verified. Windows build and cross-platform operation are unverified.</p>
   <!-- idle: the whole app is these two choices -->
   <section id="view-idle" class="card-row">
     <button class="card" id="btn-host">
       <span class="ico" aria-hidden="true">🖥️</span>
       <strong>Share this screen</strong>
-      <small>Get a code to give someone</small>
+      <small>Copy an invitation for someone</small>
     </button>
     <button class="card" id="btn-connect-mode">
       <span class="ico" aria-hidden="true">🔗</span>
       <strong>Connect to a screen</strong>
-      <small>Enter a code you were given</small>
+      <small>Paste an invitation you were given</small>
     </button>
   </section>
 
   <!-- connect -->
   <section id="view-connect" hidden>
-    <h2>Enter the share code</h2>
+    <h2>Paste the invitation</h2>
     <form id="connect-form">
-      <input id="code-input" class="code-input" placeholder="ABCD-EFGH" autocomplete="off"
-             spellcheck="false" maxlength="9" aria-label="Share code">
+      <input id="code-input" class="code-input" placeholder="Paste the host’s invitation" autocomplete="off"
+             spellcheck="false" maxlength="64" aria-label="Share code">
       <button class="primary" type="submit">Connect</button>
     </form>
     <p class="hint">The host sees a prompt and must allow you in.</p>
@@ -43,8 +44,10 @@
 
   <!-- hosting -->
   <section id="view-hosting" hidden>
-    <h2>Your share code</h2>
+    <h2>Your private invitation</h2>
     <div class="code-display" id="code-display">…</div>
+    <button id="copy-invitation" type="button">Copy invitation</button>
+    <span id="copy-status" role="status"></span>
     <p class="hint">Give this to the person connecting. It expires when you stop sharing.</p>
     <div class="status" id="host-status">Waiting for someone to connect…</div>
     <button class="danger" data-stop>Stop sharing</button>

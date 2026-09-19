@@ -8,9 +8,9 @@
  * The defence is the one ZRTP uses: derive a short string from the Noise
  * transcript hash and have the humans compare it out of band ("read me the
  * four words"). A machine in the middle runs two different handshakes, so it
- * gets two different transcripts and cannot make both strings match without
- * a 2^32 online search — one guess per connection attempt, with a human
- * watching.
+ * gets two different transcripts and normally produces different verification strings. A 32-bit truncated
+ * string is a human verification aid, not proof against every active grinding
+ * attack. The custom protocol still needs independent cryptographic review.
  */
 
 import crypto from 'node:crypto';

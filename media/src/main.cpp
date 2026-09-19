@@ -369,7 +369,11 @@ int runCapture(int argc, char** argv) {
   std::string chosen;
   auto source = makeCaptureSource(backend, chosen);
   if (!source) {
-    writeLog(stdout, "no capture backend available for '" + backend + "'");
+    const std::string message = "no real capture backend available for '" + backend +
+        "'; run from an interactive desktop with portal/PipeWire support (Wayland) or X11 support; "
+        "use --source synthetic explicitly only for tests";
+    writeLog(stdout, message);
+    fprintf(stderr, "%s\n", message.c_str());
     return 1;
   }
 

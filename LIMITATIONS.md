@@ -30,3 +30,8 @@ The full Windows↔Fedora remote desktop objective is **not complete**. This rep
 - Media artifacts are private, local and Git-ignored. Logs may contain ephemeral share/UI secrets; publish only redacted summaries. The repeat-fixture relay script validates the specific two-frame capture and is not a general benchmark.
 
 See SECURITY.md for concrete security fixes and residual risks, docs/WINDOWS.md for untested Windows build steps, docs/AUDIO.md for audio wire/API details, and docs/PACKAGING.md for release gates.
+
+Parent hardening follow-up: 160-bit invitations replace legacy short codes; final
+serial regression 95/95 passed and UI-specific rerun 18/18 passed. Local allowlisted
+development bundle now available via scripts/package.py; still no installer.
+See docs/PARENT-VERIFICATION.md.

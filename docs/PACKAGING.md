@@ -7,3 +7,12 @@ A complete offline bundle must include the Node runtime (or a documented compati
 Windows: see WINDOWS.md for untested vcpkg/MSVC instructions. Packaging must include DLL resolution testing, code signing, uninstall behavior and installer permissions. Fedora: RPM/Flatpak integration and application portal identity/desktop entry remain future work. No firewall/service configuration, autostart, elevation, public deployment, or Sunshine configuration belongs in installation without explicit operator approval.
 
 Release gates: real Windows↔Fedora desktop/video/audio/input tests, permission cancellation/revocation and lock/unlock, malicious media/control tests, reviewed cryptography, maintained coturn deployment and public CGNAT measurement, clean-machine install/uninstall, license inventory, reproducible checksums/signatures. None is implied by a successful local source build.
+
+## Local allowlisted archive
+
+Run `python3 scripts/package.py`. The deterministic uncompressed TAR includes
+original source, documentation/tests, package lock and the local Linux engine
+(if built), plus a per-file SHA-256 manifest. Dependencies/shared libraries are
+not bundled; this is not a signed or self-contained installer. The script excludes
+artifacts, captured media, node_modules, credentials and Git history by allowlist.
+Review THIRD-PARTY.md before any distribution. No archive is uploaded automatically.

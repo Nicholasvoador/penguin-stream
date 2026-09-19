@@ -10,3 +10,6 @@ artifacts/*.mp4
 .venv/
 media/build/
 compile_commands.json
+
+dist/
+artifacts/

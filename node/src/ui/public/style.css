@@ -147,3 +147,7 @@ pre#log {
   padding: .75rem; max-height: 240px; overflow: auto; font-size: .8rem; color: var(--dim);
   white-space: pre-wrap;
 }
+
+.code-display { overflow-wrap: anywhere; font-size: clamp(1rem, 3vw, 1.8rem); }
+
+.code-input { width: min(100%, 42ch); font-size: 1rem; letter-spacing: .04em; }

@@ -42,14 +42,21 @@ function isLoopbackHost(value) {
   return name === '127.0.0.1' || name === 'localhost' || name === '[::1]' || name === '::1';
 }
 
-export async function startUi({ port = 47800, open = true } = {}) {
+export async function startUi({ port = 47800, open = true, HostClass = Host, ViewerClass = Viewer,
+  consentTimeoutMs = 120_000 } = {}) {
   const token = crypto.randomBytes(24).toString('base64url');
   const identity = loadOrCreateIdentity();
   const trust = new TrustStore();
 
   /** @type {{kind:'host'|'viewer', instance:any}|null} */
   let active = null;
-  let pendingConsent = null;   // { request, resolve }
+  let pendingConsent = null;   // { request, resolve, timer }
+  let generation = 0;
+  const bindSession = (instance) => {
+    const epoch = ++generation;
+    const current = () => generation === epoch && active?.instance === instance;
+    return { current, on: (event, fn) => instance.on(event, (...args) => { if (current()) fn(...args); }) };
+  };
   const clients = new Set();
 
   const broadcast = (type, data) => {
@@ -91,12 +98,22 @@ export async function startUi({ port = 47800, open = true } = {}) {
     peers: trust.list().map((p) => ({ fingerprint: p.fingerprint, label: p.label, role: p.role })),
     pendingConsent: pendingConsent?.request ?? null,
     rendezvous: DEFAULT_RENDEZVOUS,
+    capabilities: {
+      desktopVideo: 'fedora-wayland-tested',
+      remoteInput: 'experimental-wayland-portal-unverified',
+      desktopAudio: 'experimental-linux-cli-only-unverified',
+      windows: 'implementation-uncompiled-unverified',
+    },
   });
 
   const stopActive = (reason = 'stopped by user') => {
-    if (!active) return;
-    try { active.instance.close(reason); } catch { /* already closing */ }
+    const previous = active;
     active = null;
+    ++generation;
+    clearTimeout(pendingConsent?.timer);
+    pendingConsent?.resolve?.(false);
+    pendingConsent = null;
+    try { previous?.instance.close(reason); } catch { /* already closing */ }
     state.code = null;
     state.sas = null;
     state.transport = null;
@@ -112,7 +129,7 @@ export async function startUi({ port = 47800, open = true } = {}) {
   async function startHost(opts) {
     if (active) throw new Error('a session is already running');
 
-    const host = new Host({
+    const host = new HostClass({
       rendezvousUrl: opts.rendezvous || DEFAULT_RENDEZVOUS,
       source: opts.source || undefined,
       fps: opts.fps ? Number(opts.fps) : undefined,
@@ -126,27 +143,32 @@ export async function startUi({ port = 47800, open = true } = {}) {
     });
 
     active = { kind: 'host', instance: host };
+    const scope = bindSession(host);
     setMode('hosting-waiting');
 
-    host.on('code', (code) => { state.code = code; broadcast('state', publicState()); });
-    host.on('log', pushLog);
-    host.on('stats', (s) => { state.stats = s; broadcast('stats', s); });
-    host.on('media-config', (cfg) => { state.mediaConfig = cfg; broadcast('state', publicState()); });
-    host.on('error', (e) => pushLog(`error: ${e.message}`));
-    host.on('closed', (reason) => { pushLog(`session ended: ${reason}`); stopActive(reason); });
+    scope.on('code', (code) => { state.code = code; broadcast('state', publicState()); });
+    scope.on('log', pushLog);
+    scope.on('stats', (s) => { state.stats = s; broadcast('stats', s); });
+    scope.on('media-config', (cfg) => { state.mediaConfig = cfg; broadcast('state', publicState()); });
+    scope.on('error', (e) => pushLog(`error: ${e.message}`));
+    scope.on('closed', (reason) => { pushLog(`session ended: ${reason}`); stopActive(reason); });
 
     // Resolved by the /api/consent endpoint when the user clicks.
     host.start(async (request) => {
-      pendingConsent = { request, resolve: null };
+      if (!scope.current() || pendingConsent) return false;
+      const consent = { request, resolve: null, timer: null };
+      pendingConsent = consent;
       broadcast('consent', request);
       setMode('hosting-consent');
 
       const decision = await new Promise((resolve) => {
-        pendingConsent.resolve = resolve;
-        // Never hang forever waiting for a human: refuse after two minutes.
-        setTimeout(() => resolve(false), 120_000);
+        consent.resolve = resolve;
+        consent.timer = setTimeout(() => resolve(false), consentTimeoutMs);
+        consent.timer.unref?.();
       });
 
+      clearTimeout(consent.timer);
+      if (!scope.current() || pendingConsent !== consent) return false;
       pendingConsent = null;
       if (decision) {
         state.sas = request.sas;
@@ -157,6 +179,7 @@ export async function startUi({ port = 47800, open = true } = {}) {
       }
       return decision;
     }).catch((err) => {
+      if (!scope.current()) return;
       pushLog(`host failed: ${err.message}`);
       stopActive(err.message);
     });
@@ -176,7 +199,7 @@ export async function startUi({ port = 47800, open = true } = {}) {
       throw new Error(`that share code does not look right: ${err.message}`);
     }
 
-    const viewer = new Viewer({
+    const viewer = new ViewerClass({
       code,
       rendezvousUrl: opts.rendezvous || DEFAULT_RENDEZVOUS,
       forceRelay: Boolean(opts.forceRelay),
@@ -187,16 +210,18 @@ export async function startUi({ port = 47800, open = true } = {}) {
     });
 
     active = { kind: 'viewer', instance: viewer };
+    const scope = bindSession(viewer);
     setMode('connecting');
 
-    viewer.on('sas', (sas) => { state.sas = sas.phrase; broadcast('state', publicState()); });
-    viewer.on('secure', (t) => { state.transport = t; setMode('viewing'); });
-    viewer.on('media-config', (cfg) => { state.mediaConfig = cfg; broadcast('state', publicState()); });
-    viewer.on('stats', (s) => { state.stats = s; broadcast('stats', s); });
-    viewer.on('error', (e) => pushLog(`error: ${e.message}`));
-    viewer.on('closed', (reason) => { pushLog(`disconnected: ${reason}`); stopActive(reason); });
+    scope.on('sas', (sas) => { state.sas = sas.phrase; broadcast('state', publicState()); });
+    scope.on('secure', (t) => { state.transport = t; setMode('viewing'); });
+    scope.on('media-config', (cfg) => { state.mediaConfig = cfg; broadcast('state', publicState()); });
+    scope.on('stats', (s) => { state.stats = s; broadcast('stats', s); });
+    scope.on('error', (e) => pushLog(`error: ${e.message}`));
+    scope.on('closed', (reason) => { pushLog(`disconnected: ${reason}`); stopActive(reason); });
 
     viewer.start().catch((err) => {
+      if (!scope.current()) return;
       pushLog(`connect failed: ${err.message}`);
       stopActive(err.message);
     });
@@ -224,7 +249,7 @@ export async function startUi({ port = 47800, open = true } = {}) {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
     if (url.pathname.startsWith('/api/')) {
-      const provided = req.headers.authorization?.replace(/^Bearer\s+/i, '') || url.searchParams.get('token');
+      const provided = req.headers.authorization?.replace(/^Bearer\s+/i, '');
       const expected = Buffer.from(token);
       const got = Buffer.from(provided || '');
       if (got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) {
@@ -232,8 +257,10 @@ export async function startUi({ port = 47800, open = true } = {}) {
         return;
       }
 
-      if (url.pathname !== '/api/state' && req.method !== 'POST') {
-        res.writeHead(405, { allow: 'POST' }).end(); return;
+      const method = url.pathname === '/api/state' ? 'GET' : 'POST';
+      if (req.method !== method) {
+        req.resume(); // Drain rejected bodies so a keep-alive socket remains framed.
+        res.writeHead(405, { allow: method }).end(); return;
       }
       let body = {};
       if (req.method === 'POST') {
@@ -241,7 +268,7 @@ export async function startUi({ port = 47800, open = true } = {}) {
         for await (const chunk of req) {
           chunks.push(chunk);
           if (chunks.reduce((n, c) => n + c.length, 0) > 64 * 1024) {
-            res.writeHead(413).end();
+            res.writeHead(413, { connection: 'close' }).end();
             return;
           }
         }
@@ -331,24 +358,30 @@ export async function startUi({ port = 47800, open = true } = {}) {
   });
 
   const actualPort = server.address().port;
-  const link = `http://127.0.0.1:${actualPort}/?token=${token}`;
+  const link = `http://127.0.0.1:${actualPort}/#token=${token}`;
 
   console.log('\n  penguin-stream is running.\n');
-  console.log(`  Open:  ${link}\n`);
+  console.log(`  Local UI: http://127.0.0.1:${actualPort}/ (authorized URL opened in browser; token omitted from logs)\n`);
   console.log('  (private local capability URL; do not share it)\n');
 
   if (open) openBrowser(link);
 
-  const shutdown = () => {
+  const close = async () => {
     stopActive('shutting down');
-    cleanupTransport();
-    server.close(() => process.exit(0));
+    process.off('SIGINT', shutdown);
+    process.off('SIGTERM', shutdown);
+    for (const ws of clients) ws.terminate();
+    await new Promise(resolve => wss.close(resolve));
+    await new Promise(resolve => server.close(resolve));
+  };
+  const shutdown = () => {
+    void close().then(() => { cleanupTransport(); process.exit(0); });
     setTimeout(() => process.exit(0), 1500).unref();
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  return { port: actualPort, token, url: link, close: shutdown };
+  return { port: actualPort, token, url: link, close };
 }
 
 function openBrowser(url) {

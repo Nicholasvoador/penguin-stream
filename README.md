@@ -19,10 +19,10 @@ In separate terminals:
 
 ```sh
 node node/src/cli.mjs host --source portal --fps 30 --no-input
-node node/src/cli.mjs connect XXXX-XXXX --no-input
+node node/src/cli.mjs connect "PASTE-INVITATION-HERE" --no-input
 ```
 
-Replace the code with the one printed by the host. Compare the four verification words over an independent trusted channel and explicitly approve on the host. The Wayland screen-selection prompt is compositor-controlled: select only the intended screen. `Ctrl+C` stops the host; close the viewer window to disconnect. A local UI is available with `node node/src/cli.mjs ui`; its per-run token URL is sensitive and must not be shared or exposed remotely.
+Invitations contain 160 random bits and are intended for copy/paste, not short spoken codes. Replace the invitation placeholder with the one printed by the host. Compare the four verification words over an independent trusted channel and explicitly approve on the host. The Wayland screen-selection prompt is compositor-controlled: select only the intended screen. `Ctrl+C` stops the host; close the viewer window to disconnect. A local UI is available with `node node/src/cli.mjs ui`; its per-run token URL is sensitive and must not be shared or exposed remotely.
 
 For experimental Wayland control, add `--allow-input` on both CLI endpoints and approve keyboard/pointer access in the compositor prompt. For Linux desktop audio, add `--audio` on each endpoint; this captures the host's default output monitor, never intentionally the microphone. Input/audio live operation is not verified; see the matrix before enabling. Avoid audio feedback when both ends run on one machine.
 

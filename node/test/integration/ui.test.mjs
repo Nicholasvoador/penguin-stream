@@ -7,6 +7,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import http from 'node:http';
+import { EventEmitter } from 'node:events';
+
+const hosts = [];
+class FakeHost extends EventEmitter {
+  constructor() { super(); hosts.push(this); }
+  async start(approve) {
+    this.approve = approve;
+    return new Promise((resolve, reject) => { this.resolveStart = resolve; this.rejectStart = reject; });
+  }
+  close() { this.emit('closed', 'fake closed'); }
+}
 
 import { startUi } from '../../src/ui/server.mjs';
 import { cleanupTransport } from '../../src/transport/peer.mjs';
@@ -14,11 +25,11 @@ import { cleanupTransport } from '../../src/transport/peer.mjs';
 let ui;
 
 test.before(async () => {
-  ui = await startUi({ port: 0, open: false });
+  ui = await startUi({ port: 0, open: false, HostClass: FakeHost, consentTimeoutMs: 100 });
 });
 
-test.after(() => {
-  ui?.close?.();
+test.after(async () => {
+  await ui?.close?.();
   cleanupTransport();
 });
 
@@ -153,7 +164,58 @@ test('the websocket refuses a bad token', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${ui.port}/ws?token=nope`);
     ws.on('close', (code) => resolve(code));
     ws.on('error', () => resolve(-1));
-    setTimeout(() => resolve(0), 3000);
+    setTimeout(() => resolve(0), 3000).unref();
   });
   assert.ok(closed === 4001 || closed === -1, `expected rejection, got close code ${closed}`);
+});
+
+test('methods, token transport, and capability reporting are explicit', async () => {
+  for (const route of ['host', 'connect', 'stop', 'consent', 'revoke']) {
+    assert.equal((await call(`/api/${route}`)).status, 405);
+  }
+  assert.equal((await call('/api/state', { body: {} })).status, 405);
+  assert.equal((await call(`/api/state?token=${ui.token}`, { token: null })).status, 401);
+  const res = await call('/api/state');
+  assert.equal(res.headers.get('cache-control'), 'no-store');
+  assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+  const state = await res.json();
+  assert.match(state.capabilities.remoteInput, /unverified/);
+  assert.match(state.capabilities.windows, /uncompiled/);
+  assert.ok(new URL(ui.url).hash.startsWith('#token='));
+  assert.equal(new URL(ui.url).search, '');
+});
+
+test('websocket upgrade rejects cross-site Origin and non-loopback Host even with valid token', async () => {
+  const { WebSocket } = await import('ws');
+  for (const headers of [{ Origin: 'https://evil.example' }, { Host: 'evil.example' }]) {
+    const status = await new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${ui.port}/ws?token=${ui.token}`, { headers });
+      const timer = setTimeout(() => { ws.terminate(); reject(new Error('upgrade timeout')); }, 2000);
+      ws.on('unexpected-response', (_, res) => { clearTimeout(timer); res.resume(); ws.terminate(); resolve(res.statusCode); });
+      ws.on('error', () => {});
+      ws.on('open', () => { clearTimeout(timer); ws.terminate(); reject(new Error('unsafe upgrade accepted')); });
+    });
+    assert.equal(status, 401);
+  }
+});
+
+test('stopping pending consent cancels it; old callbacks cannot mutate a new session', async () => {
+  await call('/api/host', { body: {} });
+  const old = hosts.at(-1);
+  const decision = old.approve({ sas: 'old words' });
+  assert.equal((await (await call('/api/state')).json()).mode, 'hosting-consent');
+  await call('/api/stop', { body: {} });
+  assert.equal(await decision, false);
+  assert.equal((await (await call('/api/state')).json()).mode, 'idle');
+  await call('/api/host', { body: {} });
+  const current = hosts.at(-1);
+  old.emit('code', 'STALE'); old.emit('closed', 'late'); old.rejectStart(new Error('late failure'));
+  assert.equal(await old.approve({ sas: 'stale' }), false);
+  await new Promise(resolve => setTimeout(resolve, 130));
+  const state = await (await call('/api/state')).json();
+  assert.equal(state.mode, 'hosting-waiting'); assert.equal(state.code, null);
+  const timed = current.approve({ sas: 'new words' });
+  assert.equal(await timed, false);
+  assert.equal((await (await call('/api/state')).json()).mode, 'hosting-waiting');
+  await call('/api/stop', { body: {} });
 });

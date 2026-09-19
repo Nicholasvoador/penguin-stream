@@ -1,6 +1,6 @@
 /* penguin-stream local UI. No framework, no network dependencies. */
 
-const token = new URLSearchParams(location.search).get('token') || sessionStorage.getItem('ps-ui-token') || '';
+const token = new URLSearchParams(location.hash.slice(1)).get('token') || sessionStorage.getItem('ps-ui-token') || '';
 if (token) sessionStorage.setItem('ps-ui-token', token);
 history.replaceState(null, '', location.pathname);
 const $ = (id) => document.getElementById(id);
@@ -136,8 +136,8 @@ for (const b of document.querySelectorAll('[data-stop]')) {
 
 $('code-input').addEventListener('input', (e) => {
   // Format as the user types, and accept a pasted code in any shape.
-  let v = e.target.value.toUpperCase().replace(/[^0-9A-Z]/g, '').slice(0, 8);
-  if (v.length > 4) v = `${v.slice(0, 4)}-${v.slice(4)}`;
+  let v = e.target.value.toUpperCase().replace(/[^0-9A-Z]/g, '').slice(0, 32);
+  v = v.match(/.{1,4}/g)?.join('-') || '';
   e.target.value = v;
 });
 
@@ -181,3 +181,14 @@ function connectWs() {
 
 connectWs();
 refresh();
+
+$('copy-invitation').onclick = async () => {
+  const invitation = $('code-display').textContent;
+  if (!invitation || invitation === '…') return;
+  try {
+    await navigator.clipboard.writeText(invitation);
+    $('copy-status').textContent = 'Copied — send privately to your guest.';
+  } catch {
+    $('copy-status').textContent = 'Select the invitation and copy it manually.';
+  }
+};

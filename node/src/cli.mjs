@@ -6,7 +6,7 @@
  * forwarding, no separate client download on the host side.
  *
  *   host:   penguin-stream host              -> prints a code, waits
- *   viewer: penguin-stream connect ABCD-EFGH -> compares four words, streams
+ *   viewer: penguin-stream connect <INVITATION> -> compares four words, streams
  */
 
 import readline from 'node:readline';

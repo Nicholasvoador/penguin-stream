@@ -206,17 +206,16 @@ test('rendezvous server never sees the share code or plaintext signaling', async
   assert.throws(() => openSignal(signalingKey(other), payload));
 });
 
-test('share codes normalize human typing mistakes', () => {
-  const code = 'K7QA-3ZM2';
-  assert.equal(normalizeShareCode('k7qa3zm2'), code);
-  assert.equal(normalizeShareCode('K7QA 3ZM2'), code);
-  assert.equal(normalizeShareCode('k7qa-3zm2'), code);
-  // Crockford aliases: O->0, I/L->1
-  assert.equal(normalizeShareCode('OI11-2345'), '0111-2345');
-  assert.throws(() => normalizeShareCode('short'));
-  assert.throws(() => normalizeShareCode('K7QA-3ZM2-EXTRA'));
-  // Same code always maps to the same room regardless of how it was typed.
-  assert.equal(roomIdFor('k7qa3zm2'), roomIdFor('K7QA-3ZM2'));
+test('invitations have 160-bit space and normalize without accepting legacy codes', () => {
+  const code = 'K7QA-3ZM2-K7QA-3ZM2-K7QA-3ZM2-K7QA-3ZM2';
+  assert.equal(normalizeShareCode(code.toLowerCase().replaceAll('-', ' ')), code);
+  assert.equal(normalizeShareCode('OI112345'.repeat(4)), '0111-2345-0111-2345-0111-2345-0111-2345');
+  for (const invalid of ['short', 'K7QA-3ZM2', code + 'X', 'U'.repeat(32)])
+    assert.throws(() => normalizeShareCode(invalid));
+  const generated = new Set(Array.from({length: 1000}, generateShareCode));
+  assert.equal(generated.size, 1000);
+  for (const value of generated) assert.match(value, /^[0-9A-HJKMNP-TV-Z]{4}(?:-[0-9A-HJKMNP-TV-Z]{4}){7}$/);
+  assert.equal(roomIdFor(code.toLowerCase().replaceAll('-', '')), roomIdFor(code));
 });
 
 test('rendezvous rate-limits room-guessing attempts', async () => {

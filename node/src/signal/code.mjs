@@ -1,25 +1,13 @@
-/**
- * Share codes.
- *
- * The whole onboarding story is "host reads out eight characters, client types
- * them". That code does three jobs:
- *
- *   1. It names the rendezvous room — but the server only ever sees
- *      SHA-256(code), never the code itself.
- *   2. It keys the encryption of the signaling payloads, so the rendezvous
- *      server cannot read SDP or ICE candidates and therefore cannot learn
- *      either peer's local network topology.
- *   3. It gates who may even attempt a Noise handshake with the host.
- *
- * It is explicitly *not* the thing that authenticates the peer. Codes are
- * short, typed by humans, and sometimes read aloud in a room with other
- * people. Authentication is Noise + SAS + an explicit consent prompt.
+/** High-entropy, copy/paste invitations. The rendezvous sees a hash of the
+ * invitation; its confidentiality depends on the full random invitation staying
+ * private. This is not a password protocol. Legacy 40-bit codes are rejected.
+ * Peer verification still requires SAS comparison and explicit host consent.
  */
 
 import crypto from 'node:crypto';
 
 const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
-const CODE_CHARS = 8;           // 8 * 5 = 40 bits of entropy
+const CODE_CHARS = 32;          // 160 independently random bits
 export const CODE_BITS = CODE_CHARS * 5;
 
 /** Crockford decode table, including the ambiguous-letter aliases. */
@@ -31,20 +19,20 @@ const DECODE = (() => {
 })();
 
 /**
- * @returns {string} e.g. "K7QA-3ZM2"
+ * @returns {string} eight groups of four Crockford characters
  */
 export function generateShareCode() {
   let out = '';
   // Rejection-free: take 5 bits at a time from CSPRNG bytes.
   const bytes = crypto.randomBytes(CODE_CHARS);
   for (let i = 0; i < CODE_CHARS; i++) out += CROCKFORD[bytes[i] & 31];
-  return `${out.slice(0, 4)}-${out.slice(4)}`;
+  return out.match(/.{4}/g).join('-');
 }
 
 /**
  * Accepts sloppy human input: lowercase, missing dash, O/0 and I/L/1 mixups,
  * stray spaces.
- * @returns {string} canonical "XXXX-XXXX"
+ * @returns {string} canonical eight groups of four characters
  * @throws if the code cannot be interpreted
  */
 export function normalizeShareCode(input) {
@@ -59,16 +47,16 @@ export function normalizeShareCode(input) {
     if (v === undefined) throw new Error(`invalid character '${ch}' in share code`);
     canon += CROCKFORD[v];
   }
-  return `${canon.slice(0, 4)}-${canon.slice(4)}`;
+  return canon.match(/.{4}/g).join('-');
 }
 
 function codeBytes(code) {
-  return Buffer.from(normalizeShareCode(code).replace('-', ''), 'utf8');
+  return Buffer.from(normalizeShareCode(code).replaceAll('-', ''), 'utf8');
 }
 
 /**
- * Room identifier handed to the rendezvous server. One-way: the server cannot
- * recover the code, so it cannot derive the signaling key.
+ * Room identifier handed to the rendezvous server. A malicious server can attempt guesses; 160-bit random invitations make
+ * exhaustive guessing infeasible. Do not replace invitations with passwords.
  */
 export function roomIdFor(code) {
   return crypto.createHash('sha256')
