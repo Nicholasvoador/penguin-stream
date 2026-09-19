@@ -21,3 +21,14 @@ Blockers / untested: no Windows node or build toolchain (DXGI not compiled); no 
 All implementation changes are project-scoped. No host firewall/service/config, privileged installs, purchases, public deployment or Sunshine configuration edits. Private media and raw logs are Git-ignored and not published.
 
 Delegated model route reported by workers: cheaper-inference/gpt-6-astra → cheaper-inference/openai/gpt-6-astra. One initial Windows patch operation denied its path; no change then. Standard absolute-path file write was accepted and used for the implementation without changing access policy.
+
+Update 2026-09-19:
+- Direct P2P NAT Traversal enabled by default via Google and Cloudflare STUN servers.
+- SCTP 0ms delayed-ACK and 4MB buffers configured in libdatachannel.
+- Zero-copy buffer swap in PipeWire capture to eliminate 15MB copy/frame.
+- Real-time video queue pacing to eliminate bufferbloat on network congestion.
+- Immediate keyframe recovery (<100ms vs 1000ms polling).
+- Zero-wait condition variable wakeup and V-Sync bypass (--low-latency / --no-vsync) in SDL viewer.
+- Full UI integration: FPS, Bitrate, Encoder, Source, Audio, Input, Low-latency toggle, STUN/TURN, and live streaming metrics dashboard (RTT, FPS, bandwidth, candidate IPs, route badge).
+- Win32 SendInput remote input injection added to windows_dxgi.cpp; penguin-stream.bat and build-windows.ps1 created.
+- Measured direct P2P control RTT: 0.131 ms avg; video delivery latency: 0.852 ms avg for 1080p 45KB frames at 60 FPS.

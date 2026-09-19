@@ -96,3 +96,14 @@ pkg-config discovery for FFmpeg, SDL2, and optional capture dependencies.
    explicit errors and no leaked acquired frames, mappings, or COM objects.
 6. Exercise the SDL viewer on Windows separately. End-to-end transport/input and
    other platform features are outside this backend's verification scope.
+
+## Windows Remote Control (SendInput)
+
+The Windows backend in `media/src/capture/windows_dxgi.cpp` implements native Win32
+input injection via `SendInput()` when `--allow-input` is enabled on the host:
+- Mouse movement is mapped to normalized 0..65535 coordinates (`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE`).
+- Mouse clicks (`MOUSEEVENTF_LEFTDOWN/UP`, `MOUSEEVENTF_RIGHTDOWN/UP`, `MOUSEEVENTF_MIDDLEDOWN/UP`) and mouse wheel events (`MOUSEEVENTF_WHEEL`) are injected.
+- Keyboard keystrokes are passed via hardware scan codes (`KEYEVENTF_SCANCODE`).
+- `release_all` automatically cleans up all held keys and mouse buttons upon session disconnect.
+- The root launcher `penguin-stream.bat` launches the Web UI or CLI directly on Windows.
+- `scripts/build-windows.ps1` configures and builds the Windows native executable with CMake/vcpkg.

@@ -1,12 +1,15 @@
 // DXGI Desktop Duplication: native-size, tightly packed, owned BGRA frames.
 #include "capture/source.h"
+#include "ipc/framing.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
+#include <set>
 
 #include <algorithm>
 #include <chrono>
@@ -61,6 +64,7 @@ class DxgiSource final : public CaptureSource {
   bool start(const CaptureOptions& opts, std::string& error) override {
     stop();
     error.clear();
+    allowInput_ = opts.allowInput;
     auto fail = [&](const std::string& message) {
       error = message;
       stop();
@@ -164,6 +168,7 @@ class DxgiSource final : public CaptureSource {
   }
 
   void stop() override {
+    if (allowInput_) releaseHeld();
     running_ = false;
     haveFrame_ = false;
     staging_.Reset();
@@ -248,11 +253,114 @@ class DxgiSource final : public CaptureSource {
     return true;
   }
 
+  bool input(const std::string& json) override {
+    if (!allowInput_) return false;
+    std::string t;
+    if (!jsonGetString(json, "t", t)) return false;
+
+    if (t == "release_all") {
+      releaseHeld();
+      return true;
+    }
+
+    if (t == "mousemove") {
+      double x = 0, y = 0;
+      if (!jsonGetNumber(json, "x", x) || !jsonGetNumber(json, "y", y)) return false;
+      INPUT in{};
+      in.type = INPUT_MOUSE;
+      in.mi.dx = static_cast<LONG>(std::clamp(x, 0.0, 1.0) * 65535.0);
+      in.mi.dy = static_cast<LONG>(std::clamp(y, 0.0, 1.0) * 65535.0);
+      in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+      SendInput(1, &in, sizeof(INPUT));
+      return true;
+    }
+
+    if (t == "mousebutton") {
+      double x = 0, y = 0;
+      if (!jsonGetNumber(json, "x", x) || !jsonGetNumber(json, "y", y)) return false;
+      std::string btn;
+      if (!jsonGetString(json, "button", btn)) return false;
+      const bool down = json.find(""down":true") != std::string::npos;
+
+      INPUT in{};
+      in.type = INPUT_MOUSE;
+      in.mi.dx = static_cast<LONG>(std::clamp(x, 0.0, 1.0) * 65535.0);
+      in.mi.dy = static_cast<LONG>(std::clamp(y, 0.0, 1.0) * 65535.0);
+      in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+
+      DWORD flag = 0;
+      int btnId = 0;
+      if (btn == "left") { flag = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP; btnId = 1; }
+      else if (btn == "right") { flag = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP; btnId = 2; }
+      else if (btn == "middle") { flag = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP; btnId = 3; }
+      else return false;
+
+      in.mi.dwFlags |= flag;
+      SendInput(1, &in, sizeof(INPUT));
+      if (down) heldButtons_.insert(btnId);
+      else heldButtons_.erase(btnId);
+      return true;
+    }
+
+    if (t == "wheel") {
+      double dy = 0;
+      if (!jsonGetNumber(json, "dy", dy)) return false;
+      INPUT in{};
+      in.type = INPUT_MOUSE;
+      in.mi.dwFlags = MOUSEEVENTF_WHEEL;
+      in.mi.mouseData = static_cast<DWORD>(static_cast<int>(dy * WHEEL_DELTA));
+      SendInput(1, &in, sizeof(INPUT));
+      return true;
+    }
+
+    if (t == "key") {
+      double scancode = 0;
+      if (!jsonGetNumber(json, "scancode", scancode)) return false;
+      const bool down = json.find(""down":true") != std::string::npos;
+      const int scan = static_cast<int>(scancode);
+
+      INPUT in{};
+      in.type = INPUT_KEYBOARD;
+      in.ki.wScan = static_cast<WORD>(scan);
+      in.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP);
+      SendInput(1, &in, sizeof(INPUT));
+      if (down) heldKeys_.insert(scan);
+      else heldKeys_.erase(scan);
+      return true;
+    }
+
+    return false;
+  }
+
+  void releaseHeld() {
+    for (int btnId : heldButtons_) {
+      INPUT in{};
+      in.type = INPUT_MOUSE;
+      if (btnId == 1) in.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+      else if (btnId == 2) in.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+      else if (btnId == 3) in.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
+      SendInput(1, &in, sizeof(INPUT));
+    }
+    heldButtons_.clear();
+
+    for (int scan : heldKeys_) {
+      INPUT in{};
+      in.type = INPUT_KEYBOARD;
+      in.ki.wScan = static_cast<WORD>(scan);
+      in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+      SendInput(1, &in, sizeof(INPUT));
+    }
+    heldKeys_.clear();
+  }
+
   int width() const override { return width_; }
   int height() const override { return height_; }
   const char* name() const override { return "dxgi"; }
 
  private:
+  bool allowInput_ = false;
+  std::set<int> heldButtons_;
+  std::set<int> heldKeys_;
   ComPtr<ID3D11Device> device_;
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<IDXGIOutputDuplication> duplication_;
