@@ -164,7 +164,10 @@ export class Host extends EventEmitter {
       this.stats.bytesSent += v.data.length;
     });
 
-    this.engine.on('stats', (s) => this.emit('stats', { ...s, ...this.stats }));
+    this.engine.on('stats', (s) => {
+      const transport = peer.transportInfo();
+      this.emit('stats', { ...s, ...this.stats, transport });
+    });
     this.engine.on('log', (m) => this.emit('log', m));
     this.engine.on('stderr', (m) => this.emit('log', `ps-media: ${m}`));
     this.engine.on('error', (e) => this.emit('error', e));
@@ -234,10 +237,17 @@ export class Viewer extends EventEmitter {
 
   async start() {
     if (!this.opts.code) throw new Error('a share code is required');
+    let code = this.opts.code;
+    let rendezvousUrl = this.opts.rendezvousUrl;
+    try {
+      const parsed = parseInvitation(this.opts.code);
+      code = parsed.code;
+      if (!rendezvousUrl && parsed.rendezvousUrl) rendezvousUrl = parsed.rendezvousUrl;
+    } catch { /* keep raw */ }
 
     this.session = await joinSession({
-      code: this.opts.code,
-      rendezvousUrl: this.opts.rendezvousUrl || DEFAULT_RENDEZVOUS,
+      code,
+      rendezvousUrl: rendezvousUrl || DEFAULT_RENDEZVOUS,
       identity: this.identity.keypair,
       iceServers: resolveIceServers(this.opts),
       iceTransportPolicy: this.opts.forceRelay ? 'relay' : 'all',
@@ -257,6 +267,8 @@ export class Viewer extends EventEmitter {
     this.engine = new ViewEngine({
       title: this.opts.title || 'penguin-stream',
       noInput: this.opts.noInput,
+      lowLatency: this.opts.lowLatency,
+      noVsync: this.opts.noVsync,
     });
 
     this.engine.on('input', (event) => {
@@ -319,7 +331,8 @@ export class Viewer extends EventEmitter {
           this.reassembler.acknowledgeKeyframe();
         } catch { /* closing */ }
       }
-      this.emit('stats', { ...this.stats, ...this.reassembler.stats });
+      const transport = peer.transportInfo();
+      this.emit('stats', { ...this.stats, ...this.reassembler.stats, transport });
     }, 1000);
     this._keyframeTimer.unref?.();
 

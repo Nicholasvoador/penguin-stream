@@ -241,6 +241,7 @@ export class ViewEngine extends EventEmitter {
     const args = ['view'];
     if (this.opts.title) args.push('--title', this.opts.title);
     if (this.opts.noInput) args.push('--no-input');
+    if (this.opts.lowLatency || this.opts.noVsync) args.push('--low-latency');
 
     this.proc = spawn(bin, args, { stdio: ['pipe', 'pipe', 'inherit'] });
 

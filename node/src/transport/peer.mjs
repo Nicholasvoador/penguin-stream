@@ -441,6 +441,8 @@ export class Peer extends EventEmitter {
     if (!pair) return { connected: false, policy: this.iceTransportPolicy };
     const localType = pair.local?.type ?? 'unknown';
     const remoteType = pair.remote?.type ?? 'unknown';
+    let rtt = -1;
+    try { rtt = this.pc.rtt(); } catch { /* ignore */ }
     return {
       connected: true,
       policy: this.iceTransportPolicy,
@@ -448,8 +450,13 @@ export class Peer extends EventEmitter {
       localType,
       remoteType,
       localAddress: pair.local?.address,
+      localPort: pair.local?.port,
       remoteAddress: pair.remote?.address,
-      protocol: pair.local?.transportType,
+      remotePort: pair.remote?.port,
+      protocol: pair.local?.transportType || 'UDP',
+      rttMs: rtt >= 0 ? rtt : undefined,
+      bytesSent: this.pc.bytesSent?.() ?? 0,
+      bytesReceived: this.pc.bytesReceived?.() ?? 0,
     };
   }
 
