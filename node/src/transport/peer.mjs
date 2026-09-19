@@ -128,6 +128,8 @@ export class Peer extends EventEmitter {
     this.media = null;
     this._closed = false;
     this._consentSent = false;
+    this._remoteDescriptionSet = false;
+    this._pendingCandidates = [];
 
     this._hsTimer = setTimeout(() => {
       if (this.state !== PeerState.SECURE && !this._closed) {
@@ -386,11 +388,39 @@ export class Peer extends EventEmitter {
     }
   }
 
-  /** Feed a signaling message received from the rendezvous channel. */
+  /**
+   * Feed a signaling message received from the rendezvous channel.
+   *
+   * Candidates routinely arrive before the SDP they belong to, because both
+   * travel as separate rendezvous messages and trickling starts immediately.
+   * Handing one to libdatachannel early throws a Napi error that aborts the
+   * whole process, so queue until the remote description lands.
+   */
   applySignal(sig) {
     if (this._closed) return;
-    if (sig.kind === 'sdp') this.pc.setRemoteDescription(sig.sdp, sig.type);
-    else if (sig.kind === 'candidate') this.pc.addRemoteCandidate(sig.candidate, sig.mid);
+    try {
+      if (sig.kind === 'sdp') {
+        this.pc.setRemoteDescription(sig.sdp, sig.type);
+        this._remoteDescriptionSet = true;
+        const queued = this._pendingCandidates;
+        this._pendingCandidates = [];
+        for (const c of queued) this._addCandidate(c);
+      } else if (sig.kind === 'candidate') {
+        if (!this._remoteDescriptionSet) this._pendingCandidates.push(sig);
+        else this._addCandidate(sig);
+      }
+    } catch (err) {
+      this.emit('warning', `failed to apply ${sig.kind} signal: ${err.message}`);
+    }
+  }
+
+  _addCandidate(sig) {
+    try {
+      this.pc.addRemoteCandidate(sig.candidate, sig.mid);
+    } catch (err) {
+      // A single malformed or late candidate must never take the process down.
+      this.emit('warning', `rejected remote candidate: ${err.message}`);
+    }
   }
 
   /** Which candidate pair won, and whether we ended up on a relay. */

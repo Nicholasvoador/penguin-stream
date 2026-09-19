@@ -65,6 +65,9 @@ async function run({
   };
 
   peer.on('signal', (sig) => {
+    if (process.env.PS_TRACE) {
+      console.error(`[${role}] local ${sig.kind}`, sig.kind === 'candidate' ? sig.candidate : sig.type);
+    }
     outbox.push(sealSignal(key, sig));
     if (peerPresent) flush();
   });
@@ -121,6 +124,9 @@ async function run({
           return;
         }
         peerPresent = true;
+        if (process.env.PS_TRACE) {
+          console.error(`[${role}] remote ${sig.kind}`, sig.kind === 'candidate' ? sig.candidate : sig.type);
+        }
         peer.applySignal(sig);
         break;
       }
