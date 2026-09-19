@@ -1,6 +1,6 @@
 {
   "name": "penguin-stream",
-  "version": "0.1.0",
+  "version": "0.9.0",
   "private": true,
   "type": "module",
   "description": "Low-friction peer-to-peer remote desktop with CGNAT relay fallback",
