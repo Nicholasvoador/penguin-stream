@@ -6,3 +6,5 @@ artifacts/*.h264
 artifacts/*.mp4
 *.tmp
 .venv/
+media/build/
+compile_commands.json
