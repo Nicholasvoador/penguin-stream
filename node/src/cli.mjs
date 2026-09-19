@@ -70,7 +70,8 @@ async function cmdHost(args) {
     bitrateKbps: args.bitrate ? Number(args.bitrate) : undefined,
     encoder: args.encoder,
     forceRelay: Boolean(args['force-relay']),
-    allowInput: !args['no-input'],
+    allowInput: Boolean(args['allow-input']) && !args['no-input'],
+    audio: Boolean(args.audio),
     turn: args.turn,
     turnUser: args['turn-user'],
     turnPassword: args['turn-password'],
@@ -128,6 +129,9 @@ async function cmdHost(args) {
     console.log(`  ${c.dim}If they differ, someone is intercepting the connection - say no.${c.reset}`);
     console.log();
 
+    if (autoAccept && args.source !== 'synthetic') {
+      throw new Error('--yes is restricted to --source synthetic; real desktop requires explicit approval');
+    }
     if (autoAccept) {
       console.log(`${c.yellow}  --yes given: accepting without asking.${c.reset}`);
       return true;
@@ -157,7 +161,8 @@ async function cmdConnect(args) {
     code,
     rendezvousUrl: args.rendezvous || DEFAULT_RENDEZVOUS,
     forceRelay: Boolean(args['force-relay']),
-    noInput: Boolean(args['no-input']),
+    noInput: !args['allow-input'] || Boolean(args['no-input']),
+    audio: Boolean(args.audio),
     turn: args.turn,
     turnUser: args['turn-user'],
     turnPassword: args['turn-password'],
@@ -297,15 +302,17 @@ ${c.bold}Common options${c.reset}
   --turn <turn:host:port>         TURN relay for CGNAT / strict NAT
   --turn-user, --turn-password    TURN credentials
   --stun <stun:host:port>         STUN server for NAT discovery
-  --force-relay                   never use a direct path (testing / privacy)
+  --force-relay                   request relay-only ICE (verify actual path; no privacy guarantee)
 
 ${c.bold}Host options${c.reset}
   --source <portal|x11|synthetic> capture backend (default: auto)
   --fps <n>                       target frame rate (default 60)
   --bitrate <kbps>                target bitrate (default 15000)
   --encoder <auto|vaapi|nvenc|x264>
-  --no-input                      view-only: ignore remote keyboard/mouse
-  --yes                           accept the first viewer without prompting
+  --allow-input                   opt in to remote control (portal permission required)
+  --no-input                      view-only (default); ignore remote keyboard/mouse
+  --audio                         opt in to Linux desktop audio capture/playback
+  --yes                           synthetic-source tests only: skip human approval
 `);
 }
 

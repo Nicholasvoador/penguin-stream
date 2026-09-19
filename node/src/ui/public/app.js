@@ -1,6 +1,8 @@
 /* penguin-stream local UI. No framework, no network dependencies. */
 
-const token = new URLSearchParams(location.search).get('token') || '';
+const token = new URLSearchParams(location.search).get('token') || sessionStorage.getItem('ps-ui-token') || '';
+if (token) sessionStorage.setItem('ps-ui-token', token);
+history.replaceState(null, '', location.pathname);
 const $ = (id) => document.getElementById(id);
 
 async function api(path, body) {

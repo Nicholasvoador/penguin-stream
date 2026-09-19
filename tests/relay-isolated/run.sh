@@ -1,201 +1,133 @@
 #!/usr/bin/env bash
-#
-# Forced-relay proof on an isolated topology.
-#
-# Builds a CGNAT-like network with rootless podman:
-#
-#     [peer-a] --- ps-net-a --- [turn+rendezvous] --- ps-net-b --- [peer-b]
-#                 10.89.0.0/24    (dual-homed)        10.89.1.0/24
-#
-# ps-net-a and ps-net-b are created with isolate=true, so peer-a has NO route
-# to peer-b. The only mutually reachable host is the relay. A successful
-# media session therefore *must* have traversed the relay - we assert the
-# selected ICE candidate pair is typ relay AND that the TURN server's own byte
-# counters moved by at least the payload we sent.
-#
-# Everything runs in rootless containers. No host firewall, service, or network
-# configuration is modified. Cleanup removes only the resources created here.
-#
-# Usage: ./run.sh [--keep]
-set -uo pipefail
-
+# Rootless, cached-image-only, internal-network real H264 fallback proof.
+set -Eeuo pipefail
+umask 077
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ARTIFACTS="$REPO_ROOT/artifacts"
-IMAGE="${PS_TEST_IMAGE:-docker.io/library/node:22-slim}"  # glibc: the node-datachannel prebuilt is not musl-compatible
-NET_A=ps-net-a
-NET_B=ps-net-b
-C_RELAY=ps-relay
-C_A=ps-peer-a
-C_B=ps-peer-b
-KEEP=0
-[[ "${1:-}" == "--keep" ]] && KEEP=1
-
-mkdir -p "$ARTIFACTS"
-LOG="$ARTIFACTS/relay-isolated-$(date +%Y%m%d-%H%M%S).log"
-exec > >(tee -a "$LOG") 2>&1
-
-FAILED=0
-step()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-pass()  { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
-fail()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
-info()  { printf '  ---- %s\n' "$*"; }
-
+BASE="$REPO_ROOT/tests/relay-isolated"
+IMAGE=docker.io/library/node:22-slim
+[[ $# -le 1 ]] || { echo 'usage: run.sh [/path/to/private/source.h264]'; exit 2; }
+SOURCE="${1:-/tmp/ps-portal.h264}"
+mkdir -p "$BASE/artifacts"
+RUN="$(mktemp -d "$BASE/artifacts/run-XXXXXXXX")"
+chmod 700 "$RUN"
+exec 3>&1
+printf 'Private proof artifacts: %s\n' "$RUN" >&3
+exec >"$RUN/run.log" 2>&1
+CONTAINERS=() NETWORKS=() PIDS=()
+PHASE=preflight
 cleanup() {
-  if [[ $KEEP -eq 1 ]]; then
-    info "--keep given; leaving containers and networks in place"
-    return
+  local status=$? cleanup_failed=0
+  trap - EXIT
+  set +e
+  for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; done
+  for id in "${CONTAINERS[@]}"; do podman rm -f "$id" >>"$RUN/cleanup.log" 2>&1 || cleanup_failed=1; done
+  for id in "${NETWORKS[@]}"; do podman network rm "$id" >>"$RUN/cleanup.log" 2>&1 || cleanup_failed=1; done
+  # Run credentials are not retained even in private artifacts.
+  rm -f "$RUN/credentials.json"
+  (( cleanup_failed == 0 )) || status=1
+  printf '{"ok":%s,"containers":%s,"networks":%s}\n' "$([[ $cleanup_failed == 0 ]] && echo true || echo false)" "${#CONTAINERS[@]}" "${#NETWORKS[@]}" >"$RUN/cleanup.json"
+  if (( status == 0 )); then
+    printf 'PASS: real H264 relay proof; summary: %s/summary.json\n' "$RUN" >&3
+  else
+    printf 'FAIL: phase=%s exit=%s; private logs: %s\n' "$PHASE" "$status" "$RUN" >&3
+    # Whitelisted diagnostics only: never dump arbitrary library logs/secrets.
+    grep -E '^(AssertionError:|Error:|PermissionError:|FileNotFoundError:|RuntimeError:)' "$RUN/run.log" "$RUN/verification.log" 2>/dev/null | tail -5 | cut -c1-240 >&3
   fi
-  step "Cleanup"
-  podman rm -f "$C_RELAY" "$C_A" "$C_B" >/dev/null 2>&1
-  podman network rm -f "$NET_A" "$NET_B" >/dev/null 2>&1
-  info "removed containers and networks created by this script"
+  exit "$status"
 }
 trap cleanup EXIT
-
-command -v podman >/dev/null 2>&1 || { echo "podman is required"; exit 2; }
-
-step "Preparing isolated networks"
-podman rm -f "$C_RELAY" "$C_A" "$C_B" >/dev/null 2>&1
-podman network rm -f "$NET_A" "$NET_B" >/dev/null 2>&1
-podman network create --opt isolate=true "$NET_A" >/dev/null
-podman network create --opt isolate=true "$NET_B" >/dev/null
-info "$NET_A $(podman network inspect $NET_A --format '{{range .Subnets}}{{.Subnet}}{{end}}')"
-info "$NET_B $(podman network inspect $NET_B --format '{{range .Subnets}}{{.Subnet}}{{end}}')"
-
-MOUNT=(-v "$REPO_ROOT:/app:ro,z" -w /app)
-
-step "Starting relay (TURN + rendezvous), dual-homed"
-TURN_USER=penguin
-TURN_PASS="$(head -c 18 /dev/urandom | base64 | tr -d '/+=' )"
-podman run -d --name "$C_RELAY" --network "$NET_A" --network "$NET_B" "${MOUNT[@]}" \
-  -e TURN_USER="$TURN_USER" -e TURN_PASSWORD="$TURN_PASS" \
-  "$IMAGE" node /app/tests/relay-isolated/relay-runner.mjs >/dev/null
-sleep 3
-
-RELAY_A=$(podman inspect "$C_RELAY" --format "{{(index .NetworkSettings.Networks \"$NET_A\").IPAddress}}")
-RELAY_B=$(podman inspect "$C_RELAY" --format "{{(index .NetworkSettings.Networks \"$NET_B\").IPAddress}}")
-info "relay is $RELAY_A on $NET_A and $RELAY_B on $NET_B"
-podman logs "$C_RELAY" 2>&1 | sed 's/^/  relay| /' | head -5
-
-step "Starting peer containers"
-podman run -d --name "$C_A" --network "$NET_A" "${MOUNT[@]}" "$IMAGE" sleep 300 >/dev/null
-podman run -d --name "$C_B" --network "$NET_B" "${MOUNT[@]}" "$IMAGE" sleep 300 >/dev/null
-IP_A=$(podman inspect "$C_A" --format "{{(index .NetworkSettings.Networks \"$NET_A\").IPAddress}}")
-IP_B=$(podman inspect "$C_B" --format "{{(index .NetworkSettings.Networks \"$NET_B\").IPAddress}}")
-info "peer-a=$IP_A  peer-b=$IP_B"
-
-step "Precondition: the peers must NOT be able to reach each other"
-# UDP rather than ICMP: no ping in the slim image, and UDP is what carries media.
-podman exec -d "$C_B" node /app/tests/relay-isolated/netcheck.mjs listen 9999
-podman exec -d "$C_RELAY" node /app/tests/relay-isolated/netcheck.mjs listen 9999
-sleep 2
-
-if podman exec "$C_A" node /app/tests/relay-isolated/netcheck.mjs probe "$IP_B" 9999 4000 >/dev/null 2>&1; then
-  fail "peer-a reached peer-b over UDP - topology is NOT isolated, any relay result would be meaningless"
-  exit 1
-else
-  pass "peer-a cannot reach peer-b ($IP_B) over UDP"
-fi
-
-# Positive controls: if these fail the test is broken, not the code.
-if podman exec "$C_A" node /app/tests/relay-isolated/netcheck.mjs probe "$RELAY_A" 9999 4000 >/dev/null 2>&1; then
-  pass "peer-a can reach the relay ($RELAY_A) over UDP"
-else
-  fail "peer-a cannot reach the relay - setup broken"; exit 1
-fi
-if podman exec "$C_B" node /app/tests/relay-isolated/netcheck.mjs probe "$RELAY_B" 9999 4000 >/dev/null 2>&1; then
-  pass "peer-b can reach the relay ($RELAY_B) over UDP"
-else
-  fail "peer-b cannot reach the relay - setup broken"; exit 1
-fi
-
-CODE="$(podman exec "$C_A" node -e 'import("/app/node/src/signal/code.mjs").then(m=>console.log(m.generateShareCode()))' 2>/dev/null | tr -d "\r\n")"
-info "share code for this run: $CODE"
-
-RVURL_A="ws://$RELAY_A:8787"
-RVURL_B="ws://$RELAY_B:8787"
-
-run_peer() {
-  local ctr="$1" role="$2" turnhost="$3" rvurl="$4" out="$5"
-  podman exec -e ICE_POLICY="${ICE_POLICY:-all}" -e FRAME_COUNT=40 -e FRAME_SIZE=8000 "$ctr" \
-    node /app/tests/relay-isolated/peer-runner.mjs \
-    "$role" "$rvurl" "$turnhost" 3478 "$TURN_USER" "$TURN_PASS" "$CODE" >"$out" 2>&1
+for cmd in podman node python3 ffprobe; do command -v "$cmd"; done
+[[ "$(podman info --format '{{.Host.Security.Rootless}}')" == true ]]
+podman image exists "$IMAGE"
+git -C "$REPO_ROOT" check-ignore "$RUN/run.log"
+python3 "$BASE/media-proof.py" prepare "$SOURCE" "$RUN"
+node --input-type=module - "$RUN/credentials.json" "$REPO_ROOT" <<'JS'
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+const { generateShareCode } = await import(`${process.argv[3]}/node/src/signal/code.mjs`);
+fs.writeFileSync(process.argv[2], JSON.stringify({ user: 'penguin', password: crypto.randomBytes(24).toString('hex'), code: generateShareCode() }), { mode: 0o600 });
+JS
+mkdir -m 700 "$RUN/received"
+PREFIX="ps-proof-$(basename "$RUN")-$$"
+NET_A="$PREFIX-a"; NET_B="$PREFIX-b"
+PHASE=networks
+for net in "$NET_A" "$NET_B"; do
+  # Never pre-delete names; only retain IDs returned by successful creation.
+  id=$(podman network create --internal --disable-dns --opt isolate=true "$net")
+  NETWORKS+=("$id") # Successful create returns this run's unique name.
+  NETWORKS[$((${#NETWORKS[@]} - 1))]="$(podman network inspect "$id" --format '{{.ID}}')"
+done
+podman network inspect "$NET_A" >"$RUN/network-a.json"
+podman network inspect "$NET_B" >"$RUN/network-b.json"
+# No :z/:Z relabel: do not mutate labels on the user's checkout/private source.
+# SELinux label separation is disabled only for these short-lived test containers.
+MOUNT=(--security-opt label=disable --cap-drop=all --security-opt no-new-privileges
+  -v "$REPO_ROOT/node:/app/node:ro" -v "$REPO_ROOT/turn:/app/turn:ro"
+  -v "$REPO_ROOT/node_modules:/app/node_modules:ro" -w /app
+  -v "$BASE/peer-runner.mjs:/app/tests/relay-isolated/peer-runner.mjs:ro"
+  -v "$BASE/relay-runner.mjs:/app/tests/relay-isolated/relay-runner.mjs:ro"
+  -v "$BASE/netcheck.mjs:/app/tests/relay-isolated/netcheck.mjs:ro"
+  -v "$RUN/credentials.json:/run/credentials.json:ro"
+  -v "$RUN/manifest.json:/run/manifest.json:ro")
+PHASE=containers
+RELAY=$(podman create --pull=never --name "$PREFIX-relay" --network "$NET_A" --network "$NET_B" "${MOUNT[@]}" "$IMAGE" node tests/relay-isolated/relay-runner.mjs)
+CONTAINERS+=("$RELAY")
+podman start "$RELAY"
+HOST=$(podman create --pull=never --name "$PREFIX-host" --network "$NET_A" "${MOUNT[@]}" -v "$RUN/source.h264:/fixture/source.h264:ro" "$IMAGE" sleep 240)
+CONTAINERS+=("$HOST")
+podman start "$HOST"
+CLIENT=$(podman create --pull=never --name "$PREFIX-client" --network "$NET_B" "${MOUNT[@]}" -v "$RUN/received:/output:rw" "$IMAGE" sleep 240)
+CONTAINERS+=("$CLIENT")
+podman start "$CLIENT"
+ip() { podman inspect "$1" --format "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}"; }
+RELAY_A=$(ip "$RELAY" "$NET_A"); RELAY_B=$(ip "$RELAY" "$NET_B")
+IP_A=$(ip "$HOST" "$NET_A"); IP_B=$(ip "$CLIENT" "$NET_B")
+printf '{"host":"%s","client":"%s","relayA":"%s","relayB":"%s"}\n' "$IP_A" "$IP_B" "$RELAY_A" "$RELAY_B" >"$RUN/topology.json"
+wait_file() {
+  for ((i=0;i<40;i++)); do
+    if podman exec "$1" test -f "$2"; then return 0; fi
+    sleep .25
+  done
+  return 1
 }
-
-step "Scenario 1: automatic fallback (iceTransportPolicy=all, no direct path exists)"
-OUT_H="$ARTIFACTS/.relay-host.json"; OUT_C="$ARTIFACTS/.relay-client.json"
-ICE_POLICY=all run_peer "$C_A" host "$RELAY_A" "$RVURL_A" "$OUT_H" &
-HPID=$!
+wait_file "$RELAY" /tmp/turn-stats.json
+PHASE=isolation
+for role in host client relay; do
+  case "$role" in host) ctr=$HOST;; client) ctr=$CLIENT;; relay) ctr=$RELAY;; esac
+  podman exec "$ctr" node tests/relay-isolated/netcheck.mjs routes >"$RUN/$role-routes.json"
+  podman exec -d "$ctr" node tests/relay-isolated/netcheck.mjs listen 9999
+  wait_file "$ctr" /tmp/udp-9999.ready
+done
+probe() {
+  local expected="$1" label="$2" ctr="$3" address="$4" status=0
+  podman exec "$ctr" node tests/relay-isolated/netcheck.mjs probe "$address" 9999 2000 >"$RUN/$label.json" || status=$?
+  [[ $status == "$expected" ]]
+}
+# Verify each destination listener from the dual-homed relay, in addition to
+# peer->relay controls. Recheck controls after negative probes.
+probe 0 host-relay "$HOST" "$RELAY_A"
+probe 0 client-relay "$CLIENT" "$RELAY_B"
+probe 0 relay-host "$RELAY" "$IP_A"
+probe 0 relay-client "$RELAY" "$IP_B"
+probe 1 host-client-blocked "$HOST" "$IP_B"
+probe 1 client-host-blocked "$CLIENT" "$IP_A"
+probe 0 host-relay-after "$HOST" "$RELAY_A"
+probe 0 client-relay-after "$CLIENT" "$RELAY_B"
+printf '{"hostRelay":true,"clientRelay":true,"relayHost":true,"relayClient":true,"hostClientBlocked":true,"clientHostBlocked":true,"hostRelayAfter":true,"clientRelayAfter":true}\n' >"$RUN/isolation.json"
+PHASE=media
+podman exec "$HOST" node tests/relay-isolated/peer-runner.mjs host "ws://$RELAY_A:8787" "$RELAY_A" >"$RUN/host.log" 2>&1 &
+HPID=$!; PIDS+=("$HPID")
+sleep 1
+podman exec "$CLIENT" node tests/relay-isolated/peer-runner.mjs client "ws://$RELAY_B:8787" "$RELAY_B" >"$RUN/client.log" 2>&1 &
+CPID=$!; PIDS+=("$CPID")
+host_status=0; client_status=0
+wait "$HPID" || host_status=$?
+wait "$CPID" || client_status=$?
+PIDS=()
 sleep 2
-ICE_POLICY=all run_peer "$C_B" client "$RELAY_B" "$RVURL_B" "$OUT_C" &
-CPID=$!
-wait $HPID; wait $CPID
-
-HOST_JSON=$(grep -h '^RESULT:' "$OUT_H" 2>/dev/null | tail -1 | sed 's/^RESULT://')
-CLIENT_JSON=$(grep -h '^RESULT:' "$OUT_C" 2>/dev/null | tail -1 | sed 's/^RESULT://')
-
-if [[ -z "$HOST_JSON" || -z "$CLIENT_JSON" ]]; then
-  fail "a peer produced no result"
-  echo "--- host log ---"; tail -20 "$OUT_H"
-  echo "--- client log ---"; tail -20 "$OUT_C"
-else
-  echo "  host  : $HOST_JSON"
-  echo "  client: $CLIENT_JSON"
-
-  node -e '
-    const host = JSON.parse(process.argv[1]);
-    const client = JSON.parse(process.argv[2]);
-    const hostIp = process.argv[3];
-    const clientIp = process.argv[4];
-    let bad = 0;
-    const ok = (c, m) => { console.log(`  ${c ? "\x1b[32mPASS\x1b[0m" : "\x1b[31mFAIL\x1b[0m"} ${m}`); if (!c) bad = 1; };
-
-    ok(host.ok && client.ok, "both peers completed without error" + (host.error||client.error ? ` (${host.error||client.error})` : ""));
-
-    // The offering side reports its own relay candidate directly.
-    ok(host.transport?.relayed === true,
-       `host selected a RELAYED candidate pair (local=${host.transport?.localType})`);
-
-    // The answering side sees the relay as a PEER-REFLEXIVE remote, because the
-    // media arrives from the relay address rather than from the peer. So the
-    // precise check is: the client must NOT be talking to the peer\x27s address.
-    ok(client.transport?.remoteAddress && client.transport.remoteAddress !== hostIp,
-       `client\x27s remote is the relay (${client.transport?.remoteAddress}), not peer-a directly (${hostIp})`);
-    ok(host.transport?.remoteAddress !== clientIp || host.transport?.localType === "relay",
-       `host is not using a direct path to peer-b (${clientIp})`);
-
-    ok(host.sas && host.sas === client.sas, `SAS matched end to end ("${host.sas}")`);
-    ok(client.received > 0, `client received ${client.received} media frames`);
-    ok(client.received >= host.sent * 0.5, `no catastrophic loss: ${client.received}/${host.sent} frames`);
-    ok(client.rejected === 0, "every relayed frame authenticated");
-    process.exit(bad);
-  ' "$HOST_JSON" "$CLIENT_JSON" "$IP_A" "$IP_B" || FAILED=1
-fi
-
-step "Relay server accounting (independent evidence that bytes crossed the relay)"
-podman exec "$C_RELAY" cat /tmp/turn-stats.json 2>/dev/null | tee "$ARTIFACTS/.turn-stats.json" | sed 's/^/  /'
-STATS=$(cat "$ARTIFACTS/.turn-stats.json" 2>/dev/null)
-if [[ -n "$STATS" ]]; then
-  node -e '
-    const s = JSON.parse(process.argv[1]);
-    let bad = 0;
-    const ok = (c, m) => { console.log(`  ${c ? "\x1b[32mPASS\x1b[0m" : "\x1b[31mFAIL\x1b[0m"} ${m}`); if (!c) bad = 1; };
-    ok(s.allocations >= 2, `TURN served ${s.allocations} allocations`);
-    ok(s.relayedToPeer > 0 && s.relayedToClient > 0, `TURN forwarded both directions (${s.relayedToPeer} out, ${s.relayedToClient} in)`);
-    ok(s.bytesRelayed > 200000, `TURN relayed ${s.bytesRelayed} bytes of real traffic`);
-    ok(s.authFailures === 0, "no TURN auth failures");
-    process.exit(bad);
-  ' "$STATS" || FAILED=1
-else
-  fail "could not read TURN statistics"
-fi
-
-step "Result"
-if [[ $FAILED -eq 0 ]]; then
-  printf '  \033[32mALL RELAY ASSERTIONS PASSED\033[0m\n'
-  printf '  Peers with no route to each other streamed media through the relay.\n'
-else
-  printf '  \033[31mRELAY TEST FAILED\033[0m\n'
-fi
-info "log saved to $LOG"
-exit $FAILED
+podman logs "$RELAY" >"$RUN/relay.log" 2>&1
+podman exec "$RELAY" cat /tmp/turn-stats.json >"$RUN/turn-stats.json"
+[[ $host_status == 0 && $client_status == 0 ]]
+PHASE=host-verification
+python3 "$BASE/media-proof.py" verify "$RUN" >"$RUN/verification.log" 2>&1
+PHASE=complete

@@ -11,12 +11,9 @@ import fs from 'node:fs';
 import { startTurnServer } from '../../turn/src/server.mjs';
 import { startRendezvous } from '../../node/src/signal/server.mjs';
 
-const user = process.env.TURN_USER || 'penguin';
-const password = process.env.TURN_PASSWORD;
-if (!password) {
-  console.error('TURN_PASSWORD must be provided by the harness');
-  process.exit(2);
-}
+process.umask(0o077);
+const { user, password } = JSON.parse(fs.readFileSync('/run/credentials.json'));
+if (!password) throw new Error('private credential file required');
 
 const { server: turn } = await startTurnServer({
   port: 3478,
@@ -37,7 +34,8 @@ turn.on('allocation', (a) => console.log(`allocation -> relay port ${a.relayPort
 
 const dump = () => {
   try {
-    fs.writeFileSync('/tmp/turn-stats.json', JSON.stringify(turn.stats));
+    fs.writeFileSync('/tmp/turn-stats.tmp', JSON.stringify(turn.stats), { mode: 0o600 });
+    fs.renameSync('/tmp/turn-stats.tmp', '/tmp/turn-stats.json');
   } catch { /* container fs hiccup; not fatal */ }
 };
 setInterval(dump, 1000);

@@ -18,6 +18,8 @@ import { CHANNEL } from '../crypto/session.mjs';
 import { MAX_PAYLOAD } from '../transport/peer.mjs';
 import { Chunker, Reassembler } from '../media/chunker.mjs';
 import { CaptureEngine, ViewEngine } from '../media/engine.mjs';
+import { AudioCapture, AudioPlayer } from '../media/audio.mjs';
+import { createInputValidator } from '../media/input.mjs';
 
 export const DEFAULT_RENDEZVOUS = process.env.PENGUIN_RENDEZVOUS || 'ws://127.0.0.1:8787';
 
@@ -60,7 +62,7 @@ export class Host extends EventEmitter {
     this.engine = null;
     this.chunker = new Chunker({ maxPayload: MAX_PAYLOAD });
     this.stats = { framesSent: 0, bytesSent: 0, dropped: 0 };
-    this.allowInput = opts.allowInput !== false;
+    this.allowInput = opts.allowInput === true;
   }
 
   /**
@@ -112,6 +114,7 @@ export class Host extends EventEmitter {
 
     this.engine = new CaptureEngine({
       source: this.opts.source,
+      allowInput: this.allowInput,
       fps: this.opts.fps ?? 60,
       bitrateKbps: this.opts.bitrateKbps ?? 15000,
       encoder: this.opts.encoder,
@@ -154,20 +157,36 @@ export class Host extends EventEmitter {
       if (msg?.t === 'keyframe-request') this.engine?.requestKeyframe();
     });
 
+    const validateInput = createInputValidator();
     peer.on('input', (event) => {
-      if (!this.allowInput) return;           // host disabled remote control
-      this.emit('input', event);
-      this.engine?.sendInput(event);
+      if (!this.allowInput || peer.state !== 'secure') return;
+      const valid = validateInput(event);
+      if (!valid) return;
+      this.emit('input', valid);
+      this.engine?.sendInput(valid);
     });
 
     peer.on('closed', (reason) => this.close(reason));
 
     this.engine.start();
+    if (this.opts.audio === true) {
+      this.audio = new AudioCapture({ enabled: true, maxPayload: MAX_PAYLOAD });
+      this.audio.on('error', e => this.emit('log', `audio stopped: ${e.message}`));
+      this.audio.on('data', payload => {
+        if (peer.state !== 'secure' || peer.bufferedAmount > 65536) return;
+        try { peer.sendMedia(CHANNEL.AUDIO, payload); } catch { void this.audio?.stop(); }
+      });
+      try { this.audio.start(); } catch (e) {
+        this.emit('log', `audio unavailable: ${e.message}`); void this.audio.stop();
+      }
+    }
   }
 
   close(reason = 'closed') {
     if (this._closed) return;
     this._closed = true;
+    if (this.allowInput) this.engine?.sendInput({ t: 'release_all' });
+    void this.audio?.stop();
     this.engine?.stop();
     this.session?.close();
     this.emit('closed', reason);
@@ -211,12 +230,8 @@ export class Viewer extends EventEmitter {
     this.emit('sas', { phrase: peer.sas.phrase, words: peer.sas.words });
     this.emit('secure', this.session.transport);
 
-    // Remember the host we just verified, so a future session can show whether
-    // this is the same machine.
-    this.trust.trust(peer.remoteStatic, {
-      label: this.opts.hostLabel || 'paired host',
-      role: 'host',
-    });
+    // Displaying SAS is not proof the viewer verified it. Do not persist trust
+    // without an explicit verification action.
 
     this.engine = new ViewEngine({
       title: this.opts.title || 'penguin-stream',
@@ -229,6 +244,16 @@ export class Viewer extends EventEmitter {
     this.engine.on('exit', () => this.close('viewer window closed'));
     this.engine.on('error', (e) => this.emit('error', e));
     this.engine.start();
+    if (this.opts.audio === true) {
+      this.audio = new AudioPlayer({ enabled: true, maxPayload: MAX_PAYLOAD });
+      this.audio.on('error', e => this.emit('log', `audio stopped: ${e.message}`));
+      peer.on('audio', payload => {
+        if (peer.state !== 'secure') return;
+        try { this.audio.write(payload); } catch (e) {
+          this.emit('log', `audio unavailable: ${e.message}`); void this.audio.stop();
+        }
+      });
+    }
 
     peer.on('control', (msg) => {
       if (msg?.t === 'media-config') {
@@ -267,6 +292,7 @@ export class Viewer extends EventEmitter {
     if (this._closed) return;
     this._closed = true;
     if (this._keyframeTimer) clearInterval(this._keyframeTimer);
+    void this.audio?.stop();
     this.engine?.stop();
     this.session?.close();
     this.emit('closed', reason);

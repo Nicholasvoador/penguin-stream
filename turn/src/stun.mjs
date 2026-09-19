@@ -68,16 +68,27 @@ export function isChannelData(buf) {
 }
 
 export function isStun(buf) {
-  return buf.length >= 20
+  return Buffer.isBuffer(buf) && buf.length >= 20
     && (buf[0] & 0xc0) === 0x00
     && buf.readUInt32BE(4) === MAGIC_COOKIE;
 }
+
+// Peer addresses remain repeatable for CreatePermission, unlike security and
+// scalar control attributes whose first/last-wins interpretation is ambiguous.
+const SINGLETON_ATTRS = new Set([
+  Attr.USERNAME, Attr.REALM, Attr.NONCE, Attr.MESSAGE_INTEGRITY,
+  Attr.FINGERPRINT, Attr.LIFETIME, Attr.REQUESTED_TRANSPORT, Attr.CHANNEL_NUMBER,
+]);
+const FIXED_LENGTHS = new Map([
+  [Attr.MESSAGE_INTEGRITY, 20], [Attr.FINGERPRINT, 4], [Attr.LIFETIME, 4],
+  [Attr.REQUESTED_TRANSPORT, 4], [Attr.CHANNEL_NUMBER, 4],
+]);
 
 export function parse(buf) {
   if (!isStun(buf)) return null;
   const type = buf.readUInt16BE(0);
   const length = buf.readUInt16BE(2);
-  if (20 + length > buf.length) return null;
+  if (length % 4 !== 0 || 20 + length !== buf.length) return null;
 
   const { method, cls } = decodeType(type);
   const transactionId = Buffer.from(buf.subarray(8, 20));
@@ -86,16 +97,27 @@ export function parse(buf) {
 
   let off = 20;
   const end = 20 + length;
-  while (off + 4 <= end) {
+  while (off < end) {
+    if (off + 4 > end) return null;
     const atype = buf.readUInt16BE(off);
     const alen = buf.readUInt16BE(off + 2);
     const vstart = off + 4;
-    if (vstart + alen > end) break;
+    const next = vstart + alen + ((4 - (alen % 4)) % 4);
+    if (next > end) return null;
+    if (SINGLETON_ATTRS.has(atype) && attrs.has(atype)) return null;
+    if (FIXED_LENGTHS.has(atype) && alen !== FIXED_LENGTHS.get(atype)) return null;
+    // Nothing after MI except a final, valid fingerprint may reach handlers.
+    if (attrs.has(Attr.MESSAGE_INTEGRITY) && atype !== Attr.FINGERPRINT) return null;
+    if (atype === Attr.FINGERPRINT) {
+      if (next !== end) return null;
+      const expected = (crc32(buf.subarray(0, off)) ^ 0x5354554e) >>> 0;
+      if (buf.readUInt32BE(vstart) !== expected) return null;
+    }
     const value = Buffer.from(buf.subarray(vstart, vstart + alen));
-    // Later duplicates are ignored per RFC; first occurrence wins.
+    // For repeatable/non-security attributes, the map keeps the first value.
     if (!attrs.has(atype)) attrs.set(atype, value);
     raw.push({ type: atype, offset: off, length: alen, value });
-    off = vstart + alen + ((4 - (alen % 4)) % 4); // 4-byte alignment padding
+    off = next;
   }
 
   return { type, method, cls, length, transactionId, attrs, raw, buffer: buf };
@@ -119,10 +141,11 @@ export function encodeXorAddress(family, ip, port, transactionId) {
 export function decodeXorAddress(value, transactionId) {
   if (value.length < 8) return null;
   const family = value.readUInt8(1);
+  if (family !== 0x01 && family !== 0x02) return null;
   const port = value.readUInt16BE(2) ^ (MAGIC_COOKIE >>> 16);
   const isV6 = family === 0x02;
   const len = isV6 ? 16 : 4;
-  if (value.length < 4 + len) return null;
+  if (value.length !== 4 + len) return null;
 
   const mask = isV6 ? Buffer.concat([COOKIE_BUF, transactionId]) : COOKIE_BUF;
   const addr = Buffer.alloc(len);
@@ -253,6 +276,9 @@ export function longTermKey(username, realm, password) {
  * rewritten to include it.
  */
 export function verifyMessageIntegrity(msg, key) {
+  // Revalidate wire bytes rather than trusting caller-provided raw/attrs.
+  msg = parse(msg?.buffer);
+  if (!msg) return false;
   const mi = msg.raw.find((a) => a.type === Attr.MESSAGE_INTEGRITY);
   if (!mi || mi.length !== 20) return false;
 

@@ -60,6 +60,7 @@ test('captured H.264 survives the encrypted transport and decodes with ffmpeg', 
   });
 
   const [host, client] = await Promise.all([hostPromise, clientPromise]);
+  t.after(async () => { host.close(); client.close(); h.cleanup(); c.cleanup(); await rv.close(); });
 
   // ---- viewer side: reassemble what arrives ----
   const reassembler = new Reassembler();
@@ -80,6 +81,7 @@ test('captured H.264 survives the encrypted transport and decodes with ffmpeg', 
     maxFrames: FRAMES,
   });
 
+  t.after(() => engine.stop());
   const sentFrames = [];
   const engineErrors = [];
   engine.on('error', (e) => engineErrors.push(e.message));
@@ -88,7 +90,7 @@ test('captured H.264 survives the encrypted transport and decodes with ffmpeg', 
   const configPromise = new Promise((resolve, reject) => {
     engine.once('config', resolve);
     engine.once('exit', ({ code: ec }) => reject(new Error(`ps-media exited early (code ${ec})`)));
-    setTimeout(() => reject(new Error('no config from ps-media within 20s')), 20_000);
+    setTimeout(() => reject(new Error('no config from ps-media within 20s')), 20_000).unref();
   });
 
   engine.on('video', (v) => {
@@ -108,7 +110,7 @@ test('captured H.264 survives the encrypted transport and decodes with ffmpeg', 
   assert.ok(config.encoder, 'engine must report which encoder it used');
 
   const exited = new Promise((resolve) => engine.once('exit', resolve));
-  await Promise.race([exited, new Promise((r) => setTimeout(r, 40_000))]);
+  await Promise.race([exited, new Promise((r) => setTimeout(r, 40_000).unref())]);
   // Let the tail of the stream drain across the network.
   await new Promise((r) => setTimeout(r, 1500));
 
@@ -160,9 +162,4 @@ test('captured H.264 survives the encrypted transport and decodes with ffmpeg', 
   t.diagnostic(`sent ${sentFrames.length} frames, received ${received.length}, ffmpeg decoded ${decoded}`);
 
   engine.stop();
-  host.close();
-  client.close();
-  h.cleanup();
-  c.cleanup();
-  await rv.close();
 });

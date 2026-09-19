@@ -7,7 +7,7 @@
  *   Allocate (401 challenge -> authenticated retry), Refresh, CreatePermission,
  *   ChannelBind, Send/Data indications, and ChannelData framing.
  *
- * Not implemented: TCP/TLS transports, EVEN-PORT, RESERVATION-TOKEN, quotas,
+ * Not implemented: TCP/TLS transports, EVEN-PORT, RESERVATION-TOKEN, per-user quotas,
  * bandwidth accounting. It is a test and self-hosting relay, not a public one.
  * See LIMITATIONS.md before pointing anything untrusted at it.
  */
@@ -94,9 +94,18 @@ export class TurnServer extends EventEmitter {
    * @param {string} opts.realm
    * @param {Record<string,string>} opts.users username -> password
    * @param {string} [opts.relayAddress] address advertised in XOR-RELAYED-ADDRESS
+   * @param {number} [opts.maxNonces=1024] global challenge cache cap (FIFO eviction)
+   * @param {number} [opts.maxAllocations=128] global active plus pending relay cap
    */
-  constructor({ realm = 'penguin-stream', users = {}, relayAddress = '127.0.0.1', listenAddress = '127.0.0.1', multiHomed = false } = {}) {
+  constructor({ realm = 'penguin-stream', users = {}, relayAddress = '127.0.0.1', listenAddress = '127.0.0.1', multiHomed = false, maxNonces = 1024, maxAllocations = 128 } = {}) {
     super();
+    for (const limit of [maxNonces, maxAllocations]) {
+      if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError('TURN limits must be positive safe integers');
+    }
+    this.maxNonces = maxNonces;
+    this.maxAllocations = maxAllocations;
+    this._pendingAllocations = new Map(); // client tuple -> binding relay socket
+    this._closed = false;
     this.realm = realm;
     this.users = users;
     this.relayAddress = relayAddress;
@@ -132,7 +141,7 @@ export class TurnServer extends EventEmitter {
 
   /** Config block ready to hand to Peer({ iceServers }). */
   iceServerConfig(username) {
-    const password = this.users[username];
+    const password = Object.hasOwn(this.users, username) ? this.users[username] : undefined;
     if (!password) throw new Error(`no such TURN user: ${username}`);
     return {
       hostname: this.relayAddress,
@@ -144,9 +153,15 @@ export class TurnServer extends EventEmitter {
   }
 
   close() {
+    this._closed = true;
     clearInterval(this._sweep);
+    for (const relay of this._pendingAllocations.values()) {
+      try { relay.close(); } catch { /* not bound */ }
+    }
+    this._pendingAllocations.clear();
     for (const a of this.allocations.values()) a.close();
     this.allocations.clear();
+    this.nonces.clear();
     try { this.socket?.close(); } catch { /* already closed */ }
   }
 
@@ -159,19 +174,39 @@ export class TurnServer extends EventEmitter {
   #sweep() {
     const now = Date.now();
     for (const [k, a] of this.allocations) {
-      if (a.expiresAt <= now) { a.close(); this.allocations.delete(k); }
+      if (a.expiresAt <= now) { a.close(); this.allocations.delete(k); continue; }
+      for (const [ip, exp] of a.permissions) if (exp <= now) a.permissions.delete(ip);
+      for (const [channel, binding] of a.channels) {
+        if (binding.expiry <= now) {
+          a.channels.delete(channel);
+          a.byPeer.delete(key5(binding.addr, binding.port));
+        }
+      }
     }
     for (const [n, exp] of this.nonces) if (exp <= now) this.nonces.delete(n);
   }
 
   #newNonce() {
+    // Bound unauthenticated challenge state. Evicted nonces get a fresh 438.
+    while (this.nonces.size >= this.maxNonces) this.nonces.delete(this.nonces.keys().next().value);
     const nonce = crypto.randomBytes(16).toString('hex');
     this.nonces.set(nonce, Date.now() + NONCE_LIFETIME_MS);
     return nonce;
   }
 
   #send(buf, rinfo) {
+    if (this._closed) return;
     this.socket.send(buf, rinfo.port, rinfo.address);
+  }
+
+  #liveAllocation(id) {
+    const alloc = this.allocations.get(id);
+    if (alloc && alloc.expiresAt <= Date.now()) {
+      alloc.close();
+      this.allocations.delete(id);
+      return undefined;
+    }
+    return alloc;
   }
 
   #sendError(msg, rinfo, code, reason, extra = () => {}) {
@@ -207,7 +242,7 @@ export class TurnServer extends EventEmitter {
       return null;
     }
 
-    const password = this.users[username];
+    const password = Object.hasOwn(this.users, username) ? this.users[username] : undefined;
     if (!password || realm !== this.realm) {
       this.stats.authFailures++;
       this.#sendError(msg, rinfo, 401, 'Unauthorized', (b) => {
@@ -229,6 +264,7 @@ export class TurnServer extends EventEmitter {
   }
 
   #onClientMessage(msg, rinfo) {
+    if (this._closed) return;
     try {
       if (isChannelData(msg)) return this.#onChannelData(msg, rinfo);
       if (!isStun(msg)) return;
@@ -268,8 +304,8 @@ export class TurnServer extends EventEmitter {
     if (!auth) return;
 
     const id = key5(rinfo.address, rinfo.port);
-    const existing = this.allocations.get(id);
-    if (existing) {
+    const existing = this.#liveAllocation(id);
+    if (existing || this._pendingAllocations.has(id)) {
       // RFC 5766 §6.2: a retransmitted Allocate must not create a second
       // allocation. Different transaction => 437.
       return this.#sendError(msg, rinfo, 437, 'Allocation Mismatch');
@@ -280,9 +316,30 @@ export class TurnServer extends EventEmitter {
       return this.#sendError(msg, rinfo, 442, 'Unsupported Transport Protocol');
     }
 
+    this.#sweep();
+    if (this.allocations.size + this._pendingAllocations.size >= this.maxAllocations) {
+      return this.#sendError(msg, rinfo, 486, 'Allocation Quota Reached');
+    }
+    const lifetime = Math.min(
+      msg.attrs.get(Attr.LIFETIME)?.readUInt32BE(0) ?? DEFAULT_LIFETIME,
+      MAX_LIFETIME,
+    );
     const relay = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-    relay.on('error', () => { /* transient relay socket errors are non-fatal */ });
-    relay.bind(0, this.listenAddress, () => {
+    // Reserve before async bind so duplicate packets cannot leak relay sockets.
+    this._pendingAllocations.set(id, relay);
+    const failed = () => {
+      if (this._pendingAllocations.get(id) !== relay) return;
+      this._pendingAllocations.delete(id);
+      try { relay.close(); } catch { /* not bound */ }
+      this.#sendError(msg, rinfo, 508, 'Insufficient Capacity');
+    };
+    relay.on('error', failed);
+    const bound = () => {
+      if (this._closed || this._pendingAllocations.get(id) !== relay) {
+        try { relay.close(); } catch { /* already closed */ }
+        return;
+      }
+      this._pendingAllocations.delete(id);
       const alloc = new Allocation({
         socket: relay,
         username: auth.username,
@@ -295,10 +352,6 @@ export class TurnServer extends EventEmitter {
 
       relay.on('message', (data, peer) => this.#onPeerMessage(alloc, data, peer));
 
-      const lifetime = Math.min(
-        msg.attrs.get(Attr.LIFETIME)?.readUInt32BE(0) ?? DEFAULT_LIFETIME,
-        MAX_LIFETIME,
-      );
       alloc.expiresAt = Date.now() + lifetime * 1000;
 
       const b = new MessageBuilder(Method.ALLOCATE, Class.SUCCESS, msg.transactionId)
@@ -308,14 +361,16 @@ export class TurnServer extends EventEmitter {
         .addUInt32(Attr.LIFETIME, lifetime);
       this.#send(b.build({ integrityKey: auth.key }), rinfo);
       this.emit('allocation', { username: auth.username, relayPort: alloc.relayPort });
-    });
+    };
+    try { relay.bind(0, this.listenAddress, bound); } catch { failed(); }
   }
 
   #onRefresh(msg, rinfo) {
     const auth = this.#authenticate(msg, rinfo);
     if (!auth) return;
-    const alloc = this.allocations.get(key5(rinfo.address, rinfo.port));
+    const alloc = this.#liveAllocation(key5(rinfo.address, rinfo.port));
     if (!alloc) return this.#sendError(msg, rinfo, 437, 'Allocation Mismatch');
+    if (alloc.username !== auth.username) return this.#sendError(msg, rinfo, 441, 'Wrong Credentials');
 
     const requested = msg.attrs.get(Attr.LIFETIME)?.readUInt32BE(0) ?? DEFAULT_LIFETIME;
     const lifetime = Math.min(requested, MAX_LIFETIME);
@@ -335,17 +390,17 @@ export class TurnServer extends EventEmitter {
   #onCreatePermission(msg, rinfo) {
     const auth = this.#authenticate(msg, rinfo);
     if (!auth) return;
-    const alloc = this.allocations.get(key5(rinfo.address, rinfo.port));
+    const alloc = this.#liveAllocation(key5(rinfo.address, rinfo.port));
     if (!alloc) return this.#sendError(msg, rinfo, 437, 'Allocation Mismatch');
+    if (alloc.username !== auth.username) return this.#sendError(msg, rinfo, 441, 'Wrong Credentials');
 
     // A request may carry several XOR-PEER-ADDRESS attributes.
     const peers = msg.raw.filter((a) => a.type === Attr.XOR_PEER_ADDRESS);
     if (peers.length === 0) return this.#sendError(msg, rinfo, 400, 'Bad Request');
 
-    for (const p of peers) {
-      const addr = decodeXorAddress(p.value, msg.transactionId);
-      if (addr) { alloc.addPermission(addr.address); this.stats.permissions++; }
-    }
+    const addresses = peers.map((p) => decodeXorAddress(p.value, msg.transactionId));
+    if (addresses.some((addr) => !addr || addr.family !== 4)) return this.#sendError(msg, rinfo, 400, 'Bad Request');
+    for (const addr of addresses) { alloc.addPermission(addr.address); this.stats.permissions++; }
 
     const b = new MessageBuilder(Method.CREATE_PERMISSION, Class.SUCCESS, msg.transactionId);
     this.#send(b.build({ integrityKey: auth.key }), rinfo);
@@ -354,8 +409,9 @@ export class TurnServer extends EventEmitter {
   #onChannelBind(msg, rinfo) {
     const auth = this.#authenticate(msg, rinfo);
     if (!auth) return;
-    const alloc = this.allocations.get(key5(rinfo.address, rinfo.port));
+    const alloc = this.#liveAllocation(key5(rinfo.address, rinfo.port));
     if (!alloc) return this.#sendError(msg, rinfo, 437, 'Allocation Mismatch');
+    if (alloc.username !== auth.username) return this.#sendError(msg, rinfo, 441, 'Wrong Credentials');
 
     const chAttr = msg.attrs.get(Attr.CHANNEL_NUMBER);
     const peerAttr = msg.attrs.get(Attr.XOR_PEER_ADDRESS);
@@ -366,12 +422,17 @@ export class TurnServer extends EventEmitter {
       return this.#sendError(msg, rinfo, 400, 'Bad Request');
     }
     const peer = decodeXorAddress(peerAttr, msg.transactionId);
-    if (!peer) return this.#sendError(msg, rinfo, 400, 'Bad Request');
+    if (!peer || peer.family !== 4 || peer.port === 0) return this.#sendError(msg, rinfo, 400, 'Bad Request');
 
+    this.#sweep();
     const peerKey = key5(peer.address, peer.port);
     const boundTo = alloc.channels.get(channel);
     if (boundTo && key5(boundTo.addr, boundTo.port) !== peerKey) {
       return this.#sendError(msg, rinfo, 400, 'Channel already bound to another peer');
+    }
+
+    if (alloc.byPeer.has(peerKey) && alloc.byPeer.get(peerKey) !== channel) {
+      return this.#sendError(msg, rinfo, 400, 'Peer already bound to another channel');
     }
 
     alloc.channels.set(channel, { addr: peer.address, port: peer.port, expiry: Date.now() + CHANNEL_LIFETIME_MS });
@@ -385,7 +446,7 @@ export class TurnServer extends EventEmitter {
 
   /** Client -> peer, unbound path. Indications are not authenticated per RFC. */
   #onSendIndication(msg, rinfo) {
-    const alloc = this.allocations.get(key5(rinfo.address, rinfo.port));
+    const alloc = this.#liveAllocation(key5(rinfo.address, rinfo.port));
     if (!alloc) return;
 
     const peerAttr = msg.attrs.get(Attr.XOR_PEER_ADDRESS);
@@ -393,7 +454,7 @@ export class TurnServer extends EventEmitter {
     if (!peerAttr || !data) return;
 
     const peer = decodeXorAddress(peerAttr, msg.transactionId);
-    if (!peer) return;
+    if (!peer || peer.family !== 4 || peer.port === 0) return;
     if (!alloc.hasPermission(peer.address)) return; // silently dropped per RFC
 
     alloc.socket.send(data, peer.port, peer.address);
@@ -405,7 +466,7 @@ export class TurnServer extends EventEmitter {
 
   /** Client -> peer, channel path. This is what carries the bulk of media. */
   #onChannelData(msg, rinfo) {
-    const alloc = this.allocations.get(key5(rinfo.address, rinfo.port));
+    const alloc = this.#liveAllocation(key5(rinfo.address, rinfo.port));
     if (!alloc) return;
 
     const channel = msg.readUInt16BE(0);
@@ -413,7 +474,7 @@ export class TurnServer extends EventEmitter {
     if (4 + length > msg.length) return;
 
     const binding = alloc.channels.get(channel);
-    if (!binding || binding.expiry <= Date.now()) return;
+    if (!binding || binding.expiry <= Date.now() || !alloc.hasPermission(binding.addr)) return;
 
     const data = msg.subarray(4, 4 + length);
     alloc.socket.send(data, binding.port, binding.addr);
@@ -425,15 +486,17 @@ export class TurnServer extends EventEmitter {
 
   /** Peer -> client. Prefer ChannelData framing when a channel is bound. */
   #onPeerMessage(alloc, data, peer) {
+    if (this._closed || this.#liveAllocation(key5(alloc.clientAddr, alloc.clientPort)) !== alloc) return;
     if (!alloc.hasPermission(peer.address)) return;
 
     const channel = alloc.byPeer.get(key5(peer.address, peer.port));
+    const binding = alloc.channels.get(channel);
     this.stats.relayedToClient++;
     this.stats.bytesRelayed += data.length;
     alloc.bytesRelayed += data.length;
     alloc.packetsRelayed++;
 
-    if (channel !== undefined) {
+    if (binding && binding.expiry > Date.now()) {
       const pad = (4 - (data.length % 4)) % 4;
       const frame = Buffer.alloc(4 + data.length + pad);
       frame.writeUInt16BE(channel, 0);

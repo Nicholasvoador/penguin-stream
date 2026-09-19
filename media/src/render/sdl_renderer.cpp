@@ -12,6 +12,8 @@
 #include <SDL2/SDL.h>
 
 #include <algorithm>
+#include <cmath>
+#include <memory>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -84,13 +86,15 @@ int runView(int argc, char** argv) {
     return 1;
   }
 
-  SharedFrame shared;
-  Decoder decoder;
-  bool decoderOpen = false;
-  int streamW = 0, streamH = 0;
+  auto sharedOwner = std::make_shared<SharedFrame>();
+  SharedFrame& shared = *sharedOwner;
 
-  // Reader thread: blocking stdio reads must not stall the render loop.
-  std::thread reader([&] {
+  // The reader may outlive the SDL loop while stdin blocks. Own all of its
+  // state by value, never capture the returning runView stack by reference.
+  std::thread reader([sharedOwner] {
+    SharedFrame& shared = *sharedOwner;
+    Decoder decoder;
+    bool decoderOpen = false;
     Message msg;
     std::string err;
     while (!g_quit && readMessage(stdin, msg, &err)) {
@@ -101,8 +105,11 @@ int runView(int argc, char** argv) {
         jsonGetNumber(json, "width", w);
         jsonGetNumber(json, "height", h);
         jsonGetString(json, "extradata", extraHex);
-        streamW = static_cast<int>(w);
-        streamH = static_cast<int>(h);
+        if (!std::isfinite(w) || !std::isfinite(h) || w < 2 || h < 2 || w > 8192 || h > 8192 ||
+            extraHex.size() > 1024 * 1024 || extraHex.size() % 2 ||
+            extraHex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+          fprintf(stderr, "invalid media configuration\n"); g_quit = true; return;
+        }
 
         std::string derr;
         if (!decoder.open(hexToBytes(extraHex), derr)) {

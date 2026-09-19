@@ -131,6 +131,7 @@ export class CaptureEngine extends EventEmitter {
     if (this.opts.width) args.push('--width', String(this.opts.width));
     if (this.opts.height) args.push('--height', String(this.opts.height));
     if (this.opts.maxFrames) args.push('--max-frames', String(this.opts.maxFrames));
+    if (this.opts.allowInput === true) args.push('--allow-input');
 
     this.proc = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 

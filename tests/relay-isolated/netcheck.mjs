@@ -1,59 +1,42 @@
-/**
- * UDP reachability probe used to verify the test topology before we trust any
- * relay result.
- *
- * ICMP would be the obvious tool, but the container image has no ping, and UDP
- * is what actually carries our media anyway - so this measures the thing we
- * care about.
- *
- *   node netcheck.mjs listen <port>
- *   node netcheck.mjs probe  <host> <port> [timeoutMs]
- *
- * probe exits 0 if a reply came back ("REACHABLE"), 1 if it timed out
- * ("UNREACHABLE").
+/** UDP echo probes with nonce/source validation; timeout=1, infrastructure error=2.
+ * routes asserts no IPv4/IPv6 default route, without sending external traffic.
  */
-
 import dgram from 'node:dgram';
-
-const [mode, a, b, c] = process.argv.slice(2);
-
-if (mode === 'listen') {
-  const port = Number(a || 9999);
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const [mode, host, portArg, timeoutArg] = process.argv.slice(2);
+if (mode === 'routes') {
+  const ipv4 = fs.readFileSync('/proc/net/route', 'utf8').trim().split('\n').slice(1).map((s) => s.trim().split(/\s+/));
+  const ipv6 = fs.readFileSync('/proc/net/ipv6_route', 'utf8').trim().split('\n').filter(Boolean).map((s) => s.trim().split(/\s+/));
+  const noDefaultRoute = !ipv4.some((r) => r[1] === '00000000' && r[7] === '00000000');
+  // Ignore kernel's unreachable IPv6 reject-route sentinel (RTF_REJECT=0x200).
+  const ipv6DefaultAbsent = !ipv6.some((r) => r[0] === '0'.repeat(32) && r[1] === '00' && !(parseInt(r[8], 16) & 0x200));
+  console.log(JSON.stringify({ noDefaultRoute, ipv6DefaultAbsent, ipv4, ipv6 }));
+  assert(noDefaultRoute && ipv6DefaultAbsent, 'external default route present');
+} else if (mode === 'listen') {
   const sock = dgram.createSocket('udp4');
-  sock.on('message', (msg, rinfo) => {
-    sock.send(Buffer.concat([Buffer.from('pong:'), msg]), rinfo.port, rinfo.address);
-  });
-  sock.bind(port, '0.0.0.0', () => console.log(`listening udp/${port}`));
+  sock.on('message', (msg, remote) => sock.send(msg, remote.port, remote.address));
+  sock.bind(Number(host), '0.0.0.0', () => fs.writeFileSync(`/tmp/udp-${host}.ready`, 'ready'));
 } else if (mode === 'probe') {
-  const host = a;
-  const port = Number(b);
-  const timeout = Number(c || 4000);
   const sock = dgram.createSocket('udp4');
-  let settled = false;
-
-  const finish = (reachable, detail) => {
-    if (settled) return;
-    settled = true;
-    console.log(reachable ? `REACHABLE ${detail}` : `UNREACHABLE ${detail}`);
-    try { sock.close(); } catch { /* already closed */ }
-    process.exit(reachable ? 0 : 1);
-  };
-
-  sock.on('message', (msg) => finish(true, msg.toString().slice(0, 32)));
-  sock.on('error', (err) => finish(false, `socket error: ${err.message}`));
-
-  // Retry a few times: a single lost datagram must not read as "isolated".
-  let attempts = 0;
-  const tick = setInterval(() => {
-    if (settled) return clearInterval(tick);
-    attempts++;
-    sock.send(Buffer.from(`ping-${attempts}`), port, host, (err) => {
-      if (err && attempts >= 3) finish(false, `send failed: ${err.message}`);
-    });
-  }, 500);
-
-  setTimeout(() => { clearInterval(tick); finish(false, `no reply in ${timeout}ms after ${attempts} attempts`); }, timeout);
+  const port = Number(portArg), timeout = Number(timeoutArg || 2000);
+  const nonce = crypto.randomBytes(24);
+  let sent = 0, errors = 0, noRoute = 0;
+  const finish = (code) => { console.log(JSON.stringify({ status: code === 1 && noRoute ? 'no-route' : ['reachable', 'timeout', 'error'][code], sent, errors, noRoute })); sock.close(); process.exit(code); };
+  sock.on('message', (msg, r) => {
+    if (r.address === host && r.port === port && msg.equals(nonce)) finish(0);
+  });
+  sock.on('error', () => finish(2));
+  const send = () => sock.send(nonce, port, host, (err) => {
+    if (err?.code === 'ENETUNREACH' || err?.code === 'EHOSTUNREACH') noRoute++;
+    else if (err) errors++;
+    else sent++;
+  });
+  send();
+  setInterval(send, 200);
+  setTimeout(() => finish(sent + noRoute >= 3 && errors === 0 ? 1 : 2), timeout);
 } else {
-  console.error('usage: netcheck.mjs listen <port> | probe <host> <port> [timeoutMs]');
+  console.error('usage: routes | listen port | probe host port [timeoutMs]');
   process.exit(2);
 }

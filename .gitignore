@@ -2,6 +2,8 @@ node_modules/
 media/build/
 artifacts/*.log
 artifacts/*.raw
+artifacts/*.framed
+artifacts/*.py
 artifacts/*.h264
 artifacts/*.mp4
 *.tmp

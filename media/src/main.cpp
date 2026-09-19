@@ -28,6 +28,14 @@ extern "C" {
 #include <cstring>
 #include <string>
 #include <vector>
+#include <cerrno>
+#include <csignal>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#endif
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -61,7 +69,7 @@ std::unique_ptr<CaptureSource> makeCaptureSource(const std::string& forced, std:
   }
 #endif
 
-  if (forced.empty()) { chosen = "synthetic"; return makeSyntheticSource(); }
+  // Never silently substitute a generated pattern for a real desktop.
   chosen.clear();
   return nullptr;
 }
@@ -69,6 +77,8 @@ std::unique_ptr<CaptureSource> makeCaptureSource(const std::string& forced, std:
 namespace {
 
 std::atomic<bool> g_running{true};
+volatile std::sig_atomic_t g_stopRequested = 0;
+void stopSignal(int) { g_stopRequested = 1; }
 
 uint64_t nowMicros() {
   return static_cast<uint64_t>(
@@ -273,12 +283,83 @@ int runSelftest(int argc, char** argv) {
 
 /* ------------------------------ capture ------------------------------- */
 
+// Stdin is drained only on the capture thread: no blocked reader owns a
+// source/encoder pointer after teardown. Bound both framing and work per tick.
+class CaptureControls {
+ public:
+#ifndef _WIN32
+  CaptureControls() {
+    flags_ = fcntl(STDIN_FILENO, F_GETFL, 0);
+    active_ = flags_ >= 0 && fcntl(STDIN_FILENO, F_SETFL, flags_ | O_NONBLOCK) == 0;
+  }
+  ~CaptureControls() { if (active_) fcntl(STDIN_FILENO, F_SETFL, flags_); }
+  bool drain(CaptureSource& source, Encoder& encoder, bool allowInput, bool& shutdown) {
+    if (!active_ || eof_) return true;
+    for (int tick = 0; tick < 32; ++tick) {
+      if (buffer_.size() >= 4) {
+        const uint32_t length = uint32_t(buffer_[0]) | (uint32_t(buffer_[1]) << 8) |
+            (uint32_t(buffer_[2]) << 16) | (uint32_t(buffer_[3]) << 24);
+        if (length < 1 || length > 1025) return false;
+        if (buffer_.size() >= length + 4) {
+          const auto type = static_cast<MsgType>(buffer_[4]);
+          const std::string body(buffer_.begin() + 5, buffer_.begin() + 4 + length);
+          buffer_.erase(buffer_.begin(), buffer_.begin() + 4 + length);
+          if (type == MsgType::Shutdown) { shutdown = true; return true; }
+          if (type == MsgType::Input && allowInput) source.input(body);
+          if (type == MsgType::Control) {
+            // Accept the exact control object modulo whitespace OUTSIDE strings.
+            std::string compact;
+            bool quoted = false;
+            for (char c : body) {
+              if (c == '"') quoted = !quoted;
+              if (quoted || (c != ' ' && c != '\t' && c != '\r' && c != '\n')) compact += c;
+            }
+            if (compact == "{\"t\":\"keyframe\"}") encoder.requestKeyframe();
+          }
+          continue;
+        }
+      }
+      pollfd fd{STDIN_FILENO, POLLIN, 0};
+      const int ready = poll(&fd, 1, 0);
+      if (ready < 0) return errno == EINTR;
+      if (!ready) return true;
+      if (fd.revents & (POLLERR | POLLNVAL)) return false;
+      uint8_t bytes[1024];
+      const ssize_t size = read(STDIN_FILENO, bytes, sizeof(bytes));
+      if (size == 0) {
+        eof_ = true;
+        // EOF revokes held inputs, but permits standalone capture </dev/null.
+        if (allowInput) source.input("{\"t\":\"release_all\"}");
+        return buffer_.empty();
+      }
+      if (size < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+      buffer_.insert(buffer_.end(), bytes, bytes + size);
+      if (buffer_.size() > 2053) return false;
+    }
+    return true;
+  }
+ private:
+  int flags_ = -1;
+  bool active_ = false, eof_ = false;
+  std::vector<uint8_t> buffer_;
+#else
+  bool drain(CaptureSource&, Encoder&, bool, bool&) { return true; }
+#endif
+};
+
 int runCapture(int argc, char** argv) {
 #ifdef _WIN32
   _setmode(_fileno(stdout), _O_BINARY);
   _setmode(_fileno(stdin), _O_BINARY);
 #endif
 
+  std::signal(SIGTERM, stopSignal);
+  std::signal(SIGINT, stopSignal);
+#ifndef _WIN32
+  std::signal(SIGPIPE, SIG_IGN);
+#endif
+  bool allowInput = false;
+  for (int i = 2; i < argc; ++i) if (std::string(argv[i]) == "--allow-input") allowInput = true;
   const std::string backend = getArg(argc, argv, "--source", "");
   const int fps = intArg(argc, argv, "--fps", 60);
   const int bitrate = intArg(argc, argv, "--bitrate", 15000);
@@ -297,6 +378,11 @@ int runCapture(int argc, char** argv) {
   copts.width = intArg(argc, argv, "--width", 0);
   copts.height = intArg(argc, argv, "--height", 0);
   copts.display = getArg(argc, argv, "--display", "");
+  copts.allowInput = allowInput;
+  if (allowInput && chosen != "portal") {
+    writeLog(stdout, "--allow-input requires the Wayland RemoteDesktop portal backend");
+    return 1;
+  }
 
   std::string err;
   if (!source->start(copts, err)) {
@@ -332,32 +418,38 @@ int runCapture(int argc, char** argv) {
       ",\"encoder\":\"" + jsonEscape(enc.backendName()) + "\"" +
       ",\"capture\":\"" + jsonEscape(source->name()) + "\"" +
       ",\"extradata\":\"" + extraHex + "\"}";
-  writeJson(stdout, MsgType::Config, config);
+  if (!writeJson(stdout, MsgType::Config, config)) return 1;
 
   uint64_t frames = 0, bytes = 0;
   const uint64_t started = nowMicros();
   uint64_t lastStats = started;
 
-  while (g_running) {
+  CaptureControls controls;
+  bool failed = false, writeFailed = false, shutdown = false;
+  const auto sink = [&](const EncodedPacket& p) {
+    bytes += p.size;
+    if (!writeFailed && !writeVideoPacket(stdout, p.pts_us,
+        p.keyframe ? kFlagKeyframe : 0, p.data, p.size)) writeFailed = true;
+  };
+  while (g_running && !g_stopRequested) {
+    if (!controls.drain(*source, enc, allowInput, shutdown)) {
+      writeLog(stdout, "invalid or failed capture stdin framing");
+      failed = true; break;
+    }
+    if (shutdown) break;
     CaptureFrame cf;
     if (!source->nextFrame(cf, err)) {
       writeJson(stdout, MsgType::Log, "capture ended: " + err);
-      break;
+      failed = true; break;
     }
 
-    bool writeFailed = false;
-    if (!enc.encodeBGRA(cf.bgra, cf.stride, cf.pts_us,
-                        [&](const EncodedPacket& p) {
-                          bytes += p.size;
-                          if (!writeVideoPacket(stdout, p.pts_us,
-                                                p.keyframe ? kFlagKeyframe : 0,
-                                                p.data, p.size)) {
-                            writeFailed = true;
-                          }
-                        },
-                        err)) {
+    if (cf.width != ecfg.width || cf.height != ecfg.height || !cf.bgra || cf.stride < cf.width * 4) {
+      writeLog(stdout, "capture dimensions changed or invalid frame");
+      failed = true; break;
+    }
+    if (!enc.encodeBGRA(cf.bgra, cf.stride, cf.pts_us, sink, err)) {
       writeJson(stdout, MsgType::Log, "encode failed: " + err);
-      break;
+      failed = true; break;
     }
     if (writeFailed) break;  // peer closed the pipe
 
@@ -377,8 +469,9 @@ int runCapture(int argc, char** argv) {
     if (maxFrames > 0 && frames >= static_cast<uint64_t>(maxFrames)) break;
   }
 
-  source->stop();
-  return 0;
+  source->stop(); // Release input before potentially blocking output flush.
+  enc.flush(sink);
+  return (failed || writeFailed) ? 1 : 0;
 }
 
 }  // namespace
@@ -396,7 +489,7 @@ int main(int argc, char** argv) {
             "usage: ps-media <probe|selftest|capture|view> [options]\n"
             "  probe                       list available encoders/backends as JSON\n"
             "  selftest [--frames N]       synthetic encode/decode verification\n"
-            "  capture  [--source x11|portal|synthetic] [--fps N] [--bitrate Kbps]\n"
+            "  capture  [--source x11|portal|synthetic] [--fps N] [--bitrate Kbps] [--allow-input]\n"
             "  view                        decode stdin, render in a window\n");
     return 2;
   }

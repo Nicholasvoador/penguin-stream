@@ -102,6 +102,7 @@ export async function startUi({ port = 47800, open = true } = {}) {
     state.transport = null;
     state.mediaConfig = null;
     state.stats = {};
+    pendingConsent?.resolve?.(false);
     pendingConsent = null;
     setMode('idle');
   };
@@ -116,7 +117,7 @@ export async function startUi({ port = 47800, open = true } = {}) {
       source: opts.source || undefined,
       fps: opts.fps ? Number(opts.fps) : undefined,
       bitrateKbps: opts.bitrate ? Number(opts.bitrate) : undefined,
-      allowInput: opts.allowInput !== false,
+      allowInput: opts.allowInput === true,
       forceRelay: Boolean(opts.forceRelay),
       turn: opts.turn || undefined,
       turnUser: opts.turnUser || undefined,
@@ -179,7 +180,7 @@ export async function startUi({ port = 47800, open = true } = {}) {
       code,
       rendezvousUrl: opts.rendezvous || DEFAULT_RENDEZVOUS,
       forceRelay: Boolean(opts.forceRelay),
-      noInput: opts.allowInput === false,
+      noInput: opts.allowInput !== true,
       turn: opts.turn || undefined,
       turnUser: opts.turnUser || undefined,
       turnPassword: opts.turnPassword || undefined,
@@ -206,6 +207,8 @@ export async function startUi({ port = 47800, open = true } = {}) {
   /* ------------------------------ server ------------------------------ */
 
   const server = http.createServer(async (req, res) => {
+    res.setHeader('referrer-policy', 'no-referrer');
+    res.setHeader('cache-control', 'no-store');
     // DNS-rebinding guard: a page on evil.com resolving to 127.0.0.1 would
     // arrive with a non-loopback Host header.
     if (!isLoopbackHost(req.headers.host)) {
@@ -229,6 +232,9 @@ export async function startUi({ port = 47800, open = true } = {}) {
         return;
       }
 
+      if (url.pathname !== '/api/state' && req.method !== 'POST') {
+        res.writeHead(405, { allow: 'POST' }).end(); return;
+      }
       let body = {};
       if (req.method === 'POST') {
         const chunks = [];
@@ -256,7 +262,8 @@ export async function startUi({ port = 47800, open = true } = {}) {
           case '/api/stop': stopActive('stopped by user'); return json({ ok: true });
           case '/api/consent': {
             if (!pendingConsent?.resolve) return json({ error: 'nothing awaiting consent' }, 409);
-            pendingConsent.resolve(Boolean(body.approve));
+            if (typeof body.approve !== 'boolean') return json({ error: 'approve must be boolean' }, 400);
+            pendingConsent.resolve(body.approve);
             return json({ ok: true });
           }
           case '/api/revoke': {
@@ -305,10 +312,14 @@ export async function startUi({ port = 47800, open = true } = {}) {
     });
   });
 
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 1024,
+    verifyClient: ({ req }) => isLoopbackHost(req.headers.host)
+      && (!req.headers.origin || isLoopbackHost(req.headers.origin)),
+  });
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.searchParams.get('token') !== token) { ws.close(4001, 'bad token'); return; }
+    if (clients.size >= 8) { ws.close(4008, 'client limit'); return; }
     clients.add(ws);
     ws.send(JSON.stringify({ type: 'state', data: publicState() }));
     ws.on('close', () => clients.delete(ws));
@@ -324,7 +335,7 @@ export async function startUi({ port = 47800, open = true } = {}) {
 
   console.log('\n  penguin-stream is running.\n');
   console.log(`  Open:  ${link}\n`);
-  console.log('  (the token keeps other local programs from driving this UI)\n');
+  console.log('  (private local capability URL; do not share it)\n');
 
   if (open) openBrowser(link);
 

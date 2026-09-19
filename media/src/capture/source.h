@@ -24,6 +24,7 @@ struct CaptureOptions {
   int width = 0;          // 0 = native
   int height = 0;
   int fps = 60;
+  bool allowInput = false; // Explicit opt-in; portal consent is still required.
   std::string display;    // X11 display / portal restore token / monitor index
 };
 
@@ -33,6 +34,9 @@ class CaptureSource {
 
   virtual bool start(const CaptureOptions& opts, std::string& error) = 0;
   virtual void stop() = 0;
+
+  // Canonical validated input JSON. Unsupported backends fail closed.
+  virtual bool input(const std::string&) { return false; }
 
   // Blocks until the next frame is ready.
   // Returns false on end-of-stream or unrecoverable error (error set).
