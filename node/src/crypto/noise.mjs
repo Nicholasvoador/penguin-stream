@@ -1,5 +1,12 @@
 /**
- * Noise_XX_25519_ChaChaPoly_SHA256 handshake.
+ * Noise_XX_25519_AESGCM_SHA256 handshake.
+ *
+ * Cipher choice: AES-256-GCM, not ChaChaPoly. Electron's Node is built on
+ * BoringSSL, which does not expose the ChaCha20-Poly1305 cipher through
+ * crypto.createCipheriv ("Unknown cipher") - that crashed the 1.1.x desktop
+ * apps the moment signaling started. AES-GCM exists in both OpenSSL (plain
+ * Node) and BoringSSL (Electron), and runs on AES-NI on every x86-64 CPU we
+ * target, so it is also the faster choice for media records.
  *
  * Why XX: neither side needs to know the other's static key in advance (the
  * whole point of a share code), yet both static keys are transmitted and
@@ -16,7 +23,8 @@
 
 import crypto from 'node:crypto';
 
-export const PROTOCOL_NAME = 'Noise_XX_25519_ChaChaPoly_SHA256';
+export const PROTOCOL_NAME = 'Noise_XX_25519_AESGCM_SHA256';
+export const AEAD = 'aes-256-gcm';
 const DHLEN = 32;
 const TAGLEN = 16;
 const HASHLEN = 32;
@@ -71,15 +79,15 @@ function hkdf2(chainingKey, ikm) {
   return [out.subarray(0, 32), out.subarray(32, 64)];
 }
 
-/** Noise nonce encoding: 4 zero bytes followed by an 8-byte little-endian counter. */
+/** Noise AESGCM nonce encoding: 4 zero bytes followed by an 8-byte big-endian counter. */
 export function noiseNonce(counter) {
   const n = Buffer.alloc(12);
-  n.writeBigUInt64LE(BigInt(counter), 4);
+  n.writeBigUInt64BE(BigInt(counter), 4);
   return n;
 }
 
 export function aeadEncrypt(key, nonce, ad, plaintext) {
-  const c = crypto.createCipheriv('chacha20-poly1305', key, nonce, { authTagLength: TAGLEN });
+  const c = crypto.createCipheriv(AEAD, key, nonce, { authTagLength: TAGLEN });
   c.setAAD(ad);
   const ct = Buffer.concat([c.update(plaintext), c.final()]);
   return Buffer.concat([ct, c.getAuthTag()]);
@@ -89,7 +97,7 @@ export function aeadDecrypt(key, nonce, ad, ciphertext) {
   if (ciphertext.length < TAGLEN) throw new Error('ciphertext too short');
   const ct = ciphertext.subarray(0, ciphertext.length - TAGLEN);
   const tag = ciphertext.subarray(ciphertext.length - TAGLEN);
-  const d = crypto.createDecipheriv('chacha20-poly1305', key, nonce, { authTagLength: TAGLEN });
+  const d = crypto.createDecipheriv(AEAD, key, nonce, { authTagLength: TAGLEN });
   d.setAAD(ad);
   d.setAuthTag(tag);
   return Buffer.concat([d.update(ct), d.final()]);

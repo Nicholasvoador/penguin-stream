@@ -43,6 +43,9 @@ if (!process.env.PS_UI_SNAPSHOT && !app.requestSingleInstanceLock()) {
   app.on('second-instance', () => {
     if (!win) return;
     if (win.isMinimized()) win.restore();
+    // A window that never got shown must be revealed here too, or relaunching
+    // from the app menu silently does nothing while the hidden instance lives on.
+    if (!win.isVisible()) win.show();
     win.focus();
   });
 
@@ -86,7 +89,21 @@ if (!process.env.PS_UI_SNAPSHOT && !app.requestSingleInstanceLock()) {
       cb(permission === 'clipboard-sanitized-write');
     });
 
-    if (!snapshot) win.once('ready-to-show', () => win.show());
+    if (!snapshot) {
+      // 'ready-to-show' alone is not reliable on Wayland with hardware
+      // acceleration off: it sometimes never fires, leaving an invisible
+      // instance that holds the single-instance lock. Reveal on whichever
+      // comes first, with a timeout as the last resort.
+      let shown = false;
+      const reveal = () => {
+        if (shown || !win || win.isDestroyed()) return;
+        shown = true;
+        win.show();
+      };
+      win.once('ready-to-show', reveal);
+      win.webContents.once('did-finish-load', reveal);
+      setTimeout(reveal, 3000);
+    }
     win.on('closed', () => { win = null; });
     await win.loadURL(ui.url);
     if (snapshot) {

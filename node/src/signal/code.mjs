@@ -68,7 +68,7 @@ function codeBytes(code) {
  */
 export function roomIdFor(code) {
   return crypto.createHash('sha256')
-    .update('penguin-stream room v1')
+    .update('penguin-stream room v2')
     .update(codeBytes(code))
     .digest('hex')
     .slice(0, 32);
@@ -82,7 +82,7 @@ export function signalingKey(code) {
   return Buffer.from(crypto.hkdfSync(
     'sha256',
     codeBytes(code),
-    Buffer.from('penguin-stream signaling salt v1'),
+    Buffer.from('penguin-stream signaling salt v2'),
     Buffer.from('signaling'),
     32,
   ));
@@ -94,15 +94,18 @@ export function signalingKey(code) {
  */
 export function noisePrologue(code) {
   return crypto.createHash('sha256')
-    .update('penguin-stream prologue v1')
+    .update('penguin-stream prologue v2')
     .update(codeBytes(code))
     .digest();
 }
 
+/** AES-256-GCM: available in both OpenSSL (Node) and BoringSSL (Electron). */
+const SIGNAL_AEAD = 'aes-256-gcm';
+
 /** Encrypts a JSON-serialisable signaling message. Returns base64. */
 export function sealSignal(key, obj) {
   const iv = crypto.randomBytes(12);
-  const c = crypto.createCipheriv('chacha20-poly1305', key, iv, { authTagLength: 16 });
+  const c = crypto.createCipheriv(SIGNAL_AEAD, key, iv, { authTagLength: 16 });
   const pt = Buffer.from(JSON.stringify(obj), 'utf8');
   const ct = Buffer.concat([c.update(pt), c.final()]);
   return Buffer.concat([iv, ct, c.getAuthTag()]).toString('base64');
@@ -115,7 +118,7 @@ export function openSignal(key, b64) {
   const iv = buf.subarray(0, 12);
   const tag = buf.subarray(buf.length - 16);
   const ct = buf.subarray(12, buf.length - 16);
-  const d = crypto.createDecipheriv('chacha20-poly1305', key, iv, { authTagLength: 16 });
+  const d = crypto.createDecipheriv(SIGNAL_AEAD, key, iv, { authTagLength: 16 });
   d.setAuthTag(tag);
   return JSON.parse(Buffer.concat([d.update(ct), d.final()]).toString('utf8'));
 }

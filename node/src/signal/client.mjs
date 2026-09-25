@@ -142,7 +142,15 @@ async function run({
 
   const broadcast = (entries) => {
     if (signalingDone) return;
-    const payload = sealSignal(key, { v: 2, from: self, role, ...(partner ? { to: partner } : {}), entries });
+    let payload;
+    try {
+      payload = sealSignal(key, { v: 2, from: self, role, ...(partner ? { to: partner } : {}), entries });
+    } catch (err) {
+      // Runs from timers: an escaped throw here is an uncaught exception that
+      // kills the Electron main process. Fail the session instead.
+      finish(new Error(`could not encrypt signaling: ${err.message}`));
+      return;
+    }
     for (const ch of channels) {
       try {
         const r = ch.send(payload);
