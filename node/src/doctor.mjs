@@ -47,6 +47,12 @@ async function checkMediaEngine() {
     out.push(input.kbm?.length
       ? ok('keyboard/mouse', `can be controlled remotely via ${input.kbm.join(', ')}`)
       : warn('keyboard/mouse', 'this machine cannot be controlled remotely (viewing it still works)'));
+    const audio = probe.audio || {};
+    out.push(audio.capture
+      ? (audio.appFilter
+        ? ok('desktop audio', `${audio.capture}; voice chat / chosen apps can be left out of the stream`)
+        : warn('desktop audio', `${audio.capture}; leaving apps out needs Windows 10 version 2004 or newer`))
+      : warn('desktop audio', 'this machine cannot send its audio (it can still play a host\'s audio)'));
     if (input.gamepad) {
       out.push(input.gamepadReady
         ? ok('controllers', `virtual Xbox 360 pads via ${input.gamepad}`)

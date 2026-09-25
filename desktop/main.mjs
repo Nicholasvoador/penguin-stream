@@ -27,7 +27,14 @@ if (process.platform === 'win32') app.setAppUserModelId('io.github.nicholasvoado
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.disableHardwareAcceleration?.();
 
-if (!app.requestSingleInstanceLock()) {
+// Dev-only offscreen snapshots run beside a real instance without touching it.
+if (process.env.PS_UI_SNAPSHOT) {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  app.setPath('userData', mkdtempSync(path.join(tmpdir(), 'ps-snapshot-')));
+}
+
+if (!process.env.PS_UI_SNAPSHOT && !app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   let win = null;

@@ -1,19 +1,21 @@
-# What is verified, what is not — v1.0.0 (2026-09-25)
+# What is verified, what is not — v1.1.0 (2026-09-25)
 
 This page is deliberately blunt: it lists what was actually checked for this release and what was not.
 
-## Verified for 1.0.0
+## Verified
 
 | Area | Evidence |
 |---|---|
-| Automated suite | `npm test`: **110 passed, 0 failed** (unit + integration: crypto, signaling, ICE/relay, encrypted H.264 end to end, UI API, settings) |
+| Automated suite | `npm test`: **110 passed, 0 failed, 0 skipped** (unit + integration: crypto, signaling, ICE/relay, encrypted H.264 end to end, UI API, settings) |
 | NVENC GPU-colour path | `ps-media selftest --encoder nvenc` at 2560×1440, 120 frames: 0 mismatches, worst colour delta 4/255; ~3.2 ms/frame less CPU than the NV12 path (RTX 5070) |
 | Fedora RPM | Installed with `dnf` into a **clean Fedora 44 container**: dependencies resolved from stock repos (`libavcodec-free`, `sdl2-compat`); bundled engine probe + encode/decode selftest pass; SUID sandbox, launcher and desktop entry correct |
 | Packaged Linux app | Boots from the packaged asar, loads the native WebRTC module, serves the UI, runs the network check (rendered headless) |
 | Windows build | Installer + portable exe built; bundle contains `ps-media.exe` + FFmpeg/SDL DLLs and the win32 `node-datachannel` prebuild. `ps-media.exe` **under Wine**: probe reports DXGI/GDI capture, SendInput, ViGEm detection; software encode→decode selftest passes |
+| Audio + voice-chat exclusion (Linux) | Real host→viewer session on PipeWire: game tone received at 7988/8000 amplitude, fake Discord tone < 3 (left out); own playback never re-captured |
+| Windows audio engine | Under Wine with PipeWire access: WASAPI loopback capture and SDL playback work; `Discord.exe` process tree detected; fallbacks correct ("only" mode sends nothing rather than everything) |
 | Network check | Live on a real CGNAT'd connection: endpoint-independent mapping detected; TURN probe verified against a local TURN server (success, wrong password, no-UDP cases) |
 
-## Not verified for 1.0.0 — please report results
+## Not verified yet — please report results
 
 | Area | Status |
 |---|---|
@@ -21,7 +23,7 @@ This page is deliberately blunt: it lists what was actually checked for this rel
 | **Windows ↔ Fedora over the Internet** | No two-machine WAN session was run for this release. |
 | **Cloudflare TURN** | Implemented against Cloudflare's documented API; not exercised with a real account. The generic TURN path it relies on is tested. |
 | **Wayland remote input** | Implemented through the RemoteDesktop portal and unit-tested; live injection on KDE/GNOME not re-verified for this release. |
-| **Audio** | Linux → Linux only, experimental (uncompressed PCM, needs `ffplay` on the viewer). Windows audio is not implemented. |
+| **Windows app exclusion** | Process loopback (leaving Discord out) is implemented to Microsoft's API but Wine can't run it; it hasn't been exercised on real Windows yet. Windows can exclude only one app tree at a time, and a Windows machine that both views and hosts may re-capture its own stream audio. |
 | **Code signing** | Windows builds are unsigned (SmartScreen warning). The RPM is unsigned (`dnf` installs local files without a GPG check). |
 
 ## Known behaviour

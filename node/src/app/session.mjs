@@ -297,8 +297,10 @@ export class Host extends EventEmitter {
 
     this.engine.start();
     if (this.opts.audio === true) {
-      this.audio = new AudioCapture({ enabled: true, maxPayload: MAX_PAYLOAD });
+      this.audio = new AudioCapture({ enabled: true, maxPayload: MAX_PAYLOAD, filter: this.opts.audioFilter });
       this.audio.on('error', e => this.emit('log', `audio stopped: ${e.message}`));
+      this.audio.on('log', line => this.emit('log', line));
+      this.audio.on('warning', w => this.emit('audio-warning', w));
       this.audio.on('data', payload => {
         if (peer.state !== 'secure' || peer.bufferedAmount > 65536) return;
         try { peer.sendMedia(CHANNEL.AUDIO, payload); } catch { void this.audio?.stop(); }
@@ -391,6 +393,7 @@ export class Viewer extends EventEmitter {
     if (this.opts.audio === true) {
       this.audio = new AudioPlayer({ enabled: true, maxPayload: MAX_PAYLOAD });
       this.audio.on('error', e => this.emit('log', `audio stopped: ${e.message}`));
+      this.audio.on('log', line => this.emit('log', line));
       peer.on('audio', payload => {
         if (peer.state !== 'secure') return;
         try { this.audio.write(payload); } catch (e) {

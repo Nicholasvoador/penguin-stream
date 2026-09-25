@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { AudioCapture, AudioPlayer, decodeAudio, selectDefaultMonitor } from '../../src/media/audio.mjs';
+import { AudioCapture, AudioPlayer, decodeAudio, audioFilterArgs } from '../../src/media/audio.mjs';
 
 function packet(sequence, bytes = 16) {
   const payload = Buffer.alloc(8 + bytes, 0x5a);
@@ -36,19 +36,7 @@ function harness({ congested = false, ignoreTerm = false } = {}) {
   return { calls, spawn };
 }
 
-function probe(binary, args, options) {
-  assert.equal(binary, 'pactl');
-  assert.equal(options.shell, false);
-  assert.equal(options.timeout, 2000);
-  assert.equal(options.maxBuffer, 1024 * 1024);
-  if (args[0] === 'get-default-sink') return 'output.test\n';
-  assert.deepEqual(args, ['-f', 'json', 'list', 'sources']);
-  return JSON.stringify([
-    { name: 'input.mic', monitor_source: '' },
-    { name: 'output.test.monitor', monitor_source: 'output.test' },
-  ]);
-}
-const opts = { enabled: true, platform: 'linux', probe };
+const opts = { enabled: true, platform: 'linux', binary: '/opt/ps/ps-media' };
 
 function capture(h, extra = {}) {
   const result = new AudioCapture({ ...opts, spawn: h.spawn, ...extra });
@@ -63,7 +51,7 @@ function player(h, extra = {}) {
   return result;
 }
 
-test('construction/import is inert; explicit opt-in and Linux are required', () => {
+test('construction/import is inert; explicit opt-in and Linux/Windows are required', () => {
   const h = harness();
   for (const enabled of [undefined, false, 'true', 1]) {
     const a = capture(h, { enabled });
@@ -71,58 +59,34 @@ test('construction/import is inert; explicit opt-in and Linux are required', () 
     assert.throws(() => a.start(), /explicit/);
     assert.throws(() => b.write(packet(0)), /explicit/);
   }
-  for (const platform of ['win32', 'darwin']) {
+  for (const platform of ['darwin', 'freebsd']) {
     assert.throws(() => capture(h, { platform }).start(), /unsupported/);
     assert.throws(() => player(h, { platform }).write(packet(0)), /unsupported/);
   }
   assert.equal(h.calls.length, 0);
 });
 
-test('source whitelist rejects microphone, raw device names, and shell syntax before probes', () => {
+test('app filters are validated before anything is spawned', () => {
   const h = harness();
-  for (const source of ['default', 'input.mic', 'output.test.monitor', ';touch /tmp/no', null]) {
-    const a = capture(h, { source, probe: () => assert.fail('must not probe') });
-    assert.throws(() => a.start(), /not allowed/);
+  for (const bad of ['a;b', '$(x)', 'x'.repeat(65), '../x', 'x\ny']) {
+    assert.throws(() => capture(h, { filter: { exclude: [bad] } }).start(), /invalid app name/);
+    assert.throws(() => capture(h, { filter: { only: bad } }).start(), /invalid app name/);
   }
+  assert.throws(() => capture(h, { filter: { exclude: Array.from({ length: 33 }, (_, i) => `a${i}`) } }).start(), /at most/);
   assert.equal(h.calls.length, 0);
+  assert.deepEqual(audioFilterArgs({}), []);
+  assert.deepEqual(audioFilterArgs({ excludeVoice: true, exclude: 'Spotify, obs64' }), ['--exclude-voice', '--exclude', 'Spotify,obs64']);
+  assert.deepEqual(audioFilterArgs({ excludeVoice: true, only: 'eldenring' }), ['--only', 'eldenring'], 'only overrides');
 });
 
-test('monitor verification fails closed and supports pactl monitor metadata', () => {
-  for (const sink of ['', '-bad', 'x;echo', 'x\ny', null]) {
-    assert.throws(() => selectDefaultMonitor(sink, []), /default sink/);
-  }
-  for (const source of [{ name: 'out.monitor' }, { name: 'input.mic', monitor_of_sink: 1 },
-    { name: 'out.monitor', monitor_of_sink: 0xffffffff }, { name: 'out.monitor', monitor_of_sink: -1 }]) {
-    assert.throws(() => selectDefaultMonitor('out', [source]), /no microphone fallback/);
-  }
-  for (const metadata of [{ monitor_source: 'out' }, { monitor_of_sink: 0 },
-    { properties: { 'device.class': 'monitor' } }]) {
-    assert.equal(selectDefaultMonitor('out', [{ name: 'out.monitor', ...metadata }]), 'out.monitor');
-  }
-});
-
-test('pactl missing, invalid JSON, and no monitor fail before capture spawn', () => {
+test('capture runs the engine shell-free with the app filter', async () => {
   const h = harness();
-  for (const probe of [() => { throw new Error('ENOENT'); }, () => 'not json',
-    (_, args) => args[0] === 'get-default-sink' ? 'out' : '[]']) {
-    assert.throws(() => capture(h, { probe }).start(), /preflight failed/);
-  }
-  assert.equal(h.calls.length, 0);
-});
-
-test('capture uses shell-free ffmpeg monitor input and fixed PCM output', async () => {
-  const h = harness();
-  const a = capture(h).start();
+  const a = capture(h, { filter: { excludeVoice: true } }).start();
   const { binary, args, options } = h.calls[0];
-  assert.equal(binary, 'ffmpeg');
+  assert.equal(binary, '/opt/ps/ps-media');
   assert.equal(options.shell, false);
   assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
-  assert.equal(args[args.indexOf('-i') + 1], 'output.test.monitor');
-  assert.ok(args.includes('-nostdin'));
-  assert.ok(args.includes('pulse'));
-  assert.ok(args.includes('pcm_s16le'));
-  assert.equal(args[args.indexOf('-ar') + 1], '48000');
-  assert.equal(args[args.indexOf('-ac') + 1], '2');
+  assert.deepEqual(args, ['audio-capture', '--exclude-voice']);
   assert.throws(() => a.start(), /already started/);
   await a.stop();
 });
@@ -151,15 +115,15 @@ test('fragmented/large stdout reconstructs aligned bounded packets byte exactly'
   assert.equal(out.length, 1000);
 });
 
-test('capture stays <= transport limit and 20ms, including sequence wrap', async () => {
+test('capture sends 10ms packets within the transport limit, including sequence wrap', async () => {
   const h = harness();
   const a = capture(h, { maxPayload: 60000 }).start();
   a.sequence = 0xffffffff;
   const out = [];
   a.on('data', p => out.push(p));
   h.calls[0].child.stdout.emit('data', Buffer.alloc(7680));
-  assert.deepEqual(out.map(p => p.length), [3848, 3848]);
-  assert.deepEqual(out.map(p => decodeAudio(p).sequence), [0xffffffff, 0]);
+  assert.deepEqual(out.map(p => p.length), [1928, 1928, 1928, 1928]);
+  assert.deepEqual(out.map(p => decodeAudio(p).sequence), [0xffffffff, 0, 1, 2]);
   await a.stop();
 });
 
@@ -194,12 +158,9 @@ test('player writes only PCM, starts lazily and rejects duplicates/stale frames 
   assert.equal(p.write(packet(5)), true); // loss does not stall
   const { child, binary, args, options } = h.calls[0];
   assert.equal(h.calls.length, 1);
-  assert.equal(binary, 'ffplay');
+  assert.equal(binary, '/opt/ps/ps-media');
   assert.equal(options.shell, false);
-  assert.ok(args.includes('-noinfbuf'));
-  assert.ok(args.includes('s16le'));
-  assert.ok(args.includes('48000'));
-  assert.ok(args.includes('stereo'));
+  assert.deepEqual(args, ['audio-play']);
   assert.deepEqual(child.writes, Array.from({ length: 3 }, () => packet(0).subarray(8)));
   await p.stop();
 });
@@ -236,18 +197,19 @@ test('stderr logging is capped and errors stop children without duplicate errors
   let bytes = 0;
   a.on('log', text => { bytes += Buffer.byteLength(text); });
   const { child } = h.calls[0];
-  child.stderr.emit('data', Buffer.alloc(100000, 65));
-  child.stderr.emit('data', Buffer.alloc(100000, 65));
-  assert.equal(bytes, 8192);
+  const lines = Buffer.from(`${'A'.repeat(99)}\n`.repeat(1000));
+  child.stderr.emit('data', lines);
+  child.stderr.emit('data', lines);
+  assert.ok(bytes > 7900 && bytes <= 8192, `log output must be capped at 8 KiB, got ${bytes}`);
   child.emit('error', new Error('spawn ENOENT'));
   child.stdout.emit('error', new Error('secondary error'));
   await a.stop();
   assert.equal(a.errors.length, 1);
-  assert.match(a.errors[0].message, /ffmpeg.*ENOENT/);
+  assert.match(a.errors[0].message, /audio engine.*ENOENT/);
   assert.deepEqual(child.signals, ['SIGTERM']);
 });
 
-test('ffplay EPIPE and unexpected exit are surfaced, stopped and not restarted', async () => {
+test('player EPIPE and unexpected exit are surfaced, stopped and not restarted', async () => {
   for (const fault of ['pipe', 'close', 'spawn']) {
     const h = harness();
     const p = player(h);
@@ -258,7 +220,7 @@ test('ffplay EPIPE and unexpected exit are surfaced, stopped and not restarted',
     else child.emit('close', 1, null);
     await p.stop();
     assert.equal(p.errors.length, 1);
-    assert.match(p.errors[0].message, /ffplay/);
+    assert.match(p.errors[0].message, /audio (engine|player)/);
     assert.throws(() => p.write(packet(1)), /stopped/);
   }
 });
@@ -306,4 +268,19 @@ test('stop inside a capture data handler prevents the rest of a large chunk bein
   h.calls[0].child.stdout.emit('data', Buffer.alloc(100000));
   await a.stop();
   assert.equal(count, 1);
+});
+
+test('engine warnings are surfaced as warning events, line by line', async () => {
+  const h = harness();
+  const a = capture(h).start();
+  const warnings = [];
+  const logs = [];
+  a.on('warning', w => warnings.push(w));
+  a.on('log', l => logs.push(l));
+  const { child } = h.calls[0];
+  child.stderr.emit('data', Buffer.from('audio: leaving out "Discord" (pid 42)\r\naudio: warn'));
+  child.stderr.emit('data', Buffer.from('ing: could not leave out "Discord"; streaming all apps\n'));
+  assert.deepEqual(warnings, ['could not leave out "Discord"; streaming all apps']);
+  assert.equal(logs.length, 2);
+  await a.stop();
 });

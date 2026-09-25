@@ -12,6 +12,7 @@
 
 #include "capture/source.h"
 #include "codec/decoder.h"
+#include "audio/audio.h"
 #include "codec/encoder.h"
 #include "ipc/framing.h"
 #include "input/event.h"
@@ -155,6 +156,11 @@ int runProbe() {
 #endif
   out += "],\"gamepad\":\"" + padBackend + "\",\"gamepadReady\":" + (padOk ? "true" : "false") +
          ",\"gamepadError\":\"" + jsonEscape(padWhy) + "\"}";
+#if defined(PS_HAVE_AUDIO_CAPTURE)
+  out += ",\"audio\":" + audioProbeJson();
+#elif defined(PS_HAVE_SDL)
+  out += ",\"audio\":{\"capture\":\"\",\"appFilter\":false,\"play\":\"sdl\"}";
+#endif
   out += ",\"version\":\"" PS_VERSION "\"}";
   printf("%s\n", out.c_str());
   return 0;
@@ -748,7 +754,10 @@ int main(int argc, char** argv) {
             "  capture  [--source dxgi|portal|x11|synthetic] [--display N] [--fps N] [--bitrate Kbps]\n"
             "           [--encoder auto|nvenc|amf|qsv|vaapi|mf|x264] [--allow-input] [--allow-gamepad]\n"
             "           [--input-capable]\n"
-            "  view                        decode stdin, render in a window\n");
+            "  view                        decode stdin, render in a window\n"
+            "  audio-capture [--exclude-voice] [--exclude app,app] [--only app]\n"
+            "                              desktop audio to stdout (s16le 48 kHz stereo)\n"
+            "  audio-play [--buffer-ms N] [--max-ms N]  play stdin PCM\n");
     return 2;
   }
 
@@ -757,6 +766,12 @@ int main(int argc, char** argv) {
   if (mode == "probe") return ps::runProbe();
   if (mode == "selftest") return ps::runSelftest(argc, argv);
   if (mode == "capture") return ps::runCapture(argc, argv);
+#ifdef PS_HAVE_AUDIO_CAPTURE
+  if (mode == "audio-capture") return ps::runAudioCapture(argc, argv);
+#endif
+#ifdef PS_HAVE_SDL
+  if (mode == "audio-play") return ps::runAudioPlay(argc, argv);
+#endif
 #ifdef PS_HAVE_SDL
   if (mode == "view") return ps::runView(argc, argv);
 #else

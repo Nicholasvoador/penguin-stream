@@ -174,6 +174,10 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
       // switched on later in the session without restarting the share.
       inputCapable: true,
       audio: opts.audio === true,
+      audioFilter: (() => {
+        const saved = settings.get();
+        return { excludeVoice: saved.audioExcludeVoice, exclude: saved.audioExclude, only: saved.audioOnly };
+      })(),
     });
 
     active = { kind: 'host', instance: host };
@@ -185,6 +189,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     scope.on('viewer-state', (v) => { state.remoteViewer = v; broadcast('state', publicState()); });
 
     scope.on('code', (code) => { state.code = code; broadcast('state', publicState()); });
+    scope.on('audio-warning', (w) => { pushLog(`audio warning: ${w}`); broadcast('notice', w); });
     scope.on('log', pushLog);
     scope.on('stats', (s) => { state.stats = s; broadcast('stats', s); });
     scope.on('media-config', (cfg) => { state.mediaConfig = cfg; broadcast('state', publicState()); });

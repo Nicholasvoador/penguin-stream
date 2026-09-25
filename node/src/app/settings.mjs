@@ -22,7 +22,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   source: '',
   display: '',
   lowLatency: true,
-  audio: false,
+  audio: true,
+  audioExcludeVoice: true,   // keep Discord & co. out of the stream (no double voices)
+  audioExclude: '',          // extra apps to leave out, comma-separated
+  audioOnly: '',             // or: stream just this one app
   allowInput: true,
   allowGamepad: true,
   sendKbm: true,
@@ -52,10 +55,14 @@ export function sanitizeSettings(input = {}) {
   set('encoder', oneOf(input.encoder, ['', 'auto', 'nvenc', 'amf', 'qsv', 'mf', 'vaapi', 'x264', 'software']));
   set('source', oneOf(input.source, ['', 'dxgi', 'gdi', 'portal', 'x11', 'synthetic']));
   if (typeof input.display === 'string' && /^[0-9]{0,2}$/.test(input.display.trim())) set('display', input.display.trim());
-  for (const k of ['lowLatency', 'audio', 'allowInput', 'allowGamepad', 'sendKbm', 'sendPad', 'forceRelay', 'noStun']) {
+  for (const k of ['lowLatency', 'audio', 'audioExcludeVoice', 'allowInput', 'allowGamepad', 'sendKbm', 'sendPad', 'forceRelay', 'noStun']) {
     if (typeof input[k] === 'boolean') out[k] = input[k];
   }
   set('stun', str(input.stun));
+  for (const k of ['audioExclude', 'audioOnly']) {
+    const v = str(input[k], 400);
+    if (v !== undefined && /^[\p{L}\p{N} ._+,-]*$/u.test(v)) out[k] = v;
+  }
   const rv = str(input.rendezvous);
   if (rv !== undefined && (rv === '' || /^wss?:\/\//.test(rv))) out.rendezvous = rv;
 

@@ -22,6 +22,8 @@
   <symbol id="i-pad" viewBox="0 0 24 24"><path d="M7 7h10a5 5 0 0 1 4.8 6.4l-1 3.4a2.2 2.2 0 0 1-3.8.8L15 15H9l-2 2.6a2.2 2.2 0 0 1-3.8-.8l-1-3.4A5 5 0 0 1 7 7z"/><path d="M8 10v3M6.5 11.5h3"/><circle cx="16" cy="10.5" r=".6"/><circle cx="17.5" cy="12.5" r=".6"/></symbol>
   <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="12" height="12" rx="2"/><path d="M15.5 8.5V5a1.5 1.5 0 0 0-1.5-1.5H5A1.5 1.5 0 0 0 3.5 5v9A1.5 1.5 0 0 0 5 15.5h3.5"/></symbol>
   <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></symbol>
+  <symbol id="i-sound" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></symbol>
+  <symbol id="i-mute" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="m16 9.5 5 5M21 9.5l-5 5"/></symbol>
   <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4.5 6v5.5c0 4.5 3.2 8.2 7.5 9.5 4.3-1.3 7.5-5 7.5-9.5V6z"/><path d="m9 12 2 2 4-4"/></symbol>
 </svg>
 
@@ -225,8 +227,20 @@
         </div>
         <div class="toggle-list compact">
           <label class="toggle"><svg class="t-ico"><use href="#i-bolt"/></svg><span class="t-text"><b>Lowest latency display</b><small>Show each frame the instant it is decoded (no V-Sync wait). May tear slightly.</small></span><input type="checkbox" id="opt-low-latency" data-setting="lowLatency"><i class="switch"></i></label>
-          <label class="toggle"><svg class="t-ico"><use href="#i-live"/></svg><span class="t-text"><b>Desktop audio</b><small>Experimental; Linux hosts only for now</small></span><input type="checkbox" id="opt-audio" data-setting="audio"><i class="switch"></i></label>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Audio</h2><span class="hint-inline">Windows and Fedora</span></div>
+        <div class="toggle-list compact">
+          <label class="toggle"><svg class="t-ico"><use href="#i-sound"/></svg><span class="t-text"><b>Stream desktop audio</b><small>Hear the shared computer. Turn it on at both ends.</small></span><input type="checkbox" id="opt-audio" data-setting="audio"><i class="switch"></i></label>
+          <label class="toggle"><svg class="t-ico"><use href="#i-mute"/></svg><span class="t-text"><b>Keep voice chat out of the stream</b><small>Discord, TeamSpeak, Zoom, Teams, Mumble… are left out of what you share, so friends in the same call don't hear everyone twice. You still hear them normally.</small></span><input type="checkbox" id="opt-audio-voice" data-setting="audioExcludeVoice"><i class="switch"></i></label>
+        </div>
+        <div class="field-grid">
+          <label class="field">Also leave out these apps <input id="opt-audio-exclude" data-setting="audioExclude" placeholder="e.g. Spotify, obs64" spellcheck="false"></label>
+          <label class="field">Or stream only this app <input id="opt-audio-only" data-setting="audioOnly" placeholder="optional, e.g. eldenring" spellcheck="false"></label>
+        </div>
+        <p class="muted small">Names match the app or program name (partial, any case). On Windows, leaving an app out needs Windows 10 version 2004 or newer.</p>
       </div>
 
       <div class="card">

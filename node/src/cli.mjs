@@ -22,6 +22,13 @@ import { SettingsStore } from './app/settings.mjs';
 
 /** The relay saved in the app's Settings also applies to CLI sessions. */
 const savedRelay = () => { try { return new SettingsStore().get().relay; } catch { return undefined; } };
+/** Same for the audio app filter (e.g. keep Discord out of the stream). */
+const savedAudioFilter = () => {
+  try {
+    const s = new SettingsStore().get();
+    return { excludeVoice: s.audioExcludeVoice, exclude: s.audioExclude, only: s.audioOnly };
+  } catch { return undefined; }
+};
 
 const C = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
@@ -69,6 +76,7 @@ async function cmdHost(args) {
   const control = Boolean(args['allow-control']);
   const host = new Host({
     relay: savedRelay(),
+    audioFilter: savedAudioFilter(),
     rendezvousUrl: args.rendezvous || DEFAULT_RENDEZVOUS,
     nostr: args['no-nostr'] ? false : undefined,
     source: args.source,
@@ -345,7 +353,8 @@ ${c.bold}Host options${c.reset}
   --allow-gamepad                 controllers only (virtual Xbox 360 pads; Windows
                                   needs the ViGEmBus driver, Linux /dev/uinput access)
   --no-input                      view-only (default)
-  --audio                         opt in to Linux desktop audio capture/playback
+  --audio                         stream desktop audio (host) / play it (viewer); the app filter
+                                  from Settings applies (voice chat left out by default)
   --yes                           synthetic-source tests only: skip human approval
 
 ${c.bold}Viewer options${c.reset}

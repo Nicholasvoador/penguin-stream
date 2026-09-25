@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ps_media VERSION 1.0.0 LANGUAGES CXX)
+project(ps_media VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,6 +19,7 @@ set(PS_SOURCES
   src/capture/synthetic.cpp
   src/input/event.cpp
   src/input/keymap.cpp
+  src/audio/audio_common.cpp
 )
 
 set(PS_LIBS Threads::Threads)
@@ -47,13 +48,14 @@ if(WIN32)
     list(APPEND PS_LIBRARY_DIRS ${FFMPEG_LIBRARY_DIRS})
     list(APPEND PS_LIBS ${FFMPEG_LIBRARIES})
   endif()
-  list(APPEND PS_LIBS d3d11 dxgi setupapi)
+  list(APPEND PS_LIBS d3d11 dxgi setupapi ole32 uuid)
   list(APPEND PS_SOURCES
+    src/audio/audio_capture_wasapi.cpp
     src/capture/windows_dxgi.cpp
     src/input/gamepad_vigem.cpp
     third_party/vigem/src/ViGEmClient.cpp)
   list(APPEND PS_INCLUDE_DIRS third_party/vigem/include third_party/vigem/src)
-  list(APPEND PS_DEFINES PS_HAVE_DXGI=1 NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+  list(APPEND PS_DEFINES PS_HAVE_DXGI=1 PS_HAVE_AUDIO_CAPTURE=1 NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 
   # Windows must not depend on pkg-config for SDL discovery.
   find_package(SDL2 CONFIG QUIET)
@@ -92,9 +94,9 @@ else()
   pkg_check_modules(GIO IMPORTED_TARGET gio-2.0)
   if(PIPEWIRE_FOUND AND GIO_FOUND
      AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/capture/portal_pipewire.cpp")
-    list(APPEND PS_SOURCES src/capture/portal_pipewire.cpp)
+    list(APPEND PS_SOURCES src/capture/portal_pipewire.cpp src/audio/audio_capture_pipewire.cpp)
     list(APPEND PS_LIBS PkgConfig::PIPEWIRE PkgConfig::GIO)
-    list(APPEND PS_DEFINES PS_HAVE_PIPEWIRE=1)
+    list(APPEND PS_DEFINES PS_HAVE_PIPEWIRE=1 PS_HAVE_AUDIO_CAPTURE=1)
   endif()
 
   pkg_check_modules(SDL2 IMPORTED_TARGET sdl2)
@@ -108,7 +110,7 @@ else()
 endif()
 
 if(PS_SDL_TARGET)
-  list(APPEND PS_SOURCES src/render/sdl_renderer.cpp)
+  list(APPEND PS_SOURCES src/render/sdl_renderer.cpp src/audio/audio_play_sdl.cpp)
   list(APPEND PS_LIBS ${PS_SDL_TARGET})
   list(APPEND PS_DEFINES PS_HAVE_SDL=1)
 else()

@@ -497,6 +497,7 @@ function connectWs() {
     const { type, data } = JSON.parse(ev.data);
     if (type === 'state') render(data);
     else if (type === 'consent') showConsent(data);
+    else if (type === 'notice') toast(data, true);
     else if (type === 'stats' && lastState) { lastState.stats = data; render(lastState, true); }
     else if (type === 'log') {
       const el = $('log');

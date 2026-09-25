@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.0 — 2026-09-25
+
+### Audio
+- **Windows desktop audio** (WASAPI loopback) and a native player on both systems. Audio no longer needs
+  `ffmpeg`/`ffplay`/`pactl`; it runs inside the media engine, so the packaged apps have it out of the box. On by default.
+- **Keep voice chat out of the stream** (default on): Discord, TeamSpeak, Zoom, Teams, Mumble… are left out of the captured
+  audio, so friends in the same call don't hear everyone twice. You still hear them locally. Also: leave out any apps, or
+  stream only one app.
+  - Linux: PipeWire graph linking; any number of apps, plus anything tagged *Communication*.
+  - Windows 10 2004+: WASAPI process loopback excluding (or including) the app's process tree, re-checked every 3 s.
+  - "Only this app" never widens to "everything" on failure. Warnings show up as notifications in the app.
+- Lower audio latency: 10 ms packets; 30 ms jitter buffer with a 120 ms cap so audio can't drift behind video.
+- Penguin Stream never re-captures its own playback (no feedback loop).
+- New end-to-end test: real session, fake Discord at 1000 Hz and a game at 440 Hz; the viewer gets the game (7988/8000) and
+  not Discord (< 3).
+- `doctor` reports audio capability.
+
 ## 1.0.0 — 2026-09-25
 
 ### Desktop app

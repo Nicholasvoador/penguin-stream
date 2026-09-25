@@ -7,13 +7,13 @@ Install, click <i>Share this screen</i>, send the invitation. That's the whole s
 
 ---
 
-## Download (v1.0.0)
+## Download (v1.1.0)
 
 | System | File | How |
 |---|---|---|
-| **Windows 10/11 x64** | `PenguinStream-1.0.0-Setup.exe` | Installer (per-user, no admin needed) |
-| | `PenguinStream-1.0.0-Portable.exe` | Runs without installing |
-| **Fedora 44 x86_64** | `penguin-stream-1.0.0-1.fc44.x86_64.rpm` | `sudo dnf install ./penguin-stream-1.0.0-1.fc44.x86_64.rpm` |
+| **Windows 10/11 x64** | `PenguinStream-1.1.0-Setup.exe` | Installer (per-user, no admin needed) |
+| | `PenguinStream-1.1.0-Portable.exe` | Runs without installing |
+| **Fedora 44 x86_64** | `penguin-stream-1.1.0-1.fc44.x86_64.rpm` | `sudo dnf install ./penguin-stream-1.1.0-1.fc44.x86_64.rpm` |
 
 Get them from the [Releases page](https://github.com/Nicholasvoador/penguin-stream/releases/latest). `SHA256SUMS.txt` lists the checksums.
 
@@ -40,6 +40,13 @@ The stream opens in its own window. During a session either side can switch cont
 
 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> toggles fullscreen, …+<kbd>Q</kbd> disconnects. Controllers appear on a Linux
 host through uinput and on a Windows host as virtual Xbox 360 pads (needs the free [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver).
+
+## Audio, and keeping Discord out of it
+
+The host's desktop audio streams to the viewer on both Windows and Fedora. If you're in the same **Discord call** while
+sharing, you don't want your friend hearing everyone twice (themselves included). So by default Penguin Stream **leaves
+voice-chat apps out of the streamed audio**: Discord, TeamSpeak, Zoom, Teams, Mumble and others. You still hear the call
+normally. You can also leave out other apps, or stream only one app (just the game). See [docs/AUDIO.md](docs/AUDIO.md).
 
 ## Connectivity: CGNAT, relays, and why friends configure nothing
 
@@ -84,7 +91,7 @@ Needs Node.js ≥ 20, CMake ≥ 3.20, a C++17 compiler, FFmpeg/SDL2/PipeWire/GLi
 npm ci
 cmake -S media -B media/build && cmake --build media/build -j
 npm run app                 # run the desktop app from source
-npm test                    # 110 tests
+npm test                    # 110 tests (incl. a real audio session on PipeWire)
 npm run dist:linux          # -> dist/penguin-stream-<v>-1.fc44.x86_64.rpm (needs rpmbuild)
 npm run dist:win            # -> dist/PenguinStream-<v>-Setup.exe + Portable.exe (needs podman)
 ```

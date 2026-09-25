@@ -57,5 +57,8 @@ EOF
 %{_datadir}/icons/hicolor/512x512/apps/penguin-stream.png
 
 %changelog
+* Fri Sep 25 2026 Penguin Stream contributors <noreply@github.com> - 1.1.0-1
+- Windows audio, native audio player, voice-chat apps kept out of the stream
+
 * Fri Sep 25 2026 Penguin Stream contributors <noreply@github.com> - 1.0.0-1
 - First stable release: desktop app, relay setup, network check, NVENC RGB input

@@ -1,14 +1,28 @@
-/** Opt-in Linux desktop audio. No processes start during import/construction. */
+/**
+ * Desktop audio, host -> viewer. No processes start during import/construction.
+ *
+ * Both ends use the native media engine (no ffmpeg/ffplay/pactl needed):
+ *   host:   `ps-media audio-capture` - PipeWire (Linux) or WASAPI loopback
+ *           (Windows), optionally leaving apps out (e.g. Discord, so a viewer in
+ *           the same voice call does not hear everyone twice)
+ *   viewer: `ps-media audio-play` - SDL output with a bounded jitter buffer
+ * Wire: 8-byte header ('PA01' + u32 sequence) + s16le 48 kHz stereo PCM.
+ */
 import { EventEmitter } from 'node:events';
-import { spawn as spawnProcess, execFileSync } from 'node:child_process';
+import { spawn as spawnProcess } from 'node:child_process';
+
+import { findMediaBinary, MEDIA_MISSING } from './engine.mjs';
 
 export const AUDIO_HEADER_BYTES = 8;
 export const AUDIO_FORMAT = Object.freeze({ sampleRate: 48000, channels: 2, sampleBytes: 2 });
 const MAGIC = Buffer.from('PA01'); // version 1 fixes the PCM format above
 const FRAME_BYTES = 4;
-const PCM_CHUNK_BYTES = 3840; // at most 20ms per packet
-const TRANSPORT_LIMIT = 60_000; // Peer.MAX_PAYLOAD; callers should pass MAX_PAYLOAD
+const PCM_CHUNK_BYTES = 3840;      // largest accepted packet: 20 ms
+const CAPTURE_CHUNK_BYTES = 1920;  // what we send: 10 ms, less packetisation delay
+const TRANSPORT_LIMIT = 60_000;    // Peer.MAX_PAYLOAD; callers should pass MAX_PAYLOAD
 const LOG_LIMIT = 8192;
+const SUPPORTED = new Set(['linux', 'win32']);
+const APP_NAME = /^[\p{L}\p{N} ._+-]{1,64}$/u;
 
 function payloadLimit(value = 3848) {
   if (!Number.isInteger(value) || value < 12 || value > TRANSPORT_LIMIT) {
@@ -17,19 +31,24 @@ function payloadLimit(value = 3848) {
   return value;
 }
 
-/** Fail closed: a monitor-looking name alone does not authorize microphone capture. */
-export function selectDefaultMonitor(sink, sources) {
-  if (typeof sink !== 'string' || !/^[A-Za-z0-9_.:-]{1,255}$/.test(sink)) {
-    throw new Error('Invalid or unavailable PulseAudio default sink');
+/**
+ * Validates an app filter and turns it into engine arguments.
+ * @param {{excludeVoice?:boolean, exclude?:string[]|string, only?:string}} filter
+ */
+export function audioFilterArgs(filter = {}) {
+  const list = (v) => (Array.isArray(v) ? v : String(v ?? '').split(','))
+    .map((s) => String(s).trim()).filter(Boolean);
+  const exclude = list(filter.exclude);
+  const only = list(filter.only);
+  for (const name of [...exclude, ...only]) {
+    if (!APP_NAME.test(name)) throw new Error(`invalid app name for audio filter: ${JSON.stringify(name.slice(0, 80))}`);
   }
-  if (!Array.isArray(sources)) throw new Error('Invalid PulseAudio source inventory');
-  const source = sources.find(s => s?.name === `${sink}.monitor`);
-  const monitorIndex = source?.monitor_of_sink;
-  const isMonitor = source?.properties?.['device.class'] === 'monitor'
-    || source?.monitor_source === sink
-    || (Number.isInteger(monitorIndex) && monitorIndex >= 0 && monitorIndex < 0xffffffff);
-  if (!source || !isMonitor) throw new Error('Verified default sink monitor unavailable; no microphone fallback');
-  return source.name;
+  if (exclude.length > 32 || only.length > 1) throw new Error('audio filter: at most 32 excluded apps and 1 "only" app');
+  const args = [];
+  if (only.length) return ['--only', only[0]];   // "only" overrides exclusions
+  if (filter.excludeVoice === true) args.push('--exclude-voice');
+  if (exclude.length) args.push('--exclude', exclude.join(','));
+  return args;
 }
 
 /** Strict wire validation; no allocations proportional to an untrusted length field. */
@@ -43,11 +62,12 @@ export function decodeAudio(payload, maxPayload = 3848) {
 
 class AudioProcess extends EventEmitter {
   constructor({ enabled = false, platform = process.platform, spawn = spawnProcess,
-    maxPayload, killAfterMs = 500 } = {}) {
+    binary, maxPayload, killAfterMs = 500 } = {}) {
     super();
     this.enabled = enabled === true;
     this.platform = platform;
     this.spawn = spawn;
+    this.binary = binary;
     this.maxPayload = payloadLimit(maxPayload);
     if (!Number.isInteger(killAfterMs) || killAfterMs < 1 || killAfterMs > 5000) {
       throw new RangeError('killAfterMs must be from 1 through 5000');
@@ -57,17 +77,20 @@ class AudioProcess extends EventEmitter {
     this.stopped = false;
     this.logBytes = 0;
     this.stopPromise = null;
+    this.lineBuf = '';
   }
 
   checkEnabled() {
     if (!this.enabled) throw new Error('Desktop audio requires explicit enabled: true');
-    if (this.platform !== 'linux') {
-      throw new Error(`Desktop audio unsupported on ${this.platform}; only Linux PulseAudio is implemented`);
+    if (!SUPPORTED.has(this.platform)) {
+      throw new Error(`Desktop audio unsupported on ${this.platform}; Linux and Windows are supported`);
     }
     if (this.stopped) throw new Error('Audio instance stopped; create a new instance');
   }
 
-  launch(binary, args, stdio) {
+  launch(args, stdio) {
+    const binary = this.binary ?? findMediaBinary();
+    if (!binary) throw new Error(MEDIA_MISSING);
     const proc = this.spawn(binary, args, { shell: false, windowsHide: true, stdio });
     this.proc = proc;
     this.closed = new Promise(resolve => { this.resolveClosed = resolve; });
@@ -75,12 +98,23 @@ class AudioProcess extends EventEmitter {
       const size = Math.min(data.length, LOG_LIMIT - this.logBytes);
       if (size <= 0 || this.stopped) return;
       this.logBytes += size;
-      this.emit('log', data.subarray(0, size).toString('utf8'));
+      // Engine status lines ("audio: ...") become log events; warnings are
+      // surfaced separately so the UI can tell the user (e.g. Discord could
+      // not be left out on this Windows version).
+      this.lineBuf += data.subarray(0, size).toString('utf8');
+      const lines = this.lineBuf.split(/\r?\n/);
+      this.lineBuf = lines.pop();
+      for (const line of lines) {
+        if (!line) continue;
+        const warning = /^audio: warning: (.*)$/.exec(line);
+        if (warning) this.emit('warning', warning[1]);
+        this.emit('log', line);
+      }
     });
     const failed = err => {
       if (this.stopped) return;
       void this.stop();
-      this.emit('error', new Error(`${binary}: ${err.message}`, { cause: err }));
+      this.emit('error', new Error(`audio engine: ${err.message}`, { cause: err }));
     };
     proc.on('error', failed);
     proc.stdin?.on('error', failed); // EPIPE is an ordinary audio failure, not a crash
@@ -92,7 +126,7 @@ class AudioProcess extends EventEmitter {
       this.resolveClosed();
       if (!this.stopped) {
         void this.stop();
-        this.emit('error', new Error(`${binary} exited unexpectedly (code=${code}, signal=${signal})`));
+        this.emit('error', new Error(`audio engine exited unexpectedly (code=${code}, signal=${signal})`));
       }
     });
     return proc;
@@ -120,53 +154,37 @@ class AudioProcess extends EventEmitter {
 }
 
 export class AudioCapture extends AudioProcess {
-  constructor({ source = 'default-monitor', probe = execFileSync, ...options } = {}) {
+  constructor({ filter = {}, ...options } = {}) {
     super(options);
-    this.source = source;
-    this.probe = probe;
+    this.filter = filter;
     this.sequence = 0;
     this.used = 0;
-    this.chunkBytes = Math.min(PCM_CHUNK_BYTES,
+    this.chunkBytes = Math.min(CAPTURE_CHUNK_BYTES,
       Math.floor((this.maxPayload - AUDIO_HEADER_BYTES) / FRAME_BYTES) * FRAME_BYTES);
     this.pending = Buffer.allocUnsafe(this.chunkBytes);
     this.started = false;
   }
 
-  /** Attach error/data/log listeners first. Preflight errors throw synchronously. */
+  /** Attach error/data/log listeners first. Validation errors throw synchronously. */
   start() {
     this.checkEnabled();
     if (this.started) throw new Error('AudioCapture already started');
-    if (this.source !== 'default-monitor') {
-      throw new Error('Audio source not allowed; only default-monitor is supported');
-    }
-    const probeOptions = { encoding: 'utf8', timeout: 2000, maxBuffer: 1024 * 1024,
-      shell: false, stdio: ['ignore', 'pipe', 'pipe'] };
-    let monitor;
-    try {
-      const sink = this.probe('pactl', ['get-default-sink'], probeOptions).trim();
-      const sources = JSON.parse(this.probe('pactl', ['-f', 'json', 'list', 'sources'], probeOptions));
-      monitor = selectDefaultMonitor(sink, sources);
-    } catch (err) {
-      throw new Error(`Desktop audio preflight failed (pactl/PulseAudio required): ${err.message}`, { cause: err });
-    }
+    const filterArgs = audioFilterArgs(this.filter);
     this.started = true;
     let proc;
     try {
-      proc = this.launch('ffmpeg', ['-hide_banner', '-loglevel', 'warning', '-nostdin',
-        '-thread_queue_size', '8', '-f', 'pulse', '-i', monitor, '-vn',
-        '-ac', '2', '-ar', '48000', '-c:a', 'pcm_s16le', '-f', 's16le', 'pipe:1'],
-      ['ignore', 'pipe', 'pipe']);
+      proc = this.launch(['audio-capture', ...filterArgs], ['ignore', 'pipe', 'pipe']);
     } catch (err) { void this.stop(); throw err; }
     proc.stdout.on('data', data => {
-      // Fixed staging buffer: never concatenate arbitrary stdout chunks or queue packets.
-      for (let offset = 0; offset < data.length && !this.stopped;) {
-        const size = Math.min(this.chunkBytes - this.used, data.length - offset);
-        data.copy(this.pending, this.used, offset, offset + size);
-        this.used += size;
-        offset += size;
-        if (this.used !== this.chunkBytes) continue;
+      let offset = 0;
+      while (!this.stopped && offset < data.length) {
+        const n = Math.min(this.chunkBytes - this.used, data.length - offset);
+        data.copy(this.pending, this.used, offset, offset + n);
+        this.used += n;
+        offset += n;
+        if (this.used < this.chunkBytes) break;
         const packet = Buffer.allocUnsafe(AUDIO_HEADER_BYTES + this.chunkBytes);
-        MAGIC.copy(packet);
+        MAGIC.copy(packet, 0);
         packet.writeUInt32LE(this.sequence, 4);
         this.sequence = (this.sequence + 1) >>> 0;
         this.pending.copy(packet, AUDIO_HEADER_BYTES);
@@ -185,7 +203,7 @@ export class AudioPlayer extends AudioProcess {
     this.blocked = false;
   }
 
-  /** true = submitted to ffplay, false = dropped. Never retry a dropped packet. */
+  /** true = submitted to the player, false = dropped. Never retry a dropped packet. */
   write(payload) {
     this.checkEnabled();
     const frame = decodeAudio(payload, this.maxPayload);
@@ -197,10 +215,7 @@ export class AudioPlayer extends AudioProcess {
     this.lastSequence = frame.sequence;
     if (!this.proc) {
       try {
-        const proc = this.launch('ffplay', ['-hide_banner', '-loglevel', 'warning',
-          '-nodisp', '-autoexit', '-noinfbuf', '-sync', 'audio', '-f', 's16le',
-          '-sample_rate', '48000', '-ch_layout', 'stereo', '-i', 'pipe:0'],
-        ['pipe', 'ignore', 'pipe']);
+        const proc = this.launch(['audio-play'], ['pipe', 'ignore', 'pipe']);
         proc.stdin.on('drain', () => { this.blocked = false; });
       } catch (err) { void this.stop(); throw err; }
     }
@@ -214,7 +229,7 @@ export class AudioPlayer extends AudioProcess {
       return true;
     } catch (err) {
       void this.stop();
-      this.emit('error', new Error(`ffplay input: ${err.message}`, { cause: err }));
+      this.emit('error', new Error(`audio player input: ${err.message}`, { cause: err }));
       return false;
     }
   }
