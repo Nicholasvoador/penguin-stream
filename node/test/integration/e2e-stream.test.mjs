@@ -11,6 +11,9 @@
  * operator's real desktop or sends it anywhere.
  */
 
+// Offline and deterministic: these tests use a local rendezvous only.
+process.env.PENGUIN_NOSTR ??= '0';
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

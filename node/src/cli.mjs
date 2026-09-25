@@ -10,7 +10,6 @@
  */
 
 import readline from 'node:readline';
-import process from 'node:process';
 
 import { Host, Viewer, DEFAULT_RENDEZVOUS } from './app/session.mjs';
 import { parseInvitation } from './signal/code.mjs';
@@ -18,7 +17,7 @@ import { startRendezvous } from './signal/server.mjs';
 import { startTurnServer } from '../../turn/src/server.mjs';
 import { loadOrCreateIdentity, TrustStore, configDir } from './crypto/identity.mjs';
 import { cleanupTransport } from './transport/peer.mjs';
-import { findMediaBinary } from './media/engine.mjs';
+import { findMediaBinary, MEDIA_MISSING } from './media/engine.mjs';
 
 const C = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
@@ -59,19 +58,22 @@ function banner(text) {
 
 async function cmdHost(args) {
   if (!findMediaBinary()) {
-    console.error(`${c.red}The media engine is not built.${c.reset}\n` +
-      '  cmake -B media/build -S media -G Ninja && cmake --build media/build');
+    console.error(`${c.red}${MEDIA_MISSING}${c.reset}`);
     process.exit(1);
   }
 
+  const control = Boolean(args['allow-control']);
   const host = new Host({
     rendezvousUrl: args.rendezvous || DEFAULT_RENDEZVOUS,
+    nostr: args['no-nostr'] ? false : undefined,
     source: args.source,
+    display: args.display,
     fps: args.fps ? Number(args.fps) : undefined,
     bitrateKbps: args.bitrate ? Number(args.bitrate) : undefined,
     encoder: args.encoder,
     forceRelay: Boolean(args['force-relay']),
-    allowInput: Boolean(args['allow-input']) && !args['no-input'],
+    allowInput: (control || Boolean(args['allow-input'])) && !args['no-input'],
+    allowGamepad: (control || Boolean(args['allow-gamepad'])) && !args['no-input'],
     audio: Boolean(args.audio),
     turn: args.turn,
     turnUser: args['turn-user'],
@@ -83,12 +85,22 @@ async function cmdHost(args) {
   let lastPrinted = 0;
   host.on('code', (code) => {
     console.log();
-    banner(`Share code:  ${code}`);
-    console.log(`\n  On the other machine run:  ${c.bold}penguin-stream connect ${code}${c.reset}`);
+    banner(`Invitation:  ${code}`);
+    console.log(`\n  Send it privately. On the other machine: ${c.bold}penguin-stream connect ${code}${c.reset}`);
+    console.log(`  ${c.dim}(or paste it into the Connect box of the Penguin Stream window)${c.reset}`);
+    console.log(`  keyboard+mouse: ${host.permissions.kbm ? 'allowed' : 'blocked'}, ` +
+      `controllers: ${host.permissions.pad ? 'allowed' : 'blocked'}`);
     console.log(`  ${c.dim}Waiting for someone to connect...${c.reset}\n`);
   });
 
   host.on('log', (m) => console.log(`${c.dim}  ${m}${c.reset}`));
+  let lastInputWarning = '';
+  host.on('input-status', (st) => {
+    const warning = host.permissions.pad && st.padReady === false && st.padError
+      ? `controllers unavailable: ${st.padError}` : '';
+    if (warning && warning !== lastInputWarning) console.log(`${c.yellow}  ${warning}${c.reset}`);
+    lastInputWarning = warning;
+  });
   host.on('error', (e) => console.error(`${c.red}error: ${e.message}${c.reset}`));
 
   let lastHostStats = null;
@@ -153,16 +165,19 @@ async function cmdConnect(args) {
     process.exit(2);
   }
   if (!findMediaBinary()) {
-    console.error(`${c.red}The media engine is not built.${c.reset}\n` +
-      '  cmake -B media/build -S media -G Ninja && cmake --build media/build');
+    console.error(`${c.red}${MEDIA_MISSING}${c.reset}`);
     process.exit(1);
   }
 
+  const viewOnly = Boolean(args['view-only'] || args['no-input']);
   const viewer = new Viewer({
     code,
     rendezvousUrl: args.rendezvous || DEFAULT_RENDEZVOUS,
+    nostr: args['no-nostr'] ? false : undefined,
     forceRelay: Boolean(args['force-relay']),
-    noInput: !args['allow-input'] || Boolean(args['no-input']),
+    sendKbm: !viewOnly && !args['no-kbm'],
+    sendPad: !viewOnly && !args['no-gamepad'],
+    lowLatency: !args.vsync,
     audio: Boolean(args.audio),
     turn: args.turn,
     turnUser: args['turn-user'],
@@ -182,9 +197,15 @@ async function cmdConnect(args) {
     console.log(`${c.green}connected${c.reset} (${t.relayed ? 'via relay' : 'direct'}, ${t.localType} -> ${t.remoteType})`);
   });
   viewer.on('media-config', (cfg) => {
-    console.log(`${c.dim}  stream: ${cfg.width}x${cfg.height} ${cfg.codec}, host encoder ${cfg.encoder}${c.reset}`);
-    console.log(`${c.dim}  press Ctrl+Shift+Q in the window to disconnect${c.reset}`);
+    console.log(`${c.dim}  stream: ${cfg.width}x${cfg.height} ${cfg.codec}, host encoder ${cfg.encoder}, capture ${cfg.capture}${c.reset}`);
+    console.log(`${c.dim}  in the window, hold Ctrl+Alt+Shift and press: Q disconnect, M keyboard/mouse on/off,${c.reset}`);
+    console.log(`${c.dim}  G controllers on/off, Z game mode (captured mouse), X fullscreen${c.reset}`);
   });
+  viewer.on('host-permissions', (p) => {
+    console.log(`\n  host allows: keyboard+mouse ${p.kbm ? (p.kbmReady ? 'yes' : 'yes (unavailable on host)') : 'no'}, ` +
+      `controllers ${p.pad ? (p.padReady ? 'yes' : `yes (unavailable: ${p.padError || 'unknown'})`) : 'no'}`);
+  });
+  viewer.on('log', (m) => console.log(`${c.dim}  ${m}${c.reset}`));
   let lastViewerStats = null;
   let lastViewerPrint = 0;
   viewer.on('stats', (s) => {
@@ -299,21 +320,34 @@ ${c.bold}Usage${c.reset}
   penguin-stream doctor                      check what works on this machine
 
 ${c.bold}Common options${c.reset}
-  --rendezvous <ws://host:port>   rendezvous server (default ${DEFAULT_RENDEZVOUS})
+  --rendezvous <ws://host:port>   also use a self-hosted rendezvous (pairing uses public
+                                  Nostr relays by default; nothing to set up)
+  --no-nostr                      do not use Nostr relays (requires --rendezvous)
   --turn <turn:host:port>         TURN relay for CGNAT / strict NAT
   --turn-user, --turn-password    TURN credentials
   --stun <stun:host:port>         STUN server for NAT discovery
   --force-relay                   request relay-only ICE (verify actual path; no privacy guarantee)
 
 ${c.bold}Host options${c.reset}
-  --source <portal|x11|synthetic> capture backend (default: auto)
+  --source <dxgi|gdi|portal|x11|synthetic>  capture backend (default: auto)
+  --display <n>                   monitor index (Windows; default: first/primary)
   --fps <n>                       target frame rate (default 60)
   --bitrate <kbps>                target bitrate (default 15000)
-  --encoder <auto|vaapi|nvenc|x264>
-  --allow-input                   opt in to remote control (portal permission required)
-  --no-input                      view-only (default); ignore remote keyboard/mouse
+  --encoder <auto|nvenc|amf|qsv|mf|vaapi|x264>
+  --allow-control                 let the viewer use keyboard, mouse and controllers
+  --allow-input                   keyboard + mouse only (Wayland asks for permission)
+  --allow-gamepad                 controllers only (virtual Xbox 360 pads; Windows
+                                  needs the ViGEmBus driver, Linux /dev/uinput access)
+  --no-input                      view-only (default)
   --audio                         opt in to Linux desktop audio capture/playback
   --yes                           synthetic-source tests only: skip human approval
+
+${c.bold}Viewer options${c.reset}
+  --no-kbm / --no-gamepad         do not send keyboard+mouse / controllers
+  --view-only                     send no input at all
+  --vsync                         enable vsync (smoother, adds up to one frame of latency)
+  In the viewer window hold Ctrl+Alt+Shift and press Q (quit), M (keyboard+mouse
+  on/off), G (controllers on/off), Z (game mode: captured mouse), X (fullscreen).
 `);
 }
 

@@ -6,6 +6,9 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <cstdint>
+#include <cstring>
+
 namespace ps {
 namespace {
 
@@ -33,9 +36,10 @@ bool Decoder::open(const std::vector<uint8_t>& extradata, std::string& error) {
   ctx_ = avcodec_alloc_context3(codec);
   if (!ctx_) { error = "could not allocate decoder context"; return false; }
 
-  // Latency matters more than throughput here: decode on the calling thread
-  // and never hold frames back waiting to reorder.
-  ctx_->thread_count = 1;
+  // Latency matters more than throughput: slice threads split one frame
+  // across cores without the one-frame-per-thread delay of frame threading.
+  ctx_->thread_type = FF_THREAD_SLICE;
+  ctx_->thread_count = 0;
   ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
   ctx_->flags2 |= AV_CODEC_FLAG2_FAST;
 
@@ -73,19 +77,24 @@ bool Decoder::drain(const std::function<void(const DecodedFrame&)>& sink, std::s
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) return true;
     if (ret < 0) { error = "avcodec_receive_frame: " + avErr(ret); return false; }
 
-    ensureScaler(frame_->width, frame_->height, frame_->format);
-    if (!sws_) { error = "could not create colour converter"; return false; }
-
-    uint8_t* dst[1] = {bgra_.data()};
-    const int dstStride[1] = {frame_->width * 4};
-    sws_scale(sws_, frame_->data, frame_->linesize, 0, frame_->height, dst, dstStride);
-
     DecodedFrame out{};
     out.width = frame_->width;
     out.height = frame_->height;
     out.pts_us = static_cast<uint64_t>(frame_->pts < 0 ? 0 : frame_->pts);
-    out.bgra = bgra_.data();
-    out.stride = dstStride[0];
+    if (yuvOutput_ && (frame_->format == AV_PIX_FMT_YUV420P || frame_->format == AV_PIX_FMT_YUVJ420P)) {
+      for (int i = 0; i < 3; ++i) {
+        out.planes[i] = frame_->data[i];
+        out.linesize[i] = frame_->linesize[i];
+      }
+    } else {
+      ensureScaler(frame_->width, frame_->height, frame_->format);
+      if (!sws_) { error = "could not create colour converter"; return false; }
+      uint8_t* dst[1] = {bgra_.data()};
+      const int dstStride[1] = {frame_->width * 4};
+      sws_scale(sws_, frame_->data, frame_->linesize, 0, frame_->height, dst, dstStride);
+      out.bgra = bgra_.data();
+      out.stride = dstStride[0];
+    }
     ++framesDecoded_;
     sink(out);
     av_frame_unref(frame_);
@@ -97,24 +106,26 @@ bool Decoder::decode(const uint8_t* data, size_t size, uint64_t pts_us,
                      std::string& error) {
   if (!ctx_) { error = "decoder not open"; return false; }
 
+  // The bitstream reader may read up to AV_INPUT_BUFFER_PADDING_SIZE bytes
+  // past the end, so decode from an owned, zero-padded copy.
+  if (size > static_cast<size_t>(INT32_MAX - AV_INPUT_BUFFER_PADDING_SIZE)) { ++decodeErrors_; return true; }
+  padded_.resize(size + AV_INPUT_BUFFER_PADDING_SIZE);
+  memcpy(padded_.data(), data, size);
+  memset(padded_.data() + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
   av_packet_unref(pkt_);
-  // av_packet_from_data would take ownership; we only borrow the caller's bytes
-  // for the duration of avcodec_send_packet, so point at them directly.
-  pkt_->data = const_cast<uint8_t*>(data);
+  pkt_->data = padded_.data();
   pkt_->size = static_cast<int>(size);
   pkt_->pts = static_cast<int64_t>(pts_us);
 
   int ret = avcodec_send_packet(ctx_, pkt_);
+  pkt_->data = nullptr;
+  pkt_->size = 0;
   if (ret < 0) {
     // A corrupt packet is survivable: count it, keep the stream alive, and let
     // the next keyframe resynchronise. Tearing the session down would be worse.
     ++decodeErrors_;
-    pkt_->data = nullptr;
-    pkt_->size = 0;
     return true;
   }
-  pkt_->data = nullptr;
-  pkt_->size = 0;
 
   return drain(sink, error);
 }

@@ -74,6 +74,11 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
     mediaConfig: null,
     stats: {},
     log: [],
+    permissions: null,     // host: what the viewer may control (live)
+    inputStatus: null,     // host: what this machine can actually inject
+    remoteViewer: null,    // host: what the viewer is currently sending
+    viewerState: null,     // viewer: local switches, as the stream window reports them
+    hostPermissions: null, // viewer: what the host allows
   };
 
   const pushLog = (line) => {
@@ -97,13 +102,13 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
     identity: { fingerprint: identity.fingerprint, label: identity.label },
     peers: trust.list().map((p) => ({ fingerprint: p.fingerprint, label: p.label, role: p.role })),
     pendingConsent: pendingConsent?.request ?? null,
-    rendezvous: DEFAULT_RENDEZVOUS,
-    capabilities: {
-      desktopVideo: 'fedora-wayland-tested',
-      remoteInput: 'experimental-wayland-portal-unverified',
-      desktopAudio: 'experimental-linux-cli-only-unverified',
-      windows: 'implementation-uncompiled-unverified',
-    },
+    rendezvous: DEFAULT_RENDEZVOUS ?? null,
+    permissions: state.permissions,
+    inputStatus: state.inputStatus,
+    remoteViewer: state.remoteViewer,
+    viewerState: state.viewerState,
+    hostPermissions: state.hostPermissions,
+    platform: process.platform,
   });
 
   const stopActive = (reason = 'stopped by user') => {
@@ -119,32 +124,56 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
     state.transport = null;
     state.mediaConfig = null;
     state.stats = {};
-    pendingConsent?.resolve?.(false);
-    pendingConsent = null;
+    state.permissions = null;
+    state.inputStatus = null;
+    state.remoteViewer = null;
+    state.viewerState = null;
+    state.hostPermissions = null;
     setMode('idle');
   };
 
   /* ----------------------------- actions ----------------------------- */
 
+  // Network options shared by both roles. Credentials stay in memory only.
+  function commonOptions(opts) {
+    const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
+    return {
+      rendezvousUrl: str(opts.rendezvous) || DEFAULT_RENDEZVOUS,
+      forceRelay: Boolean(opts.forceRelay),
+      noStun: opts.noStun === true,
+      stun: str(opts.stun),
+      turn: str(opts.turn),
+      turnUser: str(opts.turnUser),
+      turnPassword: typeof opts.turnPassword === 'string' && opts.turnPassword ? opts.turnPassword : undefined,
+    };
+  }
+
   async function startHost(opts) {
     if (active) throw new Error('a session is already running');
 
     const host = new HostClass({
-      rendezvousUrl: opts.rendezvous || DEFAULT_RENDEZVOUS,
-      source: opts.source || undefined,
+      ...commonOptions(opts),
+      source: typeof opts.source === 'string' && /^(dxgi|gdi|portal|x11|synthetic)$/.test(opts.source) ? opts.source : undefined,
+      display: typeof opts.display === 'string' && /^[0-9]{1,2}$/.test(opts.display) ? opts.display : undefined,
       fps: opts.fps ? Number(opts.fps) : undefined,
       bitrateKbps: opts.bitrate ? Number(opts.bitrate) : undefined,
+      encoder: typeof opts.encoder === 'string' && /^(auto|nvenc|amf|qsv|mf|vaapi|x264|software)$/.test(opts.encoder)
+        ? opts.encoder : undefined,
       allowInput: opts.allowInput === true,
-      forceRelay: Boolean(opts.forceRelay),
-      turn: opts.turn || undefined,
-      turnUser: opts.turnUser || undefined,
-      turnPassword: opts.turnPassword || undefined,
-      sessionTimeoutMs: 15 * 60 * 1000,
+      allowGamepad: opts.allowGamepad === true,
+      // Ask Wayland for remote-control permission up front, so control can be
+      // switched on later in the session without restarting the share.
+      inputCapable: true,
+      audio: opts.audio === true,
     });
 
     active = { kind: 'host', instance: host };
     const scope = bindSession(host);
+    state.permissions = { ...host.permissions };
     setMode('hosting-waiting');
+    scope.on('permissions', (p) => { state.permissions = { ...p }; broadcast('state', publicState()); });
+    scope.on('input-status', (st) => { state.inputStatus = st; broadcast('state', publicState()); });
+    scope.on('viewer-state', (v) => { state.remoteViewer = v; broadcast('state', publicState()); });
 
     scope.on('code', (code) => { state.code = code; broadcast('state', publicState()); });
     scope.on('log', pushLog);
@@ -203,18 +232,20 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
     }
 
     const viewer = new ViewerClass({
+      ...commonOptions({ ...opts, rendezvous }),
       code,
-      rendezvousUrl: rendezvous || DEFAULT_RENDEZVOUS,
-      forceRelay: Boolean(opts.forceRelay),
-      noInput: opts.allowInput !== true,
-      turn: opts.turn || undefined,
-      turnUser: opts.turnUser || undefined,
-      turnPassword: opts.turnPassword || undefined,
+      sendKbm: opts.sendKbm !== false,
+      sendPad: opts.sendPad !== false,
+      lowLatency: opts.lowLatency !== false,
+      audio: opts.audio === true,
     });
 
     active = { kind: 'viewer', instance: viewer };
     const scope = bindSession(viewer);
     setMode('connecting');
+    scope.on('viewer-state', (v) => { state.viewerState = v; broadcast('state', publicState()); });
+    scope.on('host-permissions', (p) => { state.hostPermissions = p; broadcast('state', publicState()); });
+    scope.on('log', pushLog);
 
     scope.on('sas', (sas) => { state.sas = sas.phrase; broadcast('state', publicState()); });
     scope.on('secure', (t) => { state.transport = t; setMode('viewing'); });
@@ -290,6 +321,26 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
           case '/api/host': return json(await startHost(body));
           case '/api/connect': return json(await startViewer(body));
           case '/api/stop': stopActive('stopped by user'); return json({ ok: true });
+          case '/api/permissions': {
+            if (active?.kind !== 'host') return json({ error: 'not sharing' }, 409);
+            if ((body.kbm !== undefined && typeof body.kbm !== 'boolean') ||
+                (body.pad !== undefined && typeof body.pad !== 'boolean')) {
+              return json({ error: 'kbm and pad must be booleans' }, 400);
+            }
+            active.instance.setPermissions({ kbm: body.kbm, pad: body.pad });
+            return json({ ok: true });
+          }
+          case '/api/viewer-input': {
+            if (active?.kind !== 'viewer') return json({ error: 'not connected' }, 409);
+            const change = {};
+            for (const k of ['kbm', 'pad', 'capture']) {
+              if (body[k] === undefined) continue;
+              if (typeof body[k] !== 'boolean') return json({ error: `${k} must be a boolean` }, 400);
+              change[k] = body[k];
+            }
+            active.instance.setInput(change);
+            return json({ ok: true });
+          }
           case '/api/consent': {
             if (!pendingConsent?.resolve) return json({ error: 'nothing awaiting consent' }, 409);
             if (typeof body.approve !== 'boolean') return json({ error: 'approve must be boolean' }, 400);
@@ -355,9 +406,18 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
     ws.on('close', () => clients.delete(ws));
   });
 
+  // A second copy (or another app) may already use the port: take any free one.
   await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, '127.0.0.1', resolve);
+    const onError = (err) => {
+      if (err.code === 'EADDRINUSE' && port !== 0) {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+      } else {
+        reject(err);
+      }
+    };
+    server.once('error', onError);
+    server.listen(port, '127.0.0.1', () => { server.off('error', onError); resolve(); });
   });
 
   const actualPort = server.address().port;
@@ -388,11 +448,17 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
 }
 
 function openBrowser(url) {
-  const cmd = process.platform === 'darwin' ? 'open'
-    : process.platform === 'win32' ? 'cmd' : 'xdg-open';
-  const args = process.platform === 'win32' ? ['/c', 'start', '""', url] : [url];
   try {
-    spawn(cmd, args, { detached: true, stdio: 'ignore' }).unref();
+    if (process.platform === 'win32') {
+      // `start` needs an explicit empty title argument, and Node's argument
+      // quoting would mangle it, so build the command line verbatim. The URL
+      // contains only [A-Za-z0-9:/.#=_-] (base64url token), nothing cmd-special.
+      spawn('cmd.exe', ['/d', '/s', '/c', `start "" "${url}"`], {
+        detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true,
+      }).unref();
+    } else {
+      spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
+    }
   } catch {
     // Headless or no browser: the printed link is the fallback.
   }

@@ -5,6 +5,8 @@
 // deliver without an extra conversion in the common case.
 #pragma once
 
+#include "input/event.h"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -24,7 +26,7 @@ struct CaptureOptions {
   int width = 0;          // 0 = native
   int height = 0;
   int fps = 60;
-  bool allowInput = false; // Explicit opt-in; portal consent is still required.
+  bool allowInput = false; // Keyboard/mouse opt-in; portal consent is still required.
   std::string display;    // X11 display / portal restore token / monitor index
 };
 
@@ -35,8 +37,12 @@ class CaptureSource {
   virtual bool start(const CaptureOptions& opts, std::string& error) = 0;
   virtual void stop() = 0;
 
-  // Canonical validated input JSON. Unsupported backends fail closed.
-  virtual bool input(const std::string&) { return false; }
+  // Keyboard/mouse injection for the captured output. Called from the control
+  // thread, concurrently with nextFrame(); implementations must be thread-safe.
+  // Unsupported backends fail closed.
+  virtual bool input(const InputEvent&) { return false; }
+  // Whether keyboard/mouse injection is actually usable after start().
+  virtual bool inputReady() const { return false; }
 
   // Blocks until the next frame is ready.
   // Returns false on end-of-stream or unrecoverable error (error set).
@@ -64,10 +70,11 @@ std::unique_ptr<CaptureSource> makePortalPipeWireSource();
 #endif
 #ifdef PS_HAVE_DXGI
 std::unique_ptr<CaptureSource> makeDxgiSource();
+std::unique_ptr<CaptureSource> makeGdiSource();   // fallback when duplication is unavailable
 #endif
 
 // Picks the best available backend for the current session.
-// `forced` may be "synthetic", "x11", "portal", "dxgi", or empty for auto.
+// `forced` may be "synthetic", "x11", "portal", "dxgi", "gdi", or empty for auto.
 std::unique_ptr<CaptureSource> makeCaptureSource(const std::string& forced, std::string& chosen);
 
 }  // namespace ps

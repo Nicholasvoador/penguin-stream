@@ -16,6 +16,7 @@
 // correctness requirement now.
 
 #include "capture/source.h"
+#include "input/keymap.h"
 
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
@@ -26,7 +27,6 @@
 #include <spa/utils/result.h>
 
 #include <condition_variable>
-#include <charconv>
 #include <cmath>
 #include <map>
 #include <set>
@@ -45,77 +45,6 @@ constexpr const char* kPortalPath = "/org/freedesktop/portal/desktop";
 constexpr const char* kScreenCastIface = "org.freedesktop.portal.ScreenCast";
 constexpr const char* kRequestIface = "org.freedesktop.portal.Request";
 constexpr const char* kRemoteDesktopIface = "org.freedesktop.portal.RemoteDesktop";
-
-// Deliberately small, strict flat JSON subset: no nesting, escapes, duplicate
-// fields, non-finite numbers or trailing junk. Never use substring/stod readers
-// on untrusted input. Node emits only these ASCII tokens.
-struct InputValue {
-  enum Kind { String, Number, Boolean } kind;
-  std::string text;
-  double number = 0;
-};
-using InputFields = std::map<std::string, InputValue>;
-bool parseInput(const std::string& json, InputFields& fields) {
-  if (json.empty() || json.size() > 1024) return false;
-  size_t p = 0;
-  auto ws = [&] { while (p < json.size() && (json[p] == ' ' || json[p] == '\t' ||
-                       json[p] == '\r' || json[p] == '\n')) ++p; };
-  auto take = [&](char c) { ws(); if (p == json.size() || json[p] != c) return false; ++p; return true; };
-  auto word = [&](std::string& s) {
-    if (!take('"')) return false;
-    size_t begin = p;
-    while (p < json.size() && ((json[p] >= 'a' && json[p] <= 'z') ||
-           (json[p] >= '0' && json[p] <= '9') || json[p] == '_')) ++p;
-    s = json.substr(begin, p - begin);
-    return !s.empty() && p < json.size() && json[p++] == '"';
-  };
-  if (!take('{')) return false;
-  for (;;) {
-    std::string key;
-    if (fields.size() >= 8 || !word(key) || !take(':')) return false;
-    ws();
-    if (p == json.size()) return false;
-    InputValue value{};
-    if (json[p] == '"') {
-      value.kind = InputValue::String;
-      if (!word(value.text)) return false;
-    } else if (json.compare(p, 4, "true") == 0 || json.compare(p, 5, "false") == 0) {
-      value.kind = InputValue::Boolean;
-      value.number = json[p] == 't' ? 1 : 0;
-      p += value.number == 1 ? 4 : 5;
-    } else {
-      value.kind = InputValue::Number;
-      const size_t begin = p;
-      if (json[p] == '-') ++p;
-      auto digit = [&] { return p < json.size() && json[p] >= '0' && json[p] <= '9'; };
-      if (!digit()) return false;
-      if (json[p] == '0') ++p;
-      else while (digit()) ++p;
-      if (p < json.size() && json[p] == '.') {
-        ++p; if (!digit()) return false; while (digit()) ++p;
-      }
-      if (p < json.size() && (json[p] == 'e' || json[p] == 'E')) {
-        ++p;
-        if (p < json.size() && (json[p] == '+' || json[p] == '-')) ++p;
-        if (!digit()) return false;
-        while (digit()) ++p;
-      }
-      const auto result = std::from_chars(json.data() + begin, json.data() + p, value.number);
-      if (result.ec != std::errc{} || result.ptr != json.data() + p || !std::isfinite(value.number)) return false;
-    }
-    if (!fields.emplace(key, value).second) return false;
-    ws();
-    if (take('}')) { ws(); return p == json.size(); }
-    if (!take(',')) return false;
-  }
-}
-
-bool inputNumber(const InputFields& fields, const char* key, double low, double high, double& out) {
-  const auto it = fields.find(key);
-  if (it == fields.end() || it->second.kind != InputValue::Number) return false;
-  out = it->second.number;
-  return out >= low && out <= high;
-}
 
 std::string randomToken(const char* prefix) {
   static std::mt19937 rng{std::random_device{}()};
@@ -199,7 +128,10 @@ class PortalSource : public CaptureSource {
 
   void stop() override {
     releaseHeld();
-    inputGranted_ = false;
+    {
+      std::lock_guard<std::recursive_mutex> lock(inputMu_);
+      inputGranted_ = false;
+    }
     if (threadLoop_) {
       pw_thread_loop_stop(threadLoop_);
     }
@@ -239,115 +171,63 @@ class PortalSource : public CaptureSource {
     return true;
   }
 
-  bool input(const std::string& json) override {
-    pumpPortal();
+  bool input(const InputEvent& e) override {
+    std::lock_guard<std::recursive_mutex> lock(inputMu_);
     if (!allowInput_ || !inputGranted_ || !remoteProxy_ || sessionHandle_.empty()) return false;
-    InputFields fields;
-    if (!parseInput(json, fields)) return false;
-    const auto type = fields.find("t");
-    if (type == fields.end() || type->second.kind != InputValue::String) return false;
-    const auto& t = type->second.text;
-    if (t == "release_all" && fields.size() == 1) { releaseHeld(); return inputGranted_; }
-    double x = 0, y = 0;
-    if (t == "mousemove" || t == "mousebutton") {
-      if (!inputNumber(fields, "x", 0, 1, x) || !inputNumber(fields, "y", 0, 1, y)) return false;
-      x *= inputWidth_ - 1;
-      y *= inputHeight_ - 1;
-    }
-    bool ok = false;
-    if (t == "gamepad_button") {
-      const auto button = fields.find("button");
-      const auto down = fields.find("down");
-      if (button == fields.end() || down == fields.end() ||
-          button->second.kind != InputValue::String || down->second.kind != InputValue::Boolean) return false;
-      const bool pressed = down->second.number == 1;
-      const std::string& btn = button->second.text;
-
-      // Map controller buttons to standard navigation keys/buttons
-      static const std::map<std::string, int> btnMap{
-        {"a", 32},         // Space / Select
-        {"b", 0xff1b},     // Esc / Back
-        {"x", 101},        // 'e' / Action
-        {"y", 102},        // 'f' / Secondary
-        {"start", 0xff0d}, // Enter / Pause
-        {"back", 0xff1b},  // Esc
-        {"dpad_up", 0xff52},   // Up
-        {"dpad_down", 0xff54}, // Down
-        {"dpad_left", 0xff51}, // Left
-        {"dpad_right", 0xff53},// Right
-      };
-      const auto it = btnMap.find(btn);
-      if (it != btnMap.end()) {
-        ok = keyEvent(it->second, pressed);
-      } else if (btn == "lb") {
-        ok = buttonEvent(0x110, pressed); // Left click
-      } else if (btn == "rb") {
-        ok = buttonEvent(0x111, pressed); // Right click
-      } else {
-        ok = true; // Handled
+    switch (e.kind) {
+      case InputKind::ReleaseAll:
+        releaseHeld();
+        return true;
+      case InputKind::MouseAbs:
+        return motion(e.x, e.y);
+      case InputKind::MouseRel:
+        notify("NotifyPointerMotion", g_variant_new("(o@a{sv}dd)", sessionHandle_.c_str(),
+            g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0), double(e.dx), double(e.dy)));
+        return true;
+      case InputKind::MouseButton: {
+        static const int codes[] = {0x110, 0x112, 0x111, 0x113, 0x114};  // BTN_LEFT, MIDDLE, RIGHT, SIDE, EXTRA
+        const int code = codes[static_cast<int>(e.button)];
+        if (e.hasPosition) motion(e.x, e.y);
+        if (e.down) heldButtons_.insert(code); else heldButtons_.erase(code);
+        buttonEvent(code, e.down);
+        return true;
       }
-      return ok;
-    } else if (t == "gamepad_axis") {
-      const auto axis = fields.find("axis");
-      double val = 0;
-      if (axis == fields.end() || axis->second.kind != InputValue::String ||
-          !inputNumber(fields, "value", -1, 1, val)) return false;
-      const std::string& ax = axis->second.text;
-
-      // Left stick maps to WASD movement; triggers map to click
-      if (ax == "ls_x") {
-        if (val > 0.3) keyEvent(100, true);  // 'd'
-        else if (val < -0.3) keyEvent(97, true); // 'a'
-        else { keyEvent(100, false); keyEvent(97, false); }
-      } else if (ax == "ls_y") {
-        if (val < -0.3) keyEvent(119, true); // 'w'
-        else if (val > 0.3) keyEvent(115, true); // 's'
-        else { keyEvent(119, false); keyEvent(115, false); }
-      } else if (ax == "lt") {
-        buttonEvent(0x110, val > 0.5); // Left trigger -> left click
-      } else if (ax == "rt") {
-        buttonEvent(0x111, val > 0.5); // Right trigger -> right click
-      }
-      return true;
-    } else if (t == "mousemove" && fields.size() == 3) {
-      ok = motion(x, y);
-    } else if ((t == "mousebutton" && fields.size() == 5) || (t == "key" && fields.size() == 3)) {
-      const auto down = fields.find("down");
-      if (down == fields.end() || down->second.kind != InputValue::Boolean) return false;
-      const bool pressed = down->second.number == 1;
-      if (t == "key") {
-        double keysym = 0;
-        if (!inputNumber(fields, "keysym", 1, 0x1fffffff, keysym) || std::floor(keysym) != keysym) return false;
-        const int key = static_cast<int>(keysym);
-        if (pressed && !heldKeys_.count(key) && heldKeys_.size() >= 64) return false;
-        // Track before delivery: a timed-out request may still have taken effect.
-        if (pressed) heldKeys_.insert(key);
-        ok = keyEvent(key, pressed);
-        if (ok && !pressed) heldKeys_.erase(key);
-      } else {
-        const auto button = fields.find("button");
-        if (button == fields.end() || button->second.kind != InputValue::String) return false;
-        static const std::map<std::string, int> buttons{{"left", 0x110}, {"right", 0x111},
-          {"middle", 0x112}, {"x1", 0x113}, {"x2", 0x114}};
-        const auto code = buttons.find(button->second.text);
-        if (code == buttons.end()) return false;
-        ok = motion(x, y);
-        if (ok) {
-          if (pressed) heldButtons_.insert(code->second);
-          ok = buttonEvent(code->second, pressed);
-          if (ok && !pressed) heldButtons_.erase(code->second);
+      case InputKind::Wheel: {
+        // SDL: wheel up/right is positive. Portal: positive scrolls down/right.
+        // Whole notches (mouse wheels) go out as discrete clicks so apps scroll
+        // by lines; fractional (touchpad) deltas as smooth ~15 px per notch.
+        const bool notches = std::floor(e.wheelX) == e.wheelX && std::floor(e.wheelY) == e.wheelY;
+        if (notches) {
+          if (e.wheelY != 0) notify("NotifyPointerAxisDiscrete", g_variant_new("(o@a{sv}ui)", sessionHandle_.c_str(),
+              g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0), 0u, static_cast<int>(-e.wheelY)));
+          if (e.wheelX != 0) notify("NotifyPointerAxisDiscrete", g_variant_new("(o@a{sv}ui)", sessionHandle_.c_str(),
+              g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0), 1u, static_cast<int>(e.wheelX)));
+        } else {
+          GVariantBuilder options;
+          g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+          g_variant_builder_add(&options, "{sv}", "finish", g_variant_new_boolean(TRUE));
+          notify("NotifyPointerAxis", g_variant_new("(oa{sv}dd)", sessionHandle_.c_str(), &options,
+                                                    e.wheelX * 15.0, -e.wheelY * 15.0));
         }
+        return true;
       }
-    } else if (t == "wheel" && fields.size() == 3) {
-      if (!inputNumber(fields, "dx", -100, 100, x) || !inputNumber(fields, "dy", -100, 100, y)) return false;
-      GVariantBuilder options;
-      g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-      g_variant_builder_add(&options, "{sv}", "finish", g_variant_new_boolean(TRUE));
-      // SDL wheel up/right is positive; portal axes describe scroll down/right.
-      ok = notify("NotifyPointerAxis", g_variant_new("(oa{sv}dd)", sessionHandle_.c_str(), &options, x, -y));
-    } else return false;
-    if (!ok) { inputGranted_ = false; releaseHeld(); }
-    return ok;
+      case InputKind::Key: {
+        NativeKey key;
+        if (!lookupHidKey(e.hid, key) || !key.evdev) return false;
+        if (e.repeat) return true;  // Wayland clients generate their own key repeat
+        if (e.down && !heldKeys_.count(key.evdev) && heldKeys_.size() >= 64) return false;
+        if (e.down) heldKeys_.insert(key.evdev); else heldKeys_.erase(key.evdev);
+        keyEvent(key.evdev, e.down);
+        return true;
+      }
+      default:
+        return false;  // controllers are handled by VirtualGamepads, not the portal
+    }
+  }
+
+  bool inputReady() const override {
+    std::lock_guard<std::recursive_mutex> lock(inputMu_);
+    return allowInput_ && inputGranted_;
   }
 
   int width() const override { std::lock_guard<std::mutex> lock(mu_); return width_; }
@@ -362,31 +242,34 @@ class PortalSource : public CaptureSource {
       g_main_context_iteration(nullptr, FALSE);
   }
 
-  bool notify(const char* method, GVariant* parameters) {
-    GError* error = nullptr;
-    GVariant* reply = g_dbus_proxy_call_sync(remoteProxy_, method, parameters,
-        G_DBUS_CALL_FLAGS_NONE, 250, nullptr, &error);
-    if (error) g_error_free(error);
-    if (!reply) return false;
-    g_variant_unref(reply);
+  // Fire-and-forget: with no callback GDBus sends NO_REPLY_EXPECTED, so a busy
+  // compositor never stalls the input thread, and ordering is preserved on the
+  // single connection. Revoked permission arrives as the Session Closed signal.
+  void notify(const char* method, GVariant* parameters) {
+    g_dbus_proxy_call(remoteProxy_, method, parameters, G_DBUS_CALL_FLAGS_NONE, -1,
+                      nullptr, nullptr, nullptr);
+  }
+  bool motion(double nx, double ny) {
+    const double x = nx * (inputWidth_ - 1), y = ny * (inputHeight_ - 1);
+    notify("NotifyPointerMotionAbsolute", g_variant_new("(o@a{sv}udd)",
+        sessionHandle_.c_str(), g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0), nodeId_, x, y));
     return true;
   }
-  bool motion(double x, double y) {
-    return notify("NotifyPointerMotionAbsolute", g_variant_new("(o@a{sv}udd)",
-        sessionHandle_.c_str(), g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0), nodeId_, x, y));
+  void keyEvent(int evdev, bool down) {
+    notify("NotifyKeyboardKeycode", g_variant_new("(o@a{sv}iu)",
+        sessionHandle_.c_str(), g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0), evdev, down ? 1u : 0u));
   }
-  bool keyEvent(int key, bool down) {
-    return notify("NotifyKeyboardKeysym", g_variant_new("(o@a{sv}iu)",
-        sessionHandle_.c_str(), g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0), key, down ? 1u : 0u));
-  }
-  bool buttonEvent(int button, bool down) {
-    return notify("NotifyPointerButton", g_variant_new("(o@a{sv}iu)",
+  void buttonEvent(int button, bool down) {
+    notify("NotifyPointerButton", g_variant_new("(o@a{sv}iu)",
         sessionHandle_.c_str(), g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0), button, down ? 1u : 0u));
   }
   void releaseHeld() {
-    if (remoteProxy_ && !sessionHandle_.empty()) {
-      for (int key : heldKeys_) if (!keyEvent(key, false)) inputGranted_ = false;
-      for (int button : heldButtons_) if (!buttonEvent(button, false)) inputGranted_ = false;
+    std::lock_guard<std::recursive_mutex> lock(inputMu_);
+    if (remoteProxy_ && !sessionHandle_.empty() && inputGranted_) {
+      for (int key : heldKeys_) keyEvent(key, false);
+      for (int button : heldButtons_) buttonEvent(button, false);
+      // Make sure the release messages leave before the session is closed.
+      if (conn_) g_dbus_connection_flush_sync(conn_, nullptr, nullptr);
     }
     heldKeys_.clear();
     heldButtons_.clear();
@@ -394,9 +277,12 @@ class PortalSource : public CaptureSource {
   static void onClosed(GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar*,
                        GVariant*, gpointer data) {
     auto* self = static_cast<PortalSource*>(data);
-    self->inputGranted_ = false;
-    self->heldKeys_.clear();
-    self->heldButtons_.clear();
+    {
+      std::lock_guard<std::recursive_mutex> lock(self->inputMu_);
+      self->inputGranted_ = false;
+      self->heldKeys_.clear();
+      self->heldButtons_.clear();
+    }
     { std::lock_guard<std::mutex> lock(self->mu_);
       self->running_ = false;
       self->captureError_ = "portal session closed";
@@ -836,6 +722,7 @@ class PortalSource : public CaptureSource {
   bool inputGranted_ = false;
   int inputWidth_ = 0, inputHeight_ = 0;
   std::set<int> heldKeys_, heldButtons_;
+  mutable std::recursive_mutex inputMu_;  // input thread vs. frame thread
   std::string sessionHandle_;
   uint32_t nodeId_ = 0;
   int pwFd_ = -1;

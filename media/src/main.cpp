@@ -14,6 +14,8 @@
 #include "codec/decoder.h"
 #include "codec/encoder.h"
 #include "ipc/framing.h"
+#include "input/event.h"
+#include "input/gamepad.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -22,7 +24,10 @@ extern "C" {
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <thread>
+#include <utility>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -41,6 +46,14 @@ extern "C" {
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#ifndef PS_VERSION
+#define PS_VERSION "dev"
 #endif
 
 namespace ps {
@@ -49,6 +62,7 @@ std::unique_ptr<CaptureSource> makeCaptureSource(const std::string& forced, std:
   if (forced == "synthetic") { chosen = "synthetic"; return makeSyntheticSource(); }
 
 #ifdef PS_HAVE_DXGI
+  if (forced == "gdi") { chosen = "gdi"; return makeGdiSource(); }
   if (forced.empty() || forced == "dxgi") { chosen = "dxgi"; return makeDxgiSource(); }
 #endif
 
@@ -106,7 +120,7 @@ int intArg(int argc, char** argv, const std::string& flag, int fallback) {
 int runProbe() {
   std::string out = "{\"encoders\":[";
   bool first = true;
-  for (const char* name : {"h264_vaapi", "h264_nvenc", "h264_qsv", "h264_amf",
+  for (const char* name : {"h264_nvenc", "h264_vaapi", "h264_qsv", "h264_amf", "h264_mf",
                            "libx264", "libopenh264"}) {
     if (avcodec_find_encoder_by_name(name)) {
       if (!first) out += ",";
@@ -124,13 +138,24 @@ int runProbe() {
   out += ",\"portal\"";
 #endif
 #ifdef PS_HAVE_DXGI
-  out += ",\"dxgi\"";
+  out += ",\"dxgi\",\"gdi\"";
 #endif
   out += "],\"render\":[";
 #ifdef PS_HAVE_SDL
   out += "\"sdl\"";
 #endif
-  out += "]}";
+  std::string padBackend, padWhy;
+  const bool padOk = probeVirtualGamepads(padBackend, padWhy);
+  out += "],\"input\":{\"kbm\":[";
+#ifdef PS_HAVE_DXGI
+  out += "\"sendinput\"";
+#endif
+#ifdef PS_HAVE_PIPEWIRE
+  out += "\"portal\"";
+#endif
+  out += "],\"gamepad\":\"" + padBackend + "\",\"gamepadReady\":" + (padOk ? "true" : "false") +
+         ",\"gamepadError\":\"" + jsonEscape(padWhy) + "\"}";
+  out += ",\"version\":\"" PS_VERSION "\"}";
   printf("%s\n", out.c_str());
   return 0;
 }
@@ -284,101 +309,279 @@ int runSelftest(int argc, char** argv) {
 
 /* ------------------------------ capture ------------------------------- */
 
-// Ultra-low latency input & control reader.
-// Runs on a dedicated thread so input events are dispatched to the injector
-// immediately (<0.05ms) without waiting for the video capture/encode loop.
+// Reads framed messages from stdin on a dedicated thread, so remote input is
+// injected the moment it arrives instead of waiting for the capture/encode
+// loop. Handles keyframe/bitrate requests, live permission changes and the
+// virtual controllers; emits rumble and input status back to Node.
 class CaptureControls {
  public:
-  CaptureControls(CaptureSource& source, Encoder& encoder, bool allowInput)
-      : source_(source), encoder_(encoder), allowInput_(allowInput) {
-#ifndef _WIN32
-    flags_ = fcntl(STDIN_FILENO, F_GETFL, 0);
-    active_ = flags_ >= 0 && fcntl(STDIN_FILENO, F_SETFL, flags_ | O_NONBLOCK) == 0;
-#endif
+  CaptureControls(CaptureSource& source, Encoder& encoder, bool allowKbm, bool allowPad)
+      : source_(source), encoder_(encoder), kbmAllowed_(allowKbm), padAllowed_(allowPad) {
+    reportStatus(true);
     thread_ = std::thread([this] { run(); });
   }
 
   ~CaptureControls() {
-    running_ = false;
-    if (thread_.joinable()) thread_.join();
-#ifndef _WIN32
-    if (active_) fcntl(STDIN_FILENO, F_SETFL, flags_);
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      running_ = false;
+    }
+#ifdef _WIN32
+    // ReadFile on an anonymous pipe cannot be polled; cancel the blocked read.
+    // Retry briefly in case the thread had not yet entered ReadFile.
+    for (int i = 0; i < 100 && !readerDone_; ++i) {
+      if (const DWORD tid = readerThreadId_.load()) {
+        if (HANDLE h = OpenThread(THREAD_TERMINATE, FALSE, tid)) {
+          CancelSynchronousIo(h);
+          CloseHandle(h);
+        }
+      }
+      if (!readerDone_) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!readerDone_) {
+      thread_.detach();  // process exit reaps it; it can no longer act (running_ is false)
+    }
 #endif
+    if (thread_.joinable()) thread_.join();
+    releaseEverything();
   }
 
-  bool isRunning() const { return !failed_ && !shutdownRequested_; }
-  bool shutdownRequested() const { return shutdownRequested_; }
   bool failed() const { return failed_; }
+  bool shutdownRequested() const { return shutdownRequested_; }
+
+  // Called by the capture loop once per frame: forwards the latest force-
+  // feedback state per controller (at most one frame of added latency).
+  void flushRumble() {
+    std::pair<double, double> values[kMaxPads];
+    bool dirty[kMaxPads];
+    {
+      std::lock_guard<std::mutex> lock(rumbleMu_);
+      for (int i = 0; i < kMaxPads; ++i) {
+        values[i] = rumble_[i];
+        dirty[i] = rumbleDirty_[i];
+        rumbleDirty_[i] = false;
+      }
+    }
+    for (int i = 0; i < kMaxPads; ++i) {
+      if (!dirty[i]) continue;
+      char buf[128];
+      std::snprintf(buf, sizeof(buf), "{\"t\":\"rumble\",\"slot\":%d,\"lo\":%.3f,\"hi\":%.3f}", i,
+                    values[i].first, values[i].second);
+      writeJson(stdout, MsgType::Control, buf);
+    }
+  }
 
  private:
   void run() {
-    while (running_) {
-#ifndef _WIN32
+#ifdef _WIN32
+    struct Done { std::atomic<bool>& f; ~Done() { f = true; } } done{readerDone_};
+    readerThreadId_ = GetCurrentThreadId();
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    uint8_t bytes[4096];
+    for (;;) {
+      DWORD size = 0;
+      const BOOL ok = ReadFile(in, bytes, sizeof(bytes), &size, nullptr);
+      if (!ok || size == 0) {
+        // Broken pipe / EOF: Node is gone or asked us to stop. Cancellation
+        // during shutdown also lands here.
+        onEof();
+        return;
+      }
+      if (!consume(bytes, size)) return;
+    }
+#else
+    const int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags >= 0) fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!running_) break;
+      }
       pollfd fd{STDIN_FILENO, POLLIN, 0};
-      // Poll wakes up instantly (<0.05ms) as soon as a byte arrives from pipe;
-      // 5ms timeout allows periodic check of running_ flag.
-      const int ready = poll(&fd, 1, 5);
+      const int ready = poll(&fd, 1, 20);
       if (ready < 0) {
         if (errno == EINTR) continue;
         failed_ = true;
         break;
       }
       if (!ready) continue;
-      if (fd.revents & (POLLERR | POLLNVAL)) {
-        failed_ = true;
-        break;
-      }
-      uint8_t bytes[1024];
+      if (fd.revents & (POLLERR | POLLNVAL)) { failed_ = true; break; }
+      uint8_t bytes[4096];
       const ssize_t size = read(STDIN_FILENO, bytes, sizeof(bytes));
-      if (size == 0) {
-        if (allowInput_) source_.input("{\"t\":\"release_all\"}");
-        break;
-      }
+      if (size == 0) { onEof(); break; }
       if (size < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
         failed_ = true;
         break;
       }
-      buffer_.insert(buffer_.end(), bytes, bytes + size);
-      while (buffer_.size() >= 4) {
-        const uint32_t length = uint32_t(buffer_[0]) | (uint32_t(buffer_[1]) << 8) |
-            (uint32_t(buffer_[2]) << 16) | (uint32_t(buffer_[3]) << 24);
-        if (length < 1 || length > 1025) { failed_ = true; return; }
-        if (buffer_.size() < length + 4) break;
-        const auto type = static_cast<MsgType>(buffer_[4]);
-        const std::string body(buffer_.begin() + 5, buffer_.begin() + 4 + length);
-        buffer_.erase(buffer_.begin(), buffer_.begin() + 4 + length);
-        if (type == MsgType::Shutdown) { shutdownRequested_ = true; return; }
-        if (type == MsgType::Input && allowInput_) {
-          source_.input(body); // Instant dispatch directly to OS input injector!
-        } else if (type == MsgType::Control) {
-          std::string t;
-          if (jsonGetString(body, "t", t)) {
-            if (t == "keyframe") encoder_.requestKeyframe();
-            else if (t == "bitrate") {
-              double kbps = 0;
-              if (jsonGetNumber(body, "kbps", kbps)) encoder_.setBitrate(static_cast<int>(kbps));
-            }
-          }
-        }
-      }
-#else
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-#endif
+      if (!consume(bytes, static_cast<size_t>(size))) break;
     }
+    if (flags >= 0) fcntl(STDIN_FILENO, F_SETFL, flags);
+#endif
+  }
+
+  void onEof() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!running_) return;
+    releaseEverythingLocked();
+    shutdownRequested_ = true;
+  }
+
+  // Returns false when the stream is invalid or shutdown was requested.
+  bool consume(const uint8_t* bytes, size_t size) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!running_) return false;
+    buffer_.insert(buffer_.end(), bytes, bytes + size);
+    size_t offset = 0;
+    while (buffer_.size() - offset >= 5) {
+      const uint8_t* p = buffer_.data() + offset;
+      const uint32_t length = uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+                              (uint32_t(p[3]) << 24);
+      if (length < 1 || length > 4096) { failed_ = true; return false; }
+      if (buffer_.size() - offset < length + 4) break;
+      const auto type = static_cast<MsgType>(p[4]);
+      const std::string body(reinterpret_cast<const char*>(p + 5), length - 1);
+      offset += length + 4;
+      if (type == MsgType::Shutdown) {
+        releaseEverythingLocked();
+        shutdownRequested_ = true;
+        return false;
+      }
+      if (type == MsgType::Input) handleInput(body);
+      else if (type == MsgType::Control) handleControl(body);
+    }
+    buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(offset));
+    return true;
+  }
+
+  void handleInput(const std::string& body) {
+    InputEvent e;
+    if (!parseInputEvent(body, e)) return;
+    if (e.kind == InputKind::ReleaseAll) { releaseEverythingLocked(); return; }
+    if (isPadEvent(e)) {
+      if (!padAllowed_ || !ensurePads()) return;
+      gamepads_->handle(e);
+      const int count = gamepads_->connectedCount();
+      if (count != lastPadCount_) { lastPadCount_ = count; reportStatus(false); }
+      return;
+    }
+    if (kbmAllowed_) source_.input(e);
+  }
+
+  void handleControl(const std::string& body) {
+    std::string t;
+    if (!jsonGetString(body, "t", t)) return;
+    if (t == "keyframe") {
+      encoder_.requestKeyframe();
+    } else if (t == "bitrate") {
+      double kbps = 0;
+      if (jsonGetNumber(body, "kbps", kbps) && kbps >= 100 && kbps <= 200000) {
+        encoder_.setBitrate(static_cast<int>(kbps));
+      }
+    } else if (t == "permissions") {
+      bool kbm = kbmAllowed_, pad = padAllowed_;
+      jsonGetBool(body, "kbm", kbm);
+      jsonGetBool(body, "pad", pad);
+      if (kbmAllowed_ && !kbm) source_.input(releaseAllEvent());
+      if (padAllowed_ && !pad && gamepads_) gamepads_->unplugAll();
+      kbmAllowed_ = kbm;
+      padAllowed_ = pad;
+      if (!pad) lastPadCount_ = 0;
+      reportStatus(false);
+    }
+  }
+
+  bool ensurePads() {
+    if (gamepads_) return true;
+    if (padUnavailable_) return false;
+    std::string why;
+    gamepads_ = createVirtualGamepads(
+        [this](int slot, double low, double high) {
+          // Never write to stdout here: a congested pipe would stall the
+          // driver thread that games wait on. Record; flushRumble() sends.
+          if (slot < 0 || slot >= kMaxPads) return;
+          std::lock_guard<std::mutex> lock(rumbleMu_);
+          rumble_[slot] = {low, high};
+          rumbleDirty_[slot] = true;
+        },
+        why);
+    if (!gamepads_) {
+      padUnavailable_ = true;
+      padError_ = why;
+      writeLog(stdout, "controller forwarding unavailable on this host: " + why);
+      reportStatus(false);
+      return false;
+    }
+    return true;
+  }
+
+  static InputEvent releaseAllEvent() {
+    InputEvent e;
+    e.kind = InputKind::ReleaseAll;
+    return e;
+  }
+
+  void releaseEverything() {
+    std::lock_guard<std::mutex> lock(mu_);
+    releaseEverythingLocked();
+  }
+
+  void releaseEverythingLocked() {
+    source_.input(releaseAllEvent());
+    if (gamepads_) gamepads_->unplugAll();
+    lastPadCount_ = 0;
+  }
+
+  // Tells Node what actually works, so the UI never claims more than the host
+  // can deliver (e.g. ViGEmBus missing, Wayland input permission refused).
+  void reportStatus(bool initial) {
+    std::string padBackend, padWhy;
+    bool padOk = false;
+    if (initial) {
+      padOk = probeVirtualGamepads(padBackend, padWhy);
+      if (!padOk) { padUnavailable_ = true; padError_ = padWhy; }
+      padBackendName_ = padBackend;
+    } else {
+      padOk = !padUnavailable_;
+    }
+    const std::string status =
+        std::string("{\"t\":\"input-status\",\"kbm\":") + (kbmAllowed_ ? "true" : "false") +
+        ",\"kbmReady\":" + (source_.inputReady() ? "true" : "false") +
+        ",\"pad\":" + (padAllowed_ ? "true" : "false") +
+        ",\"padReady\":" + (padOk ? "true" : "false") +
+        ",\"padBackend\":\"" + jsonEscape(padBackendName_) + "\"" +
+        ",\"padError\":\"" + jsonEscape(padError_) + "\"" +
+        ",\"pads\":" + std::to_string(lastPadCount_) + "}";
+    writeJson(stdout, MsgType::Control, status);
   }
 
   CaptureSource& source_;
   Encoder& encoder_;
-  bool allowInput_ = false;
-  std::atomic<bool> running_{true};
-  std::atomic<bool> shutdownRequested_{false};
-  std::atomic<bool> failed_{false};
-  std::thread thread_;
-  int flags_ = -1;
-  bool active_ = false;
+  std::mutex mu_;
+  bool running_ = true;
+  bool kbmAllowed_ = false;
+  bool padAllowed_ = false;
+  bool padUnavailable_ = false;
+  std::string padError_, padBackendName_;
+  int lastPadCount_ = 0;
+  std::unique_ptr<VirtualGamepads> gamepads_;
+  std::mutex rumbleMu_;
+  std::pair<double, double> rumble_[kMaxPads] = {};
+  bool rumbleDirty_[kMaxPads] = {};
   std::vector<uint8_t> buffer_;
+  std::atomic<bool> failed_{false};
+  std::atomic<bool> shutdownRequested_{false};
+#ifdef _WIN32
+  std::atomic<DWORD> readerThreadId_{0};
+  std::atomic<bool> readerDone_{false};
+#endif
+  std::thread thread_;
 };
+
+bool hasFlag(int argc, char** argv, const char* flag) {
+  for (int i = 2; i < argc; ++i) if (std::string(argv[i]) == flag) return true;
+  return false;
+}
 
 int runCapture(int argc, char** argv) {
 #ifdef _WIN32
@@ -391,8 +594,11 @@ int runCapture(int argc, char** argv) {
 #ifndef _WIN32
   std::signal(SIGPIPE, SIG_IGN);
 #endif
-  bool allowInput = false;
-  for (int i = 2; i < argc; ++i) if (std::string(argv[i]) == "--allow-input") allowInput = true;
+  const bool allowKbm = hasFlag(argc, argv, "--allow-input");
+  const bool allowPad = hasFlag(argc, argv, "--allow-gamepad");
+  // Wayland asks for remote-control permission once, when sharing starts.
+  // Hosts that may enable keyboard/mouse later must request it up front.
+  const bool kbmCapable = allowKbm || hasFlag(argc, argv, "--input-capable");
   const std::string backend = getArg(argc, argv, "--source", "");
   const int fps = intArg(argc, argv, "--fps", 60);
   const int bitrate = intArg(argc, argv, "--bitrate", 15000);
@@ -403,7 +609,7 @@ int runCapture(int argc, char** argv) {
   auto source = makeCaptureSource(backend, chosen);
   if (!source) {
     const std::string message = "no real capture backend available for '" + backend +
-        "'; run from an interactive desktop with portal/PipeWire support (Wayland) or X11 support; "
+        "'; run from an interactive desktop (Windows, Wayland portal/PipeWire or X11); "
         "use --source synthetic explicitly only for tests";
     writeLog(stdout, message);
     fprintf(stderr, "%s\n", message.c_str());
@@ -415,14 +621,23 @@ int runCapture(int argc, char** argv) {
   copts.width = intArg(argc, argv, "--width", 0);
   copts.height = intArg(argc, argv, "--height", 0);
   copts.display = getArg(argc, argv, "--display", "");
-  copts.allowInput = allowInput;
-  if (allowInput && chosen != "portal") {
-    writeLog(stdout, "--allow-input requires the Wayland RemoteDesktop portal backend");
-    return 1;
+  copts.allowInput = kbmCapable && (chosen == "portal" || chosen == "dxgi" || chosen == "gdi");
+  if (kbmCapable && !copts.allowInput) {
+    writeLog(stdout, "keyboard/mouse control is not available with the '" + chosen +
+                     "' capture backend (supported: Windows, Wayland portal)");
   }
 
   std::string err;
-  if (!source->start(copts, err)) {
+  bool sourceStarted = source->start(copts, err);
+#ifdef PS_HAVE_DXGI
+  if (!sourceStarted && chosen == "dxgi" && backend.empty()) {
+    writeLog(stdout, "DXGI desktop duplication unavailable (" + err + "); falling back to GDI capture");
+    source = makeGdiSource();
+    chosen = "gdi";
+    sourceStarted = source->start(copts, err);
+  }
+#endif
+  if (!sourceStarted) {
     writeJson(stdout, MsgType::Log, "capture start failed: " + err);
     fprintf(stderr, "capture start failed: %s\n", err.c_str());
     return 1;
@@ -461,7 +676,7 @@ int runCapture(int argc, char** argv) {
   const uint64_t started = nowMicros();
   uint64_t lastStats = started;
 
-  CaptureControls controls(*source, enc, allowInput);
+  auto controls = std::make_unique<CaptureControls>(*source, enc, allowKbm && copts.allowInput, allowPad);
   bool failed = false, writeFailed = false;
   const auto sink = [&](const EncodedPacket& p) {
     bytes += p.size;
@@ -469,11 +684,11 @@ int runCapture(int argc, char** argv) {
         p.keyframe ? kFlagKeyframe : 0, p.data, p.size)) writeFailed = true;
   };
   while (g_running && !g_stopRequested) {
-    if (controls.failed()) {
+    if (controls->failed()) {
       writeLog(stdout, "invalid or failed capture stdin framing");
       failed = true; break;
     }
-    if (controls.shutdownRequested()) break;
+    if (controls->shutdownRequested()) break;
     CaptureFrame cf;
     if (!source->nextFrame(cf, err)) {
       writeJson(stdout, MsgType::Log, "capture ended: " + err);
@@ -489,6 +704,7 @@ int runCapture(int argc, char** argv) {
       failed = true; break;
     }
     if (writeFailed) break;  // peer closed the pipe
+    controls->flushRumble();
 
     ++frames;
     const uint64_t now = nowMicros();
@@ -506,7 +722,10 @@ int runCapture(int argc, char** argv) {
     if (maxFrames > 0 && frames >= static_cast<uint64_t>(maxFrames)) break;
   }
 
-  source->stop(); // Release input before potentially blocking output flush.
+  // Stop the input thread first: it releases held keys/buttons and unplugs
+  // virtual controllers, and must not race with the source shutting down.
+  controls.reset();
+  source->stop();
   enc.flush(sink);
   return (failed || writeFailed) ? 1 : 0;
 }
@@ -526,12 +745,15 @@ int main(int argc, char** argv) {
             "usage: ps-media <probe|selftest|capture|view> [options]\n"
             "  probe                       list available encoders/backends as JSON\n"
             "  selftest [--frames N]       synthetic encode/decode verification\n"
-            "  capture  [--source x11|portal|synthetic] [--fps N] [--bitrate Kbps] [--allow-input]\n"
+            "  capture  [--source dxgi|portal|x11|synthetic] [--display N] [--fps N] [--bitrate Kbps]\n"
+            "           [--encoder auto|nvenc|amf|qsv|vaapi|mf|x264] [--allow-input] [--allow-gamepad]\n"
+            "           [--input-capable]\n"
             "  view                        decode stdin, render in a window\n");
     return 2;
   }
 
   const std::string mode = argv[1];
+  if (mode == "--version" || mode == "version") { printf("%s\n", PS_VERSION); return 0; }
   if (mode == "probe") return ps::runProbe();
   if (mode == "selftest") return ps::runSelftest(argc, argv);
   if (mode == "capture") return ps::runCapture(argc, argv);

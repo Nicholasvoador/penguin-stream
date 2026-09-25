@@ -11,7 +11,16 @@ import { EventEmitter } from 'node:events';
 
 const hosts = [];
 class FakeHost extends EventEmitter {
-  constructor() { super(); hosts.push(this); }
+  constructor(opts) {
+    super();
+    this.opts = opts;
+    this.permissions = { kbm: opts.allowInput === true, pad: opts.allowGamepad === true };
+    hosts.push(this);
+  }
+  setPermissions(p) {
+    this.permissions = { kbm: p.kbm ?? this.permissions.kbm, pad: p.pad ?? this.permissions.pad };
+    this.emit('permissions', this.permissions);
+  }
   async start(approve) {
     this.approve = approve;
     return new Promise((resolve, reject) => { this.resolveStart = resolve; this.rejectStart = reject; });
@@ -179,8 +188,8 @@ test('methods, token transport, and capability reporting are explicit', async ()
   assert.equal(res.headers.get('cache-control'), 'no-store');
   assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
   const state = await res.json();
-  assert.match(state.capabilities.remoteInput, /unverified/);
-  assert.match(state.capabilities.windows, /uncompiled/);
+  assert.equal(state.permissions, null, 'no permissions exist before sharing');
+  assert.equal(typeof state.platform, 'string');
   assert.ok(new URL(ui.url).hash.startsWith('#token='));
   assert.equal(new URL(ui.url).search, '');
 });
@@ -218,4 +227,27 @@ test('stopping pending consent cancels it; old callbacks cannot mutate a new ses
   assert.equal(await timed, false);
   assert.equal((await (await call('/api/state')).json()).mode, 'hosting-waiting');
   await call('/api/stop', { body: {} });
+});
+
+test('live input permissions: only while sharing, strictly typed, applied to the host', async () => {
+  assert.equal((await call('/api/permissions', { body: { kbm: true } })).status, 409, 'not sharing yet');
+  assert.equal((await call('/api/viewer-input', { body: { kbm: true } })).status, 409, 'not viewing');
+
+  const before = hosts.length;
+  const started = await call('/api/host', { body: { allowInput: true, allowGamepad: false, source: 'synthetic',
+    encoder: 'nvenc; rm -rf /', display: '../1' } });
+  assert.equal(started.status, 200);
+  const host = hosts[before];
+  assert.deepEqual(host.permissions, { kbm: true, pad: false });
+  assert.equal(host.opts.inputCapable, true, 'UI hosts ask for control permission up front');
+  assert.equal(host.opts.encoder, undefined, 'unknown encoder strings are dropped, not passed through');
+  assert.equal(host.opts.display, undefined, 'display must be a small index');
+
+  assert.equal((await call('/api/permissions', { body: { kbm: 'yes' } })).status, 400);
+  assert.equal((await call('/api/permissions', { body: { kbm: false, pad: true } })).status, 200);
+  assert.deepEqual(host.permissions, { kbm: false, pad: true });
+  const state = await (await call('/api/state')).json();
+  assert.deepEqual(state.permissions, { kbm: false, pad: true });
+
+  assert.equal((await call('/api/stop', { body: {} })).status, 200);
 });

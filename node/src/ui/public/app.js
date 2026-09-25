@@ -22,15 +22,15 @@ function showView(name) {
 }
 
 function advancedOptions() {
+  const display = $('opt-display').value.trim();
   return {
     fps: Number($('opt-fps').value),
     bitrate: Number($('opt-bitrate').value),
     encoder: $('opt-encoder').value || undefined,
     source: $('opt-source').value || undefined,
+    display: /^[0-9]{1,2}$/.test(display) ? display : undefined,
     lowLatency: $('opt-low-latency').checked,
-    allowInput: $('opt-allow-input').checked,
     audio: $('opt-audio').checked,
-    noInput: $('opt-no-input').checked,
     forceRelay: $('opt-force-relay').checked,
     noStun: $('opt-no-stun').checked,
     stun: $('opt-stun').value.trim() || undefined,
@@ -97,8 +97,75 @@ function updateMetricsGrid(prefix, state) {
   }
 }
 
+const VIGEM_URL = 'https://github.com/nefarius/ViGEmBus/releases/latest';
+
+function statusLine(el, parts) {
+  el.textContent = '';
+  for (const part of parts) {
+    if (!part) continue;
+    const line = document.createElement('div');
+    if (part.warn) line.className = 'warn';
+    line.textContent = part.text;
+    if (part.link) {
+      const a = document.createElement('a');
+      a.href = part.link;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.textContent = part.linkText || part.link;
+      line.append(' ', a);
+    }
+    el.appendChild(line);
+  }
+}
+
+function renderInput(state) {
+  // Host: live permissions and what the machine can actually do.
+  const perm = state.permissions || { kbm: false, pad: false };
+  $('live-allow-kbm').checked = perm.kbm;
+  $('live-allow-pad').checked = perm.pad;
+  const st = state.inputStatus;
+  const hostParts = [];
+  if (st) {
+    if (perm.kbm && !st.kbmReady) {
+      hostParts.push({ warn: true, text: 'Keyboard & mouse cannot be controlled on this machine right now ' +
+        '(on Wayland, allow "remote control" in the screen-sharing prompt; restart sharing to be asked again).' });
+    }
+    if (perm.pad && !st.padReady) {
+      const vigem = /vigem/i.test(st.padError || '');
+      hostParts.push({ warn: true, text: `Controllers unavailable: ${st.padError || 'unknown reason'}`,
+        link: vigem ? VIGEM_URL : undefined, linkText: vigem ? 'Install ViGEmBus' : undefined });
+    } else if (perm.pad && st.pads) {
+      hostParts.push({ text: `${st.pads} virtual controller${st.pads === 1 ? '' : 's'} connected (${st.padBackend})` });
+    }
+  }
+  if (state.remoteViewer) {
+    hostParts.push({ text: `Viewer is sending: keyboard & mouse ${state.remoteViewer.kbm ? 'on' : 'off'}, ` +
+      `controllers ${state.remoteViewer.pad ? `on (${state.remoteViewer.pads})` : 'off'}` });
+  }
+  statusLine($('host-input-status'), hostParts);
+
+  // Viewer: local switches and what the host allows.
+  const vs = state.viewerState;
+  $('live-send-kbm').checked = vs ? vs.kbm : $('view-send-kbm').checked;
+  $('live-send-pad').checked = vs ? vs.pad : $('view-send-pad').checked;
+  $('live-capture').checked = vs ? vs.capture : false;
+  $('live-capture').disabled = !(vs ? vs.kbm : true);
+  $('viewer-pad-count').textContent = vs && vs.pads ? `(${vs.pads} connected)` : '';
+  const hp = state.hostPermissions;
+  const viewerParts = [];
+  if (hp) {
+    const kbm = hp.kbm ? (hp.kbmReady ? 'allowed' : 'allowed, but unavailable on the host') : 'not allowed by the host';
+    const pad = hp.pad ? (hp.padReady ? 'allowed' : `allowed, but unavailable on the host (${hp.padError || 'unknown'})`)
+      : 'not allowed by the host';
+    viewerParts.push({ text: `Keyboard & mouse: ${kbm}` });
+    viewerParts.push({ text: `Controllers: ${pad}`, warn: hp.pad && !hp.padReady });
+  }
+  statusLine($('viewer-input-status'), viewerParts);
+}
+
 function render(state) {
   $('device').textContent = `${state.identity.label} · ${state.identity.fingerprint}`;
+  renderInput(state);
 
   const peers = $('peer-list');
   peers.textContent = '';
@@ -123,11 +190,13 @@ function render(state) {
   switch (state.mode) {
     case 'idle':
       showView('idle');
+      $('host-options').hidden = false;
       break;
     case 'hosting-waiting':
     case 'hosting-consent':
     case 'hosting-live': {
       showView('hosting');
+      $('host-options').hidden = true;
       $('code-display').textContent = state.code || '…';
       const s = $('host-status');
       if (state.mode === 'hosting-live') {
@@ -145,6 +214,7 @@ function render(state) {
     case 'connecting':
     case 'viewing': {
       showView('viewing');
+      $('host-options').hidden = true;
       $('viewing-title').textContent = state.mode === 'viewing' ? 'Connected' : 'Connecting…';
       if (state.sas) {
         $('viewer-sas').hidden = false;
@@ -191,12 +261,42 @@ async function refresh() {
 /* --------------------------- wiring --------------------------- */
 
 $('btn-host').onclick = async () => {
-  try { await api('host', advancedOptions()); } catch (e) { alert(e.message); }
+  try {
+    await api('host', {
+      ...advancedOptions(),
+      allowInput: $('host-allow-kbm').checked,
+      allowGamepad: $('host-allow-pad').checked,
+    });
+  } catch (e) { alert(e.message); }
 };
 
-$('btn-connect-mode').onclick = () => { showView('connect'); $('code-input').focus(); };
+$('btn-connect-mode').onclick = () => {
+  showView('connect');
+  $('host-options').hidden = true;
+  $('code-input').focus();
+};
 
-for (const b of document.querySelectorAll('[data-back]')) b.onclick = () => showView('idle');
+const livePermissions = async () => {
+  try {
+    await api('permissions', { kbm: $('live-allow-kbm').checked, pad: $('live-allow-pad').checked });
+  } catch (e) { alert(e.message); refresh(); }
+};
+$('live-allow-kbm').onchange = livePermissions;
+$('live-allow-pad').onchange = livePermissions;
+
+const liveViewerInput = async (changed) => {
+  try {
+    await api('viewer-input', { [changed]: $(changed === 'kbm' ? 'live-send-kbm'
+      : changed === 'pad' ? 'live-send-pad' : 'live-capture').checked });
+  } catch (e) { alert(e.message); refresh(); }
+};
+$('live-send-kbm').onchange = () => liveViewerInput('kbm');
+$('live-send-pad').onchange = () => liveViewerInput('pad');
+$('live-capture').onchange = () => liveViewerInput('capture');
+
+for (const b of document.querySelectorAll('[data-back]')) {
+  b.onclick = () => { showView('idle'); $('host-options').hidden = false; };
+}
 for (const b of document.querySelectorAll('[data-stop]')) {
   b.onclick = async () => { await api('stop', {}); refresh(); };
 }
@@ -218,7 +318,12 @@ $('connect-form').onsubmit = async (e) => {
   const code = $('code-input').value.trim();
   if (!code) return;
   try {
-    await api('connect', { code, ...advancedOptions() });
+    await api('connect', {
+      code,
+      ...advancedOptions(),
+      sendKbm: $('view-send-kbm').checked,
+      sendPad: $('view-send-pad').checked,
+    });
   } catch (err) {
     alert(err.message);
   }

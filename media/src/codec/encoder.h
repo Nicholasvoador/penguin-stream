@@ -6,6 +6,7 @@
 // report which one actually got used so the UI can tell the truth about it.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -54,9 +55,10 @@ class Encoder {
                   std::string& error);
 
   // Asks for a keyframe on the next encodeBGRA call. Used when a viewer joins
-  // or reports corruption.
+  // or reports corruption. Both requests are thread-safe: they are recorded
+  // here and applied by the encoding thread on the next frame.
   void requestKeyframe() { forceKeyframe_ = true; }
-  void setBitrate(int bitrateKbps);
+  void setBitrate(int bitrateKbps) { pendingBitrateKbps_ = bitrateKbps; }
 
   // Flushes buffered frames at end of stream.
   void flush(const std::function<void(const EncodedPacket&)>& sink);
@@ -81,7 +83,13 @@ class Encoder {
   AVBufferRef* hwDeviceCtx_ = nullptr;
   SwsContext* sws_ = nullptr;
   std::vector<uint8_t> extradata_;
-  bool forceKeyframe_ = true;    // always start on a keyframe
+  void applyBitrate(int bitrateKbps);
+  static bool hasParameterSets(const uint8_t* data, size_t size);
+  bool annexBExtradata() const;
+  std::vector<uint8_t> keyframeBuffer_;
+
+  std::atomic<bool> forceKeyframe_{true};    // always start on a keyframe
+  std::atomic<int> pendingBitrateKbps_{0};
   int64_t frameIndex_ = 0;
 };
 

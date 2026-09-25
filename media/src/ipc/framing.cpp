@@ -1,6 +1,7 @@
 #include "ipc/framing.h"
 
 #include <cstring>
+#include <mutex>
 
 namespace ps {
 namespace {
@@ -27,6 +28,13 @@ uint64_t getU64(const uint8_t* p) {
   return v;
 }
 
+// Messages may be produced by several threads (video, input feedback, rumble);
+// each framed message must reach the pipe contiguously.
+std::mutex& outputMutex() {
+  static std::mutex mu;
+  return mu;
+}
+
 }  // namespace
 
 bool writeMessage(FILE* out, MsgType type, const uint8_t* data, size_t len) {
@@ -37,6 +45,7 @@ bool writeMessage(FILE* out, MsgType type, const uint8_t* data, size_t len) {
   putU32(header, static_cast<uint32_t>(payload));
   header[4] = static_cast<uint8_t>(type);
 
+  std::lock_guard<std::mutex> lock(outputMutex());
   if (fwrite(header, 1, sizeof(header), out) != sizeof(header)) return false;
   if (len > 0 && fwrite(data, 1, len, out) != len) return false;
   return fflush(out) == 0;
@@ -61,6 +70,7 @@ bool writeVideoPacket(FILE* out, uint64_t pts_us, uint32_t flags,
   putU64(header + 5, pts_us);
   putU32(header + 13, flags);
 
+  std::lock_guard<std::mutex> lock(outputMutex());
   if (fwrite(header, 1, sizeof(header), out) != sizeof(header)) return false;
   if (len > 0 && fwrite(data, 1, len, out) != len) return false;
   return fflush(out) == 0;
@@ -165,6 +175,19 @@ bool jsonGetNumber(const std::string& json, const std::string& key, double& out)
     return false;
   }
   return true;
+}
+
+bool jsonGetBool(const std::string& json, const std::string& key, bool& out) {
+  const std::string needle = "\"" + key + "\"";
+  size_t p = json.find(needle);
+  if (p == std::string::npos) return false;
+  p = json.find(':', p + needle.size());
+  if (p == std::string::npos) return false;
+  p = json.find_first_not_of(" \t", p + 1);
+  if (p == std::string::npos) return false;
+  if (json.compare(p, 4, "true") == 0) { out = true; return true; }
+  if (json.compare(p, 5, "false") == 0) { out = false; return true; }
+  return false;
 }
 
 }  // namespace ps

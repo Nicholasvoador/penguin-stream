@@ -4,6 +4,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/log.h>
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
@@ -25,20 +26,39 @@ std::vector<std::string> candidateEncoders(const std::string& preferred) {
   if (preferred == "nvenc") return {"h264_nvenc"};
   if (preferred == "qsv") return {"h264_qsv"};
   if (preferred == "amf") return {"h264_amf"};
+  if (preferred == "mf") return {"h264_mf"};
   if (preferred == "x264" || preferred == "software") return {"libx264", "libopenh264"};
 #ifdef _WIN32
-  return {"h264_nvenc", "h264_amf", "h264_qsv", "libx264", "libopenh264"};
+  // Media Foundation last: it exists on every Windows 10+ machine and uses the
+  // GPU's encoder when the vendor-specific paths are unavailable.
+  return {"h264_nvenc", "h264_amf", "h264_qsv", "libx264", "h264_mf", "libopenh264"};
 #else
-  return {"h264_vaapi", "h264_nvenc", "libx264", "libopenh264"};
+  // NVENC first: on hybrid laptops VAAPI usually lands on the iGPU, while the
+  // desktop (and the fastest encoder) lives on the NVIDIA card.
+  return {"h264_nvenc", "h264_vaapi", "libx264", "libopenh264"};
 #endif
 }
 
 bool isHardware(const std::string& name) {
   return name.find("vaapi") != std::string::npos || name.find("nvenc") != std::string::npos ||
-         name.find("qsv") != std::string::npos || name.find("amf") != std::string::npos;
+         name.find("qsv") != std::string::npos || name.find("amf") != std::string::npos ||
+         name == "h264_mf";
 }
 
 }  // namespace
+
+// True when an Annex B H.264 access unit already contains an SPS (NAL type 7).
+bool Encoder::hasParameterSets(const uint8_t* data, size_t size) {
+  for (size_t i = 0; i + 3 < size; ++i) {
+    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && (data[i + 3] & 0x1f) == 7) return true;
+  }
+  return false;
+}
+
+bool Encoder::annexBExtradata() const {
+  return extradata_.size() > 4 && extradata_[0] == 0 && extradata_[1] == 0 &&
+         (extradata_[2] == 1 || (extradata_[2] == 0 && extradata_[3] == 1));
+}
 
 Encoder::Encoder() = default;
 
@@ -59,17 +79,23 @@ bool Encoder::open(const EncoderConfig& cfg, std::string& error) {
   cfg_.width &= ~1;
   cfg_.height &= ~1;
 
-  std::string lastError;
+  // Probing hardware encoders that are absent is expected; keep FFmpeg quiet
+  // while trying them and report only the final outcome.
+  const int savedLevel = av_log_get_level();
+  av_log_set_level(AV_LOG_QUIET);
+  std::string failures;
   for (const auto& name : candidateEncoders(cfg.preferred)) {
     std::string err;
     if (tryOpen(name, cfg_, err)) {
       backend_ = name;
+      av_log_set_level(savedLevel);
       return true;
     }
-    lastError = name + ": " + err;
+    failures += (failures.empty() ? "" : "; ") + name + ": " + err;
     close();
   }
-  error = "no usable H.264 encoder (" + lastError + ")";
+  av_log_set_level(savedLevel);
+  error = "no usable H.264 encoder (" + failures + ")";
   return false;
 }
 
@@ -127,9 +153,23 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     av_opt_set(ctx_->priv_data, "delay", "0", 0);
     av_opt_set(ctx_->priv_data, "zerolatency", "1", 0);
     av_opt_set(ctx_->priv_data, "forced-idr", "1", 0);
-  } else if (encoderName == "h264_qsv" || encoderName == "h264_amf") {
+  } else if (encoderName == "h264_amf") {
     ctx_->pix_fmt = AV_PIX_FMT_NV12;
     av_opt_set(ctx_->priv_data, "usage", "ultralowlatency", 0);
+    av_opt_set(ctx_->priv_data, "quality", "speed", 0);
+    av_opt_set(ctx_->priv_data, "rc", "cbr", 0);
+    av_opt_set(ctx_->priv_data, "header_insertion_mode", "idr", 0);
+  } else if (encoderName == "h264_qsv") {
+    ctx_->pix_fmt = AV_PIX_FMT_NV12;
+    av_opt_set(ctx_->priv_data, "preset", "veryfast", 0);
+    av_opt_set_int(ctx_->priv_data, "async_depth", 1, 0);
+    av_opt_set_int(ctx_->priv_data, "look_ahead", 0, 0);
+    av_opt_set_int(ctx_->priv_data, "low_delay_brc", 1, 0);
+  } else if (encoderName == "h264_mf") {
+    ctx_->pix_fmt = AV_PIX_FMT_NV12;
+    av_opt_set(ctx_->priv_data, "scenario", "display_remoting", 0);
+    av_opt_set(ctx_->priv_data, "rate_control", "ld_vbr", 0);
+    av_opt_set_int(ctx_->priv_data, "hw_encoding", 0, 0);  // let MF pick; forcing hw fails on some drivers
   } else {
     ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
     av_opt_set(ctx_->priv_data, "preset", "ultrafast", 0);
@@ -183,6 +223,15 @@ bool Encoder::drain(const std::function<void(const EncodedPacket&)>& sink, std::
     out.keyframe = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
     out.data = pkt_->data;
     out.size = static_cast<size_t>(pkt_->size);
+    // Every keyframe must be decodable on its own (loss recovery, late
+    // joiners, recordings). Some encoders (NVENC, x264 with global headers)
+    // only emit SPS/PPS out of band, so prepend them when missing.
+    if (out.keyframe && annexBExtradata() && !hasParameterSets(out.data, out.size)) {
+      keyframeBuffer_.assign(extradata_.begin(), extradata_.end());
+      keyframeBuffer_.insert(keyframeBuffer_.end(), out.data, out.data + out.size);
+      out.data = keyframeBuffer_.data();
+      out.size = keyframeBuffer_.size();
+    }
     sink(out);
     av_packet_unref(pkt_);
   }
@@ -192,6 +241,7 @@ bool Encoder::encodeBGRA(const uint8_t* bgra, int stride, uint64_t pts_us,
                          const std::function<void(const EncodedPacket&)>& sink,
                          std::string& error) {
   if (!ctx_) { error = "encoder not open"; return false; }
+  if (const int kbps = pendingBitrateKbps_.exchange(0)) applyBitrate(kbps);
 
   int ret = av_frame_make_writable(swFrame_);
   if (ret < 0) { error = "av_frame_make_writable: " + avErr(ret); return false; }
@@ -209,12 +259,12 @@ bool Encoder::encodeBGRA(const uint8_t* bgra, int stride, uint64_t pts_us,
   }
   toEncode->pts = static_cast<int64_t>(pts_us);
 
-  if (forceKeyframe_) {
+  if (forceKeyframe_.exchange(false)) {
     toEncode->pict_type = AV_PICTURE_TYPE_I;
     toEncode->flags |= AV_FRAME_FLAG_KEY;
-    forceKeyframe_ = false;
   } else {
     toEncode->pict_type = AV_PICTURE_TYPE_NONE;
+    toEncode->flags &= ~AV_FRAME_FLAG_KEY;
   }
 
   ret = avcodec_send_frame(ctx_, toEncode);
@@ -231,7 +281,7 @@ void Encoder::flush(const std::function<void(const EncodedPacket&)>& sink) {
   drain(sink, ignored);
 }
 
-void Encoder::setBitrate(int bitrateKbps) {
+void Encoder::applyBitrate(int bitrateKbps) {
   if (!ctx_ || bitrateKbps < 100 || bitrateKbps > 200000) return;
   cfg_.bitrateKbps = bitrateKbps;
   ctx_->bit_rate = static_cast<int64_t>(bitrateKbps) * 1000;

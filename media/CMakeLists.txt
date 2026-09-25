@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ps_media LANGUAGES CXX)
+project(ps_media VERSION 0.10.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,22 +17,43 @@ set(PS_SOURCES
   src/codec/encoder.cpp
   src/codec/decoder.cpp
   src/capture/synthetic.cpp
+  src/input/event.cpp
+  src/input/keymap.cpp
 )
 
 set(PS_LIBS Threads::Threads)
-set(PS_DEFINES "")
+set(PS_DEFINES "PS_VERSION=\"${PROJECT_VERSION}\"")
+
+# Optional prebuilt FFmpeg tree (include/ + lib/), e.g. BtbN's win64 "shared"
+# builds for MinGW cross-compiles. Takes precedence over other discovery.
+set(PS_FFMPEG_ROOT "" CACHE PATH "Prebuilt FFmpeg root containing include/ and lib/")
 set(PS_INCLUDE_DIRS "")
 set(PS_LIBRARY_DIRS "")
 
 if(WIN32)
-  # vcpkg's FFmpeg wrapper supplies FindFFMPEG and these usage variables.
-  # Missing FFmpeg is a configure error, not a later missing-header failure.
-  find_package(FFMPEG REQUIRED)
-  list(APPEND PS_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIRS})
-  list(APPEND PS_LIBRARY_DIRS ${FFMPEG_LIBRARY_DIRS})
-  list(APPEND PS_LIBS ${FFMPEG_LIBRARIES} d3d11 dxgi)
-  list(APPEND PS_SOURCES src/capture/windows_dxgi.cpp)
-  list(APPEND PS_DEFINES PS_HAVE_DXGI=1 NOMINMAX WIN32_LEAN_AND_MEAN)
+  if(PS_FFMPEG_ROOT)
+    set(PS_FFMPEG_LIBS "")
+    foreach(lib avcodec avutil swscale)
+      find_library(PS_${lib}_LIB NAMES ${lib} lib${lib} PATHS "${PS_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH REQUIRED)
+      list(APPEND PS_FFMPEG_LIBS ${PS_${lib}_LIB})
+    endforeach()
+    list(APPEND PS_INCLUDE_DIRS "${PS_FFMPEG_ROOT}/include")
+    list(APPEND PS_LIBS ${PS_FFMPEG_LIBS})
+  else()
+    # vcpkg's FFmpeg wrapper supplies FindFFMPEG and these usage variables.
+    # Missing FFmpeg is a configure error, not a later missing-header failure.
+    find_package(FFMPEG REQUIRED)
+    list(APPEND PS_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIRS})
+    list(APPEND PS_LIBRARY_DIRS ${FFMPEG_LIBRARY_DIRS})
+    list(APPEND PS_LIBS ${FFMPEG_LIBRARIES})
+  endif()
+  list(APPEND PS_LIBS d3d11 dxgi setupapi)
+  list(APPEND PS_SOURCES
+    src/capture/windows_dxgi.cpp
+    src/input/gamepad_vigem.cpp
+    third_party/vigem/src/ViGEmClient.cpp)
+  list(APPEND PS_INCLUDE_DIRS third_party/vigem/include third_party/vigem/src)
+  list(APPEND PS_DEFINES PS_HAVE_DXGI=1 NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 
   # Windows must not depend on pkg-config for SDL discovery.
   find_package(SDL2 CONFIG QUIET)
@@ -42,11 +63,17 @@ if(WIN32)
     set(PS_SDL_TARGET SDL2::SDL2-static)
   endif()
   if(PS_SDL_TARGET)
-    # The existing renderer spells the include <SDL2/SDL.h>, whereas some
-    # SDL targets expose only the include/SDL2 directory.
-    find_path(PS_SDL_INCLUDE_ROOT NAMES SDL2/SDL.h
-      HINTS ${SDL2_INCLUDE_DIRS} PATH_SUFFIXES .. REQUIRED)
-    list(APPEND PS_INCLUDE_DIRS ${PS_SDL_INCLUDE_ROOT})
+    # The renderer includes <SDL2/SDL.h>, whereas SDL targets usually expose
+    # the include/SDL2 directory itself: add its parent as well.
+    get_target_property(_ps_sdl_incs ${PS_SDL_TARGET} INTERFACE_INCLUDE_DIRECTORIES)
+    foreach(_dir IN LISTS _ps_sdl_incs SDL2_INCLUDE_DIRS)
+      if(EXISTS "${_dir}/SDL2/SDL.h")
+        list(APPEND PS_INCLUDE_DIRS "${_dir}")
+      elseif(EXISTS "${_dir}/SDL.h")
+        get_filename_component(_parent "${_dir}" DIRECTORY)
+        list(APPEND PS_INCLUDE_DIRS "${_parent}")
+      endif()
+    endforeach()
     list(APPEND PS_DEFINES SDL_MAIN_HANDLED)
   endif()
 else()
@@ -74,6 +101,10 @@ else()
   if(SDL2_FOUND)
     set(PS_SDL_TARGET PkgConfig::SDL2)
   endif()
+
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND PS_SOURCES src/input/gamepad_uinput.cpp)
+  endif()
 endif()
 
 if(PS_SDL_TARGET)
@@ -86,9 +117,18 @@ endif()
 
 add_executable(ps-media ${PS_SOURCES})
 if(MSVC)
-  target_compile_options(ps-media PRIVATE /W4 /permissive- /EHsc)
+  target_compile_options(ps-media PRIVATE /W4 /permissive- /EHsc /utf-8)
 else()
   target_compile_options(ps-media PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+if(MINGW)
+  # Self-contained runtime: no libstdc++/libgcc/winpthread DLLs to ship.
+  target_link_options(ps-media PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive,-Bdynamic)
+endif()
+if(WIN32)
+  # The vendored ViGEm client is third-party code; keep our warnings meaningful.
+  set_source_files_properties(third_party/vigem/src/ViGEmClient.cpp PROPERTIES COMPILE_OPTIONS
+    "$<IF:$<CXX_COMPILER_ID:MSVC>,/W0,-w>")
 endif()
 target_include_directories(ps-media PRIVATE src ${PS_INCLUDE_DIRS})
 target_link_directories(ps-media PRIVATE ${PS_LIBRARY_DIRS})

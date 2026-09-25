@@ -21,7 +21,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const idDir = fs.mkdtempSync(`${os.tmpdir()}/ps-${role}-`);
 const identity = loadOrCreateIdentity(idDir);
 const common = {
-  code, rendezvousUrl, identity: identity.keypair,
+  code, rendezvousUrl, nostr: false, identity: identity.keypair,   // isolated networks: no Internet
   iceServers: [{ hostname: turnHost, port: 3478, username: user, password, relayType: 'TurnUdp' }],
   iceTransportPolicy: 'all', sessionTimeoutMs: 60000,
 };

@@ -19,7 +19,7 @@ namespace ps {
 enum class MsgType : uint8_t {
   VideoPacket = 0x01,  // engine -> node
   Config      = 0x02,  // engine -> node (JSON: codec, width, height, extradata)
-  Control     = 0x03,  // node -> engine (JSON: keyframe request, bitrate)
+  Control     = 0x03,  // both directions (JSON: keyframe, bitrate, permissions, rumble, viewer state)
   Input       = 0x04,  // both directions (JSON input event)
   Log         = 0x05,  // engine -> node (UTF-8 text)
   Stats       = 0x06,  // engine -> node (JSON)
@@ -63,5 +63,6 @@ std::string jsonEscape(const std::string& in);
 // we exchange. Not a general parser - returns false if the key is absent.
 bool jsonGetString(const std::string& json, const std::string& key, std::string& out);
 bool jsonGetNumber(const std::string& json, const std::string& key, double& out);
+bool jsonGetBool(const std::string& json, const std::string& key, bool& out);
 
 }  // namespace ps

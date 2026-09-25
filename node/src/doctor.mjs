@@ -9,11 +9,12 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import os from 'node:os';
-import process from 'node:process';
 
-import { findMediaBinary } from './media/engine.mjs';
+import { findMediaBinary, MEDIA_MISSING } from './media/engine.mjs';
 import { loadOrCreateIdentity, configDir } from './crypto/identity.mjs';
-import { DEFAULT_RENDEZVOUS } from './app/session.mjs';
+import { DEFAULT_RENDEZVOUS, APP_VERSION } from './app/session.mjs';
+import { relayList } from './signal/nostr.mjs';
+import { nostrEnabled } from './signal/client.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -23,17 +24,16 @@ const bad = (m, d) => ({ level: 'bad', m, d });
 
 async function checkMediaEngine() {
   const bin = findMediaBinary();
-  if (!bin) {
-    return [bad('media engine', 'not built - run: cmake -B media/build -S media -G Ninja && cmake --build media/build')];
-  }
+  if (!bin) return [bad('media engine', MEDIA_MISSING)];
   const out = [ok('media engine', bin)];
   try {
     const { stdout } = await execFileAsync(bin, ['probe'], { timeout: 15000 });
     const probe = JSON.parse(stdout);
-    const hw = probe.encoders.filter((e) => /vaapi|nvenc|qsv|amf/.test(e));
+    const relevant = process.platform === 'win32' ? /nvenc|qsv|amf|_mf/ : /vaapi|nvenc|qsv/;
+    const hw = probe.encoders.filter((e) => relevant.test(e));
     out.push(hw.length
-      ? ok('hardware encoder', hw.join(', '))
-      : warn('hardware encoder', 'none found; software x264 will be used (higher CPU)'));
+      ? ok('GPU encoders', `${hw.join(', ')} (the first one this GPU supports is used)`)
+      : warn('GPU encoders', 'none built in; software x264 will be used (higher CPU)'));
     out.push(probe.encoders.some((e) => /x264|openh264/.test(e))
       ? ok('software encoder', 'available as fallback')
       : warn('software encoder', 'no software fallback'));
@@ -43,6 +43,15 @@ async function checkMediaEngine() {
     out.push(probe.render.includes('sdl')
       ? ok('viewer window', 'SDL2')
       : bad('viewer window', 'SDL2 missing - cannot display a stream'));
+    const input = probe.input || {};
+    out.push(input.kbm?.length
+      ? ok('keyboard/mouse', `can be controlled remotely via ${input.kbm.join(', ')}`)
+      : warn('keyboard/mouse', 'this machine cannot be controlled remotely (viewing it still works)'));
+    if (input.gamepad) {
+      out.push(input.gamepadReady
+        ? ok('controllers', `virtual Xbox 360 pads via ${input.gamepad}`)
+        : warn('controllers', `unavailable as host: ${input.gamepadError || 'unknown reason'}`));
+    }
   } catch (err) {
     out.push(bad('media engine probe', err.message));
   }
@@ -51,6 +60,10 @@ async function checkMediaEngine() {
 
 function checkSession() {
   const out = [];
+  if (process.platform === 'win32') {
+    out.push(ok('display session', 'Windows desktop (DXGI capture, GDI fallback)'));
+    return out;
+  }
   const wayland = process.env.WAYLAND_DISPLAY;
   const x11 = process.env.DISPLAY;
   const type = process.env.XDG_SESSION_TYPE;
@@ -66,6 +79,24 @@ function checkSession() {
       `none detected (XDG_SESSION_TYPE=${type || 'unset'}) - host mode can only use the synthetic source here`));
   }
   return out;
+}
+
+/** Pairing needs at least one public relay to answer (a few is plenty). */
+async function checkNostr() {
+  if (!nostrEnabled()) return warn('pairing relays', 'Nostr disabled (PENGUIN_NOSTR=0); a --rendezvous server is required');
+  const { WebSocket } = await import('ws');
+  const relays = relayList().slice(0, 6);
+  const results = await Promise.all(relays.map((url) => new Promise((resolve) => {
+    const ws = new WebSocket(url, { handshakeTimeout: 5000 });
+    const done = (okay) => { try { ws.terminate(); } catch { /* ignore */ } resolve(okay); };
+    ws.once('open', () => done(true));
+    ws.once('error', () => done(false));
+    setTimeout(() => done(false), 6000).unref?.();
+  })));
+  const up = results.filter(Boolean).length;
+  if (up >= 2) return ok('pairing relays', `${up}/${relays.length} public Nostr relays reachable`);
+  if (up === 1) return warn('pairing relays', `only 1/${relays.length} Nostr relays reachable - pairing may be slow`);
+  return bad('pairing relays', 'no Nostr relay reachable: check the Internet connection or firewall (outbound wss:// on port 443)');
 }
 
 async function checkRendezvous(url) {
@@ -95,6 +126,7 @@ export async function runDoctor() {
     ? ok('node', process.versions.node)
     : bad('node', `${process.versions.node} - need >= 20`));
 
+  results.push(ok('penguin stream', APP_VERSION));
   results.push(ok('platform', `${os.platform()} ${os.arch()} ${os.release()}`));
 
   try {
@@ -113,7 +145,8 @@ export async function runDoctor() {
 
   results.push(...checkSession());
   results.push(...(await checkMediaEngine()));
-  results.push(await checkRendezvous(DEFAULT_RENDEZVOUS));
+  results.push(await checkNostr());
+  if (DEFAULT_RENDEZVOUS) results.push(await checkRendezvous(DEFAULT_RENDEZVOUS));
 
   console.log(`${col('bold')}penguin-stream doctor${col('reset')}\n`);
   for (const r of results) {

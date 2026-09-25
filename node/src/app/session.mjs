@@ -11,6 +11,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 
 import { hostSession, joinSession } from '../signal/client.mjs';
 import { parseInvitation } from '../signal/code.mjs';
@@ -20,9 +21,44 @@ import { MAX_PAYLOAD } from '../transport/peer.mjs';
 import { Chunker, Reassembler } from '../media/chunker.mjs';
 import { CaptureEngine, ViewEngine } from '../media/engine.mjs';
 import { AudioCapture, AudioPlayer } from '../media/audio.mjs';
-import { createInputValidator } from '../media/input.mjs';
+import { createInputValidator, inputClass } from '../media/input.mjs';
 
-export const DEFAULT_RENDEZVOUS = process.env.PENGUIN_RENDEZVOUS || 'ws://127.0.0.1:8787';
+/** Optional self-hosted rendezvous. Pairing uses public Nostr relays by default. */
+export const DEFAULT_RENDEZVOUS = process.env.PENGUIN_RENDEZVOUS || undefined;
+
+export const APP_VERSION = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')).version;
+  } catch { return 'unknown'; }
+})();
+/** Bumped whenever the peer-to-peer message formats change incompatibly. */
+export const PROTOCOL_VERSION = 2;
+
+/** Warns when the peer never introduces itself (Penguin Stream 0.9 and older). */
+function expectHello(peer, emit) {
+  let seen = false;
+  const onControl = (msg) => { if (msg?.t === 'hello') seen = true; };
+  peer.on('control', onControl);
+  const timer = setTimeout(() => {
+    peer.off('control', onControl);
+    if (!seen && peer.state === 'secure') {
+      emit('error', new Error('the other side runs an older Penguin Stream (0.9 or earlier): ' +
+        'video may work but keyboard, mouse and controllers will not - update both machines'));
+    }
+  }, 6000);
+  timer.unref?.();
+}
+
+function checkHello(msg, emit) {
+  if (msg?.t !== 'hello') return;
+  if (msg.protocol !== PROTOCOL_VERSION) {
+    emit('error', new Error(`the other side runs Penguin Stream ${String(msg.version).slice(0, 20)} ` +
+      `(protocol ${String(msg.protocol).slice(0, 5)}), this is ${APP_VERSION} (protocol ${PROTOCOL_VERSION}); ` +
+      'input will not work until both sides run the same version'));
+  } else {
+    emit('log', `peer runs Penguin Stream ${String(msg.version).slice(0, 20)}`);
+  }
+}
 
 export const DEFAULT_STUN_SERVERS = [
   'stun:stun.l.google.com:19302',
@@ -77,7 +113,32 @@ export class Host extends EventEmitter {
     this.engine = null;
     this.chunker = new Chunker({ maxPayload: MAX_PAYLOAD });
     this.stats = { framesSent: 0, bytesSent: 0, dropped: 0 };
-    this.allowInput = opts.allowInput === true;
+    // Live-switchable: the host can grant or revoke control mid-session.
+    this.permissions = { kbm: opts.allowInput === true, pad: opts.allowGamepad === true };
+    this.inputStatus = null;
+  }
+
+  /** Grants/revokes keyboard+mouse and controller control during a session. */
+  setPermissions({ kbm = this.permissions.kbm, pad = this.permissions.pad } = {}) {
+    this.permissions = { kbm: kbm === true, pad: pad === true };
+    this.engine?.setPermissions(this.permissions);
+    this.#announcePermissions();
+    this.emit('permissions', this.permissions);
+  }
+
+  #announcePermissions() {
+    const peer = this.session?.peer;
+    // Wait for the engine's first report so the viewer is never told
+    // "unavailable" merely because the host has not finished starting.
+    if (!peer || peer.state !== 'secure' || !this.inputStatus) return;
+    const st = this.inputStatus;
+    try {
+      peer.sendControl({
+        t: 'host-permissions', kbm: this.permissions.kbm, pad: this.permissions.pad,
+        kbmReady: st.kbmReady === true, padReady: st.padReady === true,
+        padError: typeof st.padError === 'string' ? st.padError.slice(0, 200) : '',
+      });
+    } catch { /* closing */ }
   }
 
   /**
@@ -89,6 +150,7 @@ export class Host extends EventEmitter {
     this.session = await hostSession({
       code: this.opts.code,
       rendezvousUrl: this.opts.rendezvousUrl || DEFAULT_RENDEZVOUS,
+      nostr: this.opts.nostr,
       identity: this.identity.keypair,
       iceServers,
       iceTransportPolicy: this.opts.forceRelay ? 'relay' : 'all',
@@ -116,7 +178,7 @@ export class Host extends EventEmitter {
         }
         return ok;
       },
-      sessionTimeoutMs: this.opts.sessionTimeoutMs ?? 120_000,
+      sessionTimeoutMs: this.opts.sessionTimeoutMs ?? 30 * 60_000,   // how long an invitation waits for a viewer
     });
 
     this.#startMedia();
@@ -129,7 +191,10 @@ export class Host extends EventEmitter {
 
     this.engine = new CaptureEngine({
       source: this.opts.source,
-      allowInput: this.allowInput,
+      display: this.opts.display,
+      allowInput: this.permissions.kbm,
+      allowGamepad: this.permissions.pad,
+      inputCapable: this.opts.inputCapable === true || this.permissions.kbm,
       fps: this.opts.fps ?? 60,
       bitrateKbps: this.opts.bitrateKbps ?? 15000,
       encoder: this.opts.encoder,
@@ -169,6 +234,15 @@ export class Host extends EventEmitter {
       this.emit('stats', { ...s, ...this.stats, transport });
     });
     this.engine.on('log', (m) => this.emit('log', m));
+    this.engine.on('input-status', (st) => {
+      this.inputStatus = st;
+      this.emit('input-status', st);
+      this.#announcePermissions();
+    });
+    this.engine.on('rumble', ({ slot, lo, hi }) => {
+      if (peer.state !== 'secure' || !this.permissions.pad) return;
+      try { peer.sendControl({ t: 'rumble', slot, lo, hi }); } catch { /* closing */ }
+    });
     this.engine.on('stderr', (m) => this.emit('log', `ps-media: ${m}`));
     this.engine.on('error', (e) => this.emit('error', e));
     this.engine.on('exit', ({ code }) => {
@@ -182,16 +256,24 @@ export class Host extends EventEmitter {
       if (msg?.t === 'set-bitrate' && Number.isFinite(msg.kbps) && msg.kbps >= 500 && msg.kbps <= 200000) {
         this.engine?.setBitrate(Math.round(msg.kbps));
       }
+      if (msg?.t === 'viewer-state' && typeof msg.kbm === 'boolean' && typeof msg.pad === 'boolean') {
+        this.emit('viewer-state', { kbm: msg.kbm, pad: msg.pad, pads: Number.isInteger(msg.pads) ? msg.pads : 0 });
+      }
+      checkHello(msg, (...a) => this.emit(...a));
     });
 
     const validateInput = createInputValidator();
     peer.on('input', (event) => {
-      if (!this.allowInput || peer.state !== 'secure') return;
+      if (peer.state !== 'secure') return;
       const valid = validateInput(event);
-      if (!valid) return;
+      if (!valid || !this.permissions[inputClass(valid)]) return;
       this.emit('input', valid);
       this.engine?.sendInput(valid);
     });
+
+    try { peer.sendControl({ t: 'hello', app: 'penguin-stream', version: APP_VERSION, protocol: PROTOCOL_VERSION }); } catch { /* closing */ }
+    expectHello(peer, (...a) => this.emit(...a));
+    this.#announcePermissions();
 
     peer.on('closed', (reason) => this.close(reason));
 
@@ -212,7 +294,7 @@ export class Host extends EventEmitter {
   close(reason = 'closed') {
     if (this._closed) return;
     this._closed = true;
-    if (this.allowInput) this.engine?.sendInput({ t: 'release_all' });
+    this.engine?.sendInput({ t: 'release_all' });
     void this.audio?.stop();
     this.engine?.stop();
     this.session?.close();
@@ -251,6 +333,7 @@ export class Viewer extends EventEmitter {
     this.session = await joinSession({
       code,
       rendezvousUrl: rendezvousUrl || DEFAULT_RENDEZVOUS,
+      nostr: this.opts.nostr,
       identity: this.identity.keypair,
       iceServers: resolveIceServers(this.opts),
       iceTransportPolicy: this.opts.forceRelay ? 'relay' : 'all',
@@ -268,14 +351,21 @@ export class Viewer extends EventEmitter {
     // without an explicit verification action.
 
     this.engine = new ViewEngine({
-      title: this.opts.title || 'penguin-stream',
+      title: this.opts.title || 'Penguin Stream',
       noInput: this.opts.noInput,
+      sendKbm: this.opts.sendKbm,
+      sendPad: this.opts.sendPad,
       lowLatency: this.opts.lowLatency,
       noVsync: this.opts.noVsync,
     });
 
     this.engine.on('input', (event) => {
       try { peer.sendInput(event); } catch { /* not secure / closing */ }
+    });
+    this.engine.on('viewer-state', (st) => {
+      this.viewerState = st;
+      this.emit('viewer-state', st);
+      try { peer.sendControl({ t: 'viewer-state', kbm: st.kbm, pad: st.pad, pads: st.pads }); } catch { /* closing */ }
     });
     this.engine.on('exit', () => this.close('viewer window closed'));
     this.engine.on('error', (e) => this.emit('error', e));
@@ -295,8 +385,21 @@ export class Viewer extends EventEmitter {
       if (msg?.t === 'media-config') {
         this.emit('media-config', msg.config);
         this.engine.sendConfig(msg.config);
+      } else if (msg?.t === 'host-permissions') {
+        this.hostPermissions = {
+          kbm: msg.kbm === true, pad: msg.pad === true,
+          kbmReady: msg.kbmReady === true, padReady: msg.padReady === true,
+          padError: typeof msg.padError === 'string' ? msg.padError.slice(0, 200) : '',
+        };
+        this.engine.hostPermissions(this.hostPermissions);
+        this.emit('host-permissions', this.hostPermissions);
+      } else if (msg?.t === 'rumble') {
+        this.engine.rumble(msg);
       }
+      checkHello(msg, (...a) => this.emit(...a));
     });
+    try { peer.sendControl({ t: 'hello', app: 'penguin-stream', version: APP_VERSION, protocol: PROTOCOL_VERSION }); } catch { /* closing */ }
+    expectHello(peer, (...a) => this.emit(...a));
 
     let lastKeyframeReq = 0;
     const requestKeyframeImmediate = () => {
@@ -340,6 +443,11 @@ export class Viewer extends EventEmitter {
     this._keyframeTimer.unref?.();
 
     return this.session;
+  }
+
+  /** Live viewer toggles: { kbm?, pad?, capture? }. */
+  setInput(state) {
+    this.engine?.setInput(state);
   }
 
   close(reason = 'closed') {

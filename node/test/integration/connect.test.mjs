@@ -4,6 +4,9 @@
  * the Noise handshake and the consent gate. Nothing here is mocked.
  */
 
+// Offline and deterministic: these tests use a local rendezvous only.
+process.env.PENGUIN_NOSTR ??= '0';
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

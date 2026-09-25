@@ -207,3 +207,54 @@ pre#log {
   padding: .75rem; max-height: 240px; overflow: auto; font-size: .8rem; color: var(--dim);
   white-space: pre-wrap;
 }
+
+/* Input permission toggles (host) and input switches (viewer) */
+.toggle-panel {
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: .9rem 1.1rem;
+  margin: 1rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: .45rem;
+}
+.toggle-panel.inline { background: transparent; padding: .25rem 0; margin: .5rem 0; }
+.panel-title { font-weight: 600; font-size: .9rem; color: var(--dim); margin-bottom: .15rem; }
+.switch { display: flex; align-items: center; gap: .6rem; cursor: pointer; }
+.switch input[type="checkbox"] {
+  appearance: none;
+  width: 2.3rem;
+  height: 1.3rem;
+  border-radius: 1rem;
+  background: var(--panel-2);
+  border: 1px solid var(--dim);
+  position: relative;
+  cursor: pointer;
+  flex: none;
+  transition: background .15s;
+}
+.switch input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: calc(1.3rem - 6px);
+  height: calc(1.3rem - 6px);
+  border-radius: 50%;
+  background: var(--dim);
+  transition: transform .15s, background .15s;
+}
+.switch input[type="checkbox"]:checked { background: var(--accent); border-color: var(--accent); }
+.switch input[type="checkbox"]:checked::after { transform: translateX(1rem); background: #fff; }
+.switch input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch input[type="checkbox"]:disabled { opacity: .45; cursor: not-allowed; }
+.input-status { font-size: .85rem; color: var(--dim); }
+.input-status .warn { color: var(--warn); }
+.input-status a { color: var(--accent); }
+kbd {
+  font: 600 .75rem/1 ui-monospace, monospace;
+  padding: .15rem .35rem;
+  border-radius: 4px;
+  border: 1px solid var(--dim);
+  background: var(--panel-2);
+}

@@ -3,19 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>penguin-stream</title>
+<title>Penguin Stream</title>
 <link rel="stylesheet" href="/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐧</text></svg>">
 </head>
 <body>
 
 <header>
-  <h1><span aria-hidden="true">🐧</span> penguin-stream</h1>
+  <h1><span aria-hidden="true">🐧</span> Penguin Stream</h1>
   <div class="device" id="device"></div>
 </header>
 
 <main>
-  <p id="support-notice">Experimental: Fedora Wayland video tested. Remote input and Linux CLI audio are implemented but not live-verified. Windows build and cross-platform operation are unverified.</p>
+  <p id="support-notice">Beta: Windows ↔ Fedora streaming with keyboard, mouse and controllers. Pairing works across the Internet with no setup; see the Activity Log if something goes wrong.</p>
 
   <!-- idle: start hosting or connect -->
   <section id="view-idle" class="card-row">
@@ -31,12 +31,23 @@
     </button>
   </section>
 
+  <!-- what the host lets viewers do (can be changed while sharing) -->
+  <section id="host-options" class="toggle-panel">
+    <div class="panel-title">When sharing, let the other person use:</div>
+    <label class="switch"><input type="checkbox" id="host-allow-kbm" checked> <span>My keyboard &amp; mouse</span></label>
+    <label class="switch"><input type="checkbox" id="host-allow-pad" checked> <span>Game controllers (as virtual Xbox pads)</span></label>
+  </section>
+
   <!-- connect form -->
   <section id="view-connect" hidden>
     <h2>Connect to a desktop</h2>
     <form id="connect-form">
-      <input id="code-input" class="code-input" placeholder="Paste invitation (e.g. XXXX-XXXX-... or with @ws://...)" autocomplete="off"
-             spellcheck="false" maxlength="128" aria-label="Share code or invitation link">
+      <input id="code-input" class="code-input" placeholder="Paste the invitation (XXXX-XXXX-…)" autocomplete="off"
+             spellcheck="false" maxlength="256" aria-label="Invitation">
+      <div class="toggle-panel inline">
+        <label class="switch"><input type="checkbox" id="view-send-kbm" checked> <span>Send my keyboard &amp; mouse</span></label>
+        <label class="switch"><input type="checkbox" id="view-send-pad" checked> <span>Send my controllers</span></label>
+      </div>
       <div class="form-actions">
         <button class="primary" type="submit">Connect</button>
         <button class="link" type="button" data-back>Cancel</button>
@@ -78,6 +89,13 @@
       </div>
     </div>
 
+    <div class="toggle-panel" id="host-live-input">
+      <div class="panel-title">Remote control (changes apply instantly)</div>
+      <label class="switch"><input type="checkbox" id="live-allow-kbm"> <span>Keyboard &amp; mouse</span></label>
+      <label class="switch"><input type="checkbox" id="live-allow-pad"> <span>Controllers</span></label>
+      <div class="input-status" id="host-input-status"></div>
+    </div>
+
     <button class="danger" data-stop>Stop sharing</button>
   </section>
 
@@ -112,6 +130,16 @@
           <div class="metric-value" id="viewer-metric-frames">—</div>
         </div>
       </div>
+    </div>
+
+    <div class="toggle-panel" id="viewer-live-input">
+      <div class="panel-title">Your input (changes apply instantly)</div>
+      <label class="switch"><input type="checkbox" id="live-send-kbm"> <span>Keyboard &amp; mouse</span></label>
+      <label class="switch"><input type="checkbox" id="live-send-pad"> <span>Controllers <span id="viewer-pad-count" class="dim"></span></span></label>
+      <label class="switch"><input type="checkbox" id="live-capture"> <span>Game mode: lock the mouse inside the window (for 3D games)</span></label>
+      <div class="input-status" id="viewer-input-status"></div>
+      <p class="hint">In the stream window hold <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd> and press
+        <kbd>Q</kbd> disconnect · <kbd>M</kbd> keyboard/mouse · <kbd>G</kbd> controllers · <kbd>Z</kbd> game mode · <kbd>X</kbd> fullscreen</p>
     </div>
 
     <button class="danger" data-stop>Disconnect</button>
@@ -170,23 +198,31 @@
       <div class="field-grid">
         <label>Hardware Encoder
           <select id="opt-encoder">
-            <option value="" selected>Automatic (Fastest Available)</option>
-            <option value="vaapi">VA-API (Intel / AMD GPU)</option>
+            <option value="" selected>Automatic (fastest available)</option>
             <option value="nvenc">NVENC (NVIDIA GPU)</option>
-            <option value="qsv">Intel QuickSync</option>
-            <option value="software">Software (x264 Ultrafast)</option>
+            <option value="amf">AMF (AMD GPU, Windows)</option>
+            <option value="qsv">Quick Sync (Intel GPU)</option>
+            <option value="mf">Media Foundation (any GPU, Windows)</option>
+            <option value="vaapi">VA-API (Intel / AMD GPU, Linux)</option>
+            <option value="software">Software (x264 ultrafast)</option>
           </select>
         </label>
 
         <label>Capture Source
           <select id="opt-source">
-            <option value="" selected>Automatic (Wayland Portal)</option>
-            <option value="portal">Wayland portal</option>
-            <option value="x11">X11 desktop capture</option>
+            <option value="" selected>Automatic</option>
+            <option value="dxgi">Windows: Desktop Duplication (DXGI)</option>
+            <option value="gdi">Windows: GDI (compatibility fallback)</option>
+            <option value="portal">Linux: Wayland portal</option>
+            <option value="x11">Linux: X11</option>
             <option value="synthetic">Synthetic test pattern</option>
           </select>
         </label>
       </div>
+
+      <label>Monitor (Windows, 0 = first)
+        <input id="opt-display" inputmode="numeric" pattern="[0-9]*" maxlength="2" placeholder="Automatic (main monitor)">
+      </label>
 
       <label class="checkbox-label">
         <input type="checkbox" id="opt-low-latency" checked>
@@ -195,18 +231,10 @@
     </fieldset>
 
     <fieldset class="settings-group">
-      <legend>Input & Audio Capabilities</legend>
-      <label class="checkbox-label">
-        <input type="checkbox" id="opt-allow-input">
-        Allow remote keyboard & mouse control (Wayland RemoteDesktop permission)
-      </label>
+      <legend>Audio (experimental)</legend>
       <label class="checkbox-label">
         <input type="checkbox" id="opt-audio">
-        Stream / receive desktop audio (Linux PulseAudio / PipeWire monitor)
-      </label>
-      <label class="checkbox-label">
-        <input type="checkbox" id="opt-no-input">
-        View-only mode (disable sending input from this viewer)
+        Stream desktop audio from a Linux host (needs ffplay on the viewer; Windows hosts cannot send audio yet)
       </label>
     </fieldset>
 
@@ -226,8 +254,8 @@
         <input id="opt-stun" placeholder="Default: Google & Cloudflare STUN (stun:stun.l.google.com:19302)">
       </label>
 
-      <label>Rendezvous Server URL
-        <input id="opt-rendezvous" placeholder="Default: ws://127.0.0.1:8787 (or ws://your-lan-ip:8787)">
+      <label>Self-hosted rendezvous (optional)
+        <input id="opt-rendezvous" placeholder="Not needed: pairing uses public Nostr relays. For offline LANs: ws://host:8787">
       </label>
 
       <div class="turn-box">
