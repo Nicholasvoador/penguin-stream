@@ -8,7 +8,7 @@ Assets: desktop pixels, keyboard/mouse permission, system audio, identity privat
 
 ## Implemented controls
 
-- ICE/DTLS/SCTP via node-datachannel; application record encryption uses Node's X25519 and ChaCha20-Poly1305 primitives in a custom Noise XX implementation.
+- ICE/DTLS/SCTP via node-datachannel; application record encryption uses Node's X25519 and AES-256-GCM primitives in a custom Noise XX implementation (`Noise_XX_25519_AESGCM_SHA256`). AES-GCM was chosen because it exists in both OpenSSL (Node) and BoringSSL (Electron), and a test runs the handshake under Electron.
 - Per-record channel/sequence headers are authenticated. Authentication is checked **before** updating the bounded replay window. Tests cover corruption, replay, small-order keys, unrelated sessions and SAS divergence under MITM.
 - Host application starts video only after cryptographic handshake and explicit host consent. Compare the four verification words out of band. `--yes` is restricted by the CLI to explicit synthetic capture; it skips human verification and is only for controlled tests.
 - Wayland capture uses the compositor's portal consent flow rather than bypassing desktop permissions.

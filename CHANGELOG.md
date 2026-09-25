@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.2 — 2026-09-25
+
+### Fixed
+- **"A JavaScript error occurred in the main process — Error: Unknown cipher"** when hosting or connecting in the
+  Windows and Fedora desktop apps. Electron's crypto (BoringSSL) has no ChaCha20-Poly1305 in `createCipheriv`, and the old
+  test suite only ran under plain Node (OpenSSL), so it never saw the failure.
+- Signaling and the Noise session now use **AES-256-GCM** (`Noise_XX_25519_AESGCM_SHA256`). It's available in both runtimes
+  and hardware-accelerated by AES-NI.
+- An encryption failure during signaling now ends that session with an error message instead of crashing the app.
+- The window always appears on Wayland, even when `ready-to-show` never fires.
+
+### Compatibility
+- **1.1.2 cannot connect to 1.1.0 or 1.0.0.** Room IDs, the signaling salt and the Noise prologue moved to `v2`, so peers
+  on different versions fail cleanly instead of half-connecting. Update both computers.
+
+### Tests
+- New test runs the signaling encryption and a full Noise handshake **inside the Electron runtime**, plus a static check
+  that no source file uses a cipher missing from BoringSSL. 112 tests pass.
+
 ## 1.1.0 — 2026-09-25
 
 ### Audio

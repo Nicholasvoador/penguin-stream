@@ -3,7 +3,8 @@
 ## Install
 
 ```sh
-sudo dnf install ./penguin-stream-1.0.0-1.fc44.x86_64.rpm
+# download the .rpm from https://github.com/Nicholasvoador/penguin-stream/releases/latest, then:
+sudo dnf install ./penguin-stream-*.x86_64.rpm
 ```
 
 dnf pulls in the FFmpeg, SDL2 (sdl2-compat) and PipeWire libraries automatically. Start it from the app menu, or run `penguin-stream`.

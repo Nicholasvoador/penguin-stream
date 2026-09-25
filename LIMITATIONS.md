@@ -1,4 +1,6 @@
-# What is verified, what is not — v1.1.0 (2026-09-25)
+# What is verified, what is not
+
+_Last updated for 1.1.2 (2026-09-25). Release-specific notes are in [CHANGELOG.md](CHANGELOG.md)._
 
 This page is deliberately blunt: it lists what was actually checked for this release and what was not.
 
@@ -6,7 +8,8 @@ This page is deliberately blunt: it lists what was actually checked for this rel
 
 | Area | Evidence |
 |---|---|
-| Automated suite | `npm test`: **110 passed, 0 failed, 0 skipped** (unit + integration: crypto, signaling, ICE/relay, encrypted H.264 end to end, UI API, settings) |
+| Automated suite | `npm test`: **112 passed, 0 failed, 0 skipped** (unit + integration: crypto, signaling, ICE/relay, encrypted H.264 end to end, UI API, settings) |
+| Crypto inside Electron | Signaling encryption and a full Noise handshake run under the bundled Electron (BoringSSL). The installed Fedora RPM completed a real host↔client connection under its own Electron. |
 | NVENC GPU-colour path | `ps-media selftest --encoder nvenc` at 2560×1440, 120 frames: 0 mismatches, worst colour delta 4/255; ~3.2 ms/frame less CPU than the NV12 path (RTX 5070) |
 | Fedora RPM | Installed with `dnf` into a **clean Fedora 44 container**: dependencies resolved from stock repos (`libavcodec-free`, `sdl2-compat`); bundled engine probe + encode/decode selftest pass; SUID sandbox, launcher and desktop entry correct |
 | Packaged Linux app | Boots from the packaged asar, loads the native WebRTC module, serves the UI, runs the network check (rendered headless) |

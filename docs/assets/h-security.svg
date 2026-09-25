@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="84" viewBox="0 0 1280 84" role="img" aria-label="Security">
+<defs><linearGradient id="h" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#6366f1"/></linearGradient></defs>
+<clipPath id="hc"><rect width="1280" height="84" rx="20"/></clipPath><g clip-path="url(#hc)"><rect width="1280" height="84" fill="url(#h)"/>
+<path d="M0 64 Q80 56 160 64 T320 64 T480 64 T640 64 T800 64 T960 64 T1120 64 T1280 64 V84 H0 Z" fill="#fff" opacity=".14"/>
+</g><g transform="translate(46 42) scale(.19)"><ellipse cx="0" cy="0" rx="100" ry="125" fill="#0b1220"/><ellipse cx="0" cy="32" rx="68" ry="86" fill="#f8fafc"/><circle cx="-30" cy="-46" r="20" fill="#f8fafc"/><circle cx="30" cy="-46" r="20" fill="#f8fafc"/><circle cx="-26" cy="-44" r="9" fill="#0b1220"/><circle cx="34" cy="-44" r="9" fill="#0b1220"/><path d="M-18 -20 H18 L0 4 Z" fill="#fbbf24"/></g>
+<text x="84" y="53" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="30" font-weight="800" fill="#fff">Security</text>
+<g fill="#fff" opacity=".55"><circle cx="1080" cy="22" r="2.5"/><circle cx="1150" cy="48" r="2"/><circle cx="1210" cy="18" r="3"/><circle cx="990" cy="40" r="1.8"/><circle cx="1240" cy="60" r="2.2"/></g></svg>

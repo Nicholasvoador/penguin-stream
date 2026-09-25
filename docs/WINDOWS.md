@@ -1,12 +1,28 @@
-# Windows media backend
+# Windows
+
+## Installing (most people only need this)
+
+1. Download `PenguinStream-<version>-Setup.exe` (installer) or `PenguinStream-<version>-Portable.exe` (no install) from the
+   [latest release](https://github.com/Nicholasvoador/penguin-stream/releases/latest).
+2. SmartScreen may say "unrecognized app" because the builds aren't code-signed yet. Click *More info → Run anyway*.
+3. For **controllers on a Windows host**, install the free [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver once.
+4. Make sure the other computer runs the **same version**.
+
+Everything else is bundled: the app, Node, the native media engine (`ps-media.exe`, cross-compiled with MinGW), FFmpeg and SDL.
+You don't need to build anything.
 
 ## Verification status
 
-The DXGI backend is implemented, but **has not been compiled or run on Windows**.
-A Linux build does not compile `windows_dxgi.cpp` and cannot validate D3D11,
-DXGI, Windows dependency discovery, or Windows runtime behavior. Windows build
-and hardware smoke tests below remain required; do not treat this as a verified
-Windows release.
+The released Windows engine is **cross-compiled and packaged from Fedora**. It was tested under Wine (probe, software
+encode→decode selftest, WASAPI audio), and the connection crypto was tested under the bundled Electron. It has **not yet been
+verified end to end on a physical Windows PC**; see [LIMITATIONS.md](../LIMITATIONS.md). Please report results.
+
+---
+
+## Building the media engine natively with MSVC (developers only)
+
+The release build doesn't use this. It's an alternative for developers who want an MSVC build of `ps-media.exe`. The
+supported path is `npm run dist:win` (MinGW in a container), described in the main README.
 
 ## Build prerequisites
 
@@ -105,5 +121,4 @@ input injection via `SendInput()` when `--allow-input` is enabled on the host:
 - Mouse clicks (`MOUSEEVENTF_LEFTDOWN/UP`, `MOUSEEVENTF_RIGHTDOWN/UP`, `MOUSEEVENTF_MIDDLEDOWN/UP`) and mouse wheel events (`MOUSEEVENTF_WHEEL`) are injected.
 - Keyboard keystrokes are passed via hardware scan codes (`KEYEVENTF_SCANCODE`).
 - `release_all` automatically cleans up all held keys and mouse buttons upon session disconnect.
-- The root launcher `penguin-stream.bat` launches the Web UI or CLI directly on Windows.
 - `scripts/build-windows.ps1` configures and builds the Windows native executable with CMake/vcpkg.

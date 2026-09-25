@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="170" viewBox="0 0 1280 170" role="img" aria-label="A penguin waddling across the ice">
+<defs><linearGradient id="fs" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#6366f1"/></linearGradient>
+<clipPath id="fc"><rect width="1280" height="170" rx="24"/></clipPath></defs>
+<g clip-path="url(#fc)">
+<rect width="1280" height="170" fill="url(#fs)"/>
+<path d="M0 128 Q160 118 320 128 T640 128 T960 128 T1280 128 V170 H0 Z" fill="#1e3a8a" opacity=".5">
+ <animate attributeName="d" dur="5s" repeatCount="indefinite" values="M0 128 Q160 118 320 128 T640 128 T960 128 T1280 128 V170 H0 Z;M0 128 Q160 138 320 128 T640 128 T960 128 T1280 128 V170 H0 Z;M0 128 Q160 118 320 128 T640 128 T960 128 T1280 128 V170 H0 Z"/></path>
+<path d="M0 118 H1280 V130 H0 Z" fill="#e0f2fe" opacity=".9"/>
+<g><animateTransform attributeName="transform" type="translate" values="-120 0;1400 0" dur="16s" repeatCount="indefinite"/>
+ <g><animateTransform attributeName="transform" type="rotate" values="-6 0 110;6 0 110;-6 0 110" dur=".7s" repeatCount="indefinite"/><g transform="translate(0 72) scale(0.34)">
+  <ellipse cx="0" cy="128" rx="92" ry="12" fill="#0b1220" opacity=".18"/>
+  <ellipse cx="-38" cy="122" rx="30" ry="11" fill="#fbbf24"/>
+  <ellipse cx="38" cy="122" rx="30" ry="11" fill="#fbbf24"/>
+  <ellipse cx="0" cy="0" rx="100" ry="125" fill="#0b1220"/>
+  <ellipse cx="0" cy="32" rx="68" ry="86" fill="#f8fafc"/>
+  <circle cx="-30" cy="-46" r="20" fill="#f8fafc"/><circle cx="30" cy="-46" r="20" fill="#f8fafc"/>
+  <circle cx="-26" cy="-44" r="9" fill="#0b1220"/><circle cx="34" cy="-44" r="9" fill="#0b1220"/>
+  <circle cx="-23" cy="-48" r="3" fill="#fff"/><circle cx="37" cy="-48" r="3" fill="#fff"/>
+  <path d="M-18 -20 H18 L0 4 Z" fill="#fbbf24" stroke="#f59e0b" stroke-width="2" stroke-linejoin="round"/>
+  
+</g></g></g>
+<text x="640" y="62" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="26" font-weight="700" fill="#fff" text-anchor="middle">Share a screen, send an invite, play together.</text>
+<text x="640" y="94" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="18" fill="#f0f9ff" text-anchor="middle" opacity=".9">MIT licensed · made on Fedora · for Windows and Linux</text>
+<circle cx="305" r="1.9" fill="#fff" opacity="0.57"><animate attributeName="cy" values="-10;180" dur="9.0s" begin="-5.4s" repeatCount="indefinite"/><animate attributeName="cx" values="305;283;305" dur="4.5s" repeatCount="indefinite"/></circle>
+  <circle cx="17" r="2.2" fill="#fff" opacity="0.70"><animate attributeName="cy" values="-10;180" dur="8.1s" begin="-1.9s" repeatCount="indefinite"/><animate attributeName="cx" values="17;15;17" dur="4.0s" repeatCount="indefinite"/></circle>
+  <circle cx="1071" r="1.8" fill="#fff" opacity="0.57"><animate attributeName="cy" values="-10;180" dur="11.1s" begin="-1.7s" repeatCount="indefinite"/><animate attributeName="cx" values="1071;1089;1071" dur="5.6s" repeatCount="indefinite"/></circle>
+  <circle cx="670" r="2.1" fill="#fff" opacity="0.62"><animate attributeName="cy" values="-10;180" dur="11.4s" begin="-0.7s" repeatCount="indefinite"/><animate attributeName="cx" values="670;674;670" dur="5.7s" repeatCount="indefinite"/></circle>
+  <circle cx="386" r="1.2" fill="#fff" opacity="0.60"><animate attributeName="cy" values="-10;180" dur="12.9s" begin="-6.1s" repeatCount="indefinite"/><animate attributeName="cx" values="386;405;386" dur="6.5s" repeatCount="indefinite"/></circle>
+  <circle cx="914" r="2.3" fill="#fff" opacity="0.51"><animate attributeName="cy" values="-10;180" dur="9.2s" begin="-7.3s" repeatCount="indefinite"/><animate attributeName="cx" values="914;936;914" dur="4.6s" repeatCount="indefinite"/></circle>
+  <circle cx="1125" r="1.3" fill="#fff" opacity="0.69"><animate attributeName="cy" values="-10;180" dur="7.1s" begin="-1.5s" repeatCount="indefinite"/><animate attributeName="cx" values="1125;1122;1125" dur="3.5s" repeatCount="indefinite"/></circle>
+  <circle cx="802" r="1.6" fill="#fff" opacity="0.47"><animate attributeName="cy" values="-10;180" dur="10.1s" begin="-3.9s" repeatCount="indefinite"/><animate attributeName="cx" values="802;806;802" dur="5.0s" repeatCount="indefinite"/></circle>
+  <circle cx="748" r="2.3" fill="#fff" opacity="0.65"><animate attributeName="cy" values="-10;180" dur="11.5s" begin="-10.6s" repeatCount="indefinite"/><animate attributeName="cx" values="748;772;748" dur="5.7s" repeatCount="indefinite"/></circle>
+  <circle cx="859" r="1.4" fill="#fff" opacity="0.67"><animate attributeName="cy" values="-10;180" dur="12.9s" begin="-12.4s" repeatCount="indefinite"/><animate attributeName="cx" values="859;863;859" dur="6.4s" repeatCount="indefinite"/></circle>
+  <circle cx="914" r="1.5" fill="#fff" opacity="0.45"><animate attributeName="cy" values="-10;180" dur="12.7s" begin="-7.3s" repeatCount="indefinite"/><animate attributeName="cx" values="914;892;914" dur="6.3s" repeatCount="indefinite"/></circle>
+  <circle cx="1093" r="2.4" fill="#fff" opacity="0.49"><animate attributeName="cy" values="-10;180" dur="6.7s" begin="-5.4s" repeatCount="indefinite"/><animate attributeName="cx" values="1093;1076;1093" dur="3.4s" repeatCount="indefinite"/></circle>
+  <circle cx="376" r="2.1" fill="#fff" opacity="0.57"><animate attributeName="cy" values="-10;180" dur="13.0s" begin="-0.6s" repeatCount="indefinite"/><animate attributeName="cx" values="376;353;376" dur="6.5s" repeatCount="indefinite"/></circle>
+  <circle cx="920" r="1.6" fill="#fff" opacity="0.53"><animate attributeName="cy" values="-10;180" dur="13.0s" begin="-12.8s" repeatCount="indefinite"/><animate attributeName="cx" values="920;945;920" dur="6.5s" repeatCount="indefinite"/></circle>
+  <circle cx="396" r="1.3" fill="#fff" opacity="0.42"><animate attributeName="cy" values="-10;180" dur="10.8s" begin="-0.3s" repeatCount="indefinite"/><animate attributeName="cx" values="396;392;396" dur="5.4s" repeatCount="indefinite"/></circle>
+  <circle cx="781" r="1.4" fill="#fff" opacity="0.46"><animate attributeName="cy" values="-10;180" dur="6.3s" begin="-5.5s" repeatCount="indefinite"/><animate attributeName="cx" values="781;804;781" dur="3.2s" repeatCount="indefinite"/></circle>
+  <circle cx="1148" r="1.7" fill="#fff" opacity="0.58"><animate attributeName="cy" values="-10;180" dur="9.7s" begin="-5.0s" repeatCount="indefinite"/><animate attributeName="cx" values="1148;1153;1148" dur="4.8s" repeatCount="indefinite"/></circle>
+  <circle cx="716" r="1.9" fill="#fff" opacity="0.50"><animate attributeName="cy" values="-10;180" dur="13.5s" begin="-6.9s" repeatCount="indefinite"/><animate attributeName="cx" values="716;727;716" dur="6.8s" repeatCount="indefinite"/></circle>
+</g></svg>

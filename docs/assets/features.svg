@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="196" viewBox="0 0 1280 196" role="img" aria-label="Direct P2P, CGNAT-ready, keyboard mouse and controllers, Discord-safe audio">
+<defs><linearGradient id="c0" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#3b82f6"/></linearGradient><linearGradient id="c1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b82f6"/><stop offset="1" stop-color="#6366f1"/></linearGradient><linearGradient id="c2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#7c3aed"/></linearGradient><linearGradient id="c3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0ea5e9"/><stop offset="1" stop-color="#6366f1"/></linearGradient></defs>
+<g transform="translate(0 0)">
+  <rect width="296" height="196" rx="22" fill="url(#c0)"/>
+  <rect width="296" height="196" rx="22" fill="none" stroke="#fff" stroke-opacity=".25" stroke-width="2"/>
+  <circle cx="58" cy="60" r="36" fill="#fff" opacity=".18"/>
+  <g transform="translate(58 60)"><circle cx="-22" cy="0" r="11" fill="#fff"/><circle cx="22" cy="0" r="11" fill="#fff"/><path d="M-10 0 H10" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-dasharray="2 7"><animate attributeName="stroke-dashoffset" values="18;0" dur="1s" repeatCount="indefinite"/></path></g>
+  <text x="26" y="128" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="23" font-weight="800" fill="#fff">Direct P2P</text>
+  <text x="26" y="156" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="17" fill="#f0f9ff" opacity=".92">UDP hole punching,</text>
+  <text x="26" y="178" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="17" fill="#f0f9ff" opacity=".92">no ports to open</text>
+</g><g transform="translate(328 0)">
+  <rect width="296" height="196" rx="22" fill="url(#c1)"/>
+  <rect width="296" height="196" rx="22" fill="none" stroke="#fff" stroke-opacity=".25" stroke-width="2"/>
+  <circle cx="58" cy="60" r="36" fill="#fff" opacity=".18"/>
+  <g transform="translate(58 60)"><path d="M-26 10 a16 16 0 0 1 4 -31 a22 22 0 0 1 41 6 a13 13 0 0 1 3 25 Z" fill="#fff"/><path d="M-2 -2 v14 M-8 6 l6 6 l6 -6" stroke="#6366f1" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
+  <text x="26" y="128" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="23" font-weight="800" fill="#fff">CGNAT-ready</text>
+  <text x="26" y="156" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="17" fill="#f0f9ff" opacity=".92">Relay fallback that</text>
+  <text x="26" y="178" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="17" fill="#f0f9ff" opacity=".92">only one side sets up</text>
+</g><g transform="translate(656 0)">
+  <rect width="296" height="196" rx="22" fill="url(#c2)"/>
+  <rect width="296" height="196" rx="22" fill="none" stroke="#fff" stroke-opacity=".25" stroke-width="2"/>
+  <circle cx="58" cy="60" r="36" fill="#fff" opacity=".18"/>
+  <g transform="translate(58 60)"><path d="M-30 -8 q0 -12 14 -12 h32 q14 0 14 12 l6 20 q2 12 -9 12 q-7 0 -12 -8 h-30 q-5 8 -12 8 q-11 0 -9 -12 Z" fill="#fff"/><path d="M-17 -3 v10 M-22 2 h10" stroke="#6366f1" stroke-width="4" stroke-linecap="round"/><circle cx="14" cy="-1" r="3.5" fill="#6366f1"/><circle cx="21" cy="6" r="3.5" fill="#6366f1"/></g>
+  <text x="26" y="128" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="23" font-weight="800" fill="#fff">Keyboard, mouse, pads</text>
+  <text x="26" y="156" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="17" fill="#f0f9ff" opacity=".92">Each one toggles</text>
+  <text x="26" y="178" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="17" fill="#f0f9ff" opacity=".92">on and off, live</text>
+</g><g transform="translate(984 0)">
+  <rect width="296" height="196" rx="22" fill="url(#c3)"/>
+  <rect width="296" height="196" rx="22" fill="none" stroke="#fff" stroke-opacity=".25" stroke-width="2"/>
+  <circle cx="58" cy="60" r="36" fill="#fff" opacity=".18"/>
+  <g transform="translate(58 60)"><path d="M-26 -8 h10 l14 -12 v40 l-14 -12 h-10 Z" fill="#fff"/><path d="M8 -10 l18 20 M26 -10 l-18 20" stroke="#fff" stroke-width="6" stroke-linecap="round"/></g>
+  <text x="26" y="128" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="23" font-weight="800" fill="#fff">Discord-safe audio</text>
+  <text x="26" y="156" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="17" fill="#f0f9ff" opacity=".92">Voice chat stays out,</text>
+  <text x="26" y="178" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="17" fill="#f0f9ff" opacity=".92">no echo on the call</text>
+</g>
+</svg>

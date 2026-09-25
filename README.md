@@ -1,28 +1,40 @@
-<p align="center"><img src="desktop/icon.png" width="96" alt=""></p>
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="Penguin Stream: low-latency remote desktop between Windows and Fedora. No port forwarding. Works behind CGNAT." width="100%">
+</p>
 
-<h1 align="center">Penguin Stream</h1>
+<p align="center">
+  <a href="https://github.com/Nicholasvoador/penguin-stream/releases/latest"><img src="https://img.shields.io/github/v/release/Nicholasvoador/penguin-stream?style=for-the-badge&label=latest&color=38bdf8&logo=github" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/Windows-10%20%2F%2011-6366f1?style=for-the-badge&logo=windows" alt="Windows 10/11">
+  <img src="https://img.shields.io/badge/Fedora-x86__64-3b82f6?style=for-the-badge&logo=fedora&logoColor=white" alt="Fedora">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-7c3aed?style=for-the-badge" alt="MIT license"></a>
+</p>
 
-<p align="center"><b>Low-latency remote desktop for Windows and Fedora — no port forwarding, works behind CGNAT.</b><br>
-Install, click <i>Share this screen</i>, send the invitation. That's the whole setup.</p>
+<p align="center"><b>Install, click <i>Share this screen</i>, send the invitation. That's the whole setup.</b></p>
 
----
+<p align="center">
+  <img src="docs/assets/features.svg" alt="Direct P2P · CGNAT-ready · Keyboard, mouse and controllers you can toggle live · Discord-safe audio" width="100%">
+</p>
 
-## Download (v1.1.0)
+<img src="docs/assets/h-download.svg" alt="Download" width="100%">
+
+Get the installers from the **[latest release](https://github.com/Nicholasvoador/penguin-stream/releases/latest)**.
 
 | System | File | How |
 |---|---|---|
-| **Windows 10/11 x64** | `PenguinStream-1.1.0-Setup.exe` | Installer (per-user, no admin needed) |
-| | `PenguinStream-1.1.0-Portable.exe` | Runs without installing |
-| **Fedora 44 x86_64** | `penguin-stream-1.1.0-1.fc44.x86_64.rpm` | `sudo dnf install ./penguin-stream-1.1.0-1.fc44.x86_64.rpm` |
+| **Windows 10/11 x64** | `PenguinStream-<version>-Setup.exe` | Installer (per-user, no admin needed) |
+| | `PenguinStream-<version>-Portable.exe` | Runs without installing |
+| **Fedora x86_64** | `penguin-stream-<version>-1.fc44.x86_64.rpm` | `sudo dnf install ./penguin-stream-*.x86_64.rpm` |
 
-Get them from the [Releases page](https://github.com/Nicholasvoador/penguin-stream/releases/latest). `SHA256SUMS.txt` lists the checksums.
+`SHA256SUMS.txt` in each release lists the checksums. **Both computers need the same version.** Peers on different
+versions refuse to connect instead of half-connecting.
 
-> **Windows SmartScreen:** the builds are not code-signed yet, so Windows may say "unrecognized app". Choose *More info → Run anyway*.
+> [!NOTE]
+> **Windows SmartScreen:** the builds aren't code-signed yet, so Windows may say "unrecognized app". Choose *More info → Run anyway*.
 >
 > **Fedora codecs:** the RPM works with Fedora's stock FFmpeg libraries, NVENC included. AMD/Intel GPU encoding
-> (VA-API H.264) needs RPM Fusion's Mesa drivers — see [docs/FEDORA.md](docs/FEDORA.md).
+> (VA-API H.264) needs RPM Fusion's Mesa drivers. See [docs/FEDORA.md](docs/FEDORA.md).
 
-## Using it
+<img src="docs/assets/h-use.svg" alt="How to use it" width="100%">
 
 1. **Host** (the computer being shared): open Penguin Stream → **Share this screen**. On Wayland, pick the screen in the
    system dialog (and allow *remote control* if you want the other person to use your keyboard/mouse).
@@ -41,14 +53,14 @@ The stream opens in its own window. During a session either side can switch cont
 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> toggles fullscreen, …+<kbd>Q</kbd> disconnects. Controllers appear on a Linux
 host through uinput and on a Windows host as virtual Xbox 360 pads (needs the free [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver).
 
-## Audio, and keeping Discord out of it
+<img src="docs/assets/h-audio.svg" alt="Audio without the echo" width="100%">
 
 The host's desktop audio streams to the viewer on both Windows and Fedora. If you're in the same **Discord call** while
 sharing, you don't want your friend hearing everyone twice (themselves included). So by default Penguin Stream **leaves
 voice-chat apps out of the streamed audio**: Discord, TeamSpeak, Zoom, Teams, Mumble and others. You still hear the call
 normally. You can also leave out other apps, or stream only one app (just the game). See [docs/AUDIO.md](docs/AUDIO.md).
 
-## Connectivity: CGNAT, relays, and why friends configure nothing
+<img src="docs/assets/h-network.svg" alt="Connectivity and CGNAT" width="100%">
 
 - **Pairing** travels end-to-end encrypted over public Nostr relays, so there's no server to run and no port to open.
 - **Media** goes **directly peer-to-peer over UDP** (ICE hole punching). That works behind most CGNATs, which use
@@ -60,10 +72,10 @@ normally. You can also leave out other apps, or stream only one app (just the ga
     only 24-hour credentials are ever used on the wire.
   - **Credentials URL:** any HTTPS endpoint returning ICE servers (e.g. Metered).
   - **Your own TURN server:** coturn on a cheap VPS; see [docs/RELAY.md](docs/RELAY.md).
-  
+
   **Save & test relay** performs a real TURN allocation, so "configured" means "proven working".
 
-## Latency design
+<img src="docs/assets/h-latency.svg" alt="Built for low latency" width="100%">
 
 Every stage is chosen for latency first:
 
@@ -73,17 +85,18 @@ Every stage is chosen for latency first:
   the BGRA→YUV conversion (about 3 ms/frame less CPU work at 1440p).
 - **Transport:** an unordered, zero-retransmit DTLS/SCTP data channel. A late frame is dropped rather than delayed, and the host skips
   non-keyframes when the send queue backs up. Loss triggers an immediate keyframe request (< 100 ms recovery).
+- **Encryption:** AES-256-GCM, hardware-accelerated by AES-NI on every x86-64 CPU.
 - **Display:** decoded with slice threads (no frame-threading delay) in a native SDL window, not a browser. By default each frame is
   presented the moment it's decoded (no V-Sync wait).
 - **Input** runs on its own path, and relative mouse motion is coalesced per frame.
 
-## Security
+<img src="docs/assets/h-security.svg" alt="Security" width="100%">
 
-End-to-end encryption uses a Noise XX handshake over DTLS, with 160-bit invitations, four-word verification, and explicit host approval
-for every new device. Relay operators and Nostr relays see only ciphertext. The local control UI is loopback-only and token-protected.
-Read [SECURITY.md](SECURITY.md) for the threat model and what has *not* been independently audited.
+End-to-end encryption uses a Noise XX handshake (`Noise_XX_25519_AESGCM_SHA256`) over DTLS, with 160-bit invitations, four-word
+verification, and explicit host approval for every new device. Relay operators and Nostr relays see only ciphertext. The local control
+UI is loopback-only and token-protected. Read [SECURITY.md](SECURITY.md) for the threat model and what has *not* been independently audited.
 
-## Building from source
+<img src="docs/assets/h-build.svg" alt="Build from source" width="100%">
 
 Needs Node.js ≥ 20, CMake ≥ 3.20, a C++17 compiler, FFmpeg/SDL2/PipeWire/GLib development packages.
 
@@ -91,15 +104,19 @@ Needs Node.js ≥ 20, CMake ≥ 3.20, a C++17 compiler, FFmpeg/SDL2/PipeWire/GLi
 npm ci
 cmake -S media -B media/build && cmake --build media/build -j
 npm run app                 # run the desktop app from source
-npm test                    # 110 tests (incl. a real audio session on PipeWire)
-npm run dist:linux          # -> dist/penguin-stream-<v>-1.fc44.x86_64.rpm (needs rpmbuild)
-npm run dist:win            # -> dist/PenguinStream-<v>-Setup.exe + Portable.exe (needs podman)
+npm test                    # full suite, incl. crypto inside the Electron runtime and a real PipeWire audio session
+npm run dist:linux          # -> dist/penguin-stream-<version>-1.fc44.x86_64.rpm (needs rpmbuild)
+npm run dist:win            # -> dist/PenguinStream-<version>-Setup.exe + Portable.exe (needs podman)
 ```
 
 The Windows build cross-compiles the media engine with MinGW in a Fedora container and packages it in
 electron-builder's Wine container, so nothing gets installed on the build machine. The CLI (`node node/src/cli.mjs host|connect|doctor`)
 is still available for headless use and scripting.
 
-See [LIMITATIONS.md](LIMITATIONS.md) for exactly what has and hasn't been verified, and [CHANGELOG.md](CHANGELOG.md) for what changed.
+See [LIMITATIONS.md](LIMITATIONS.md) for exactly what has and hasn't been verified, and [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 
 MIT licensed. Third-party components: [THIRD-PARTY.md](THIRD-PARTY.md).
+
+<p align="center">
+  <img src="docs/assets/footer.svg" alt="A penguin waddling across the ice" width="100%">
+</p>
