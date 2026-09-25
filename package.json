@@ -1,9 +1,9 @@
 {
   "name": "penguin-stream",
-  "version": "0.10.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Low-friction peer-to-peer remote desktop with CGNAT relay fallback",
+  "description": "Low-latency remote desktop for Windows and Fedora that works behind CGNAT",
   "bin": {
     "penguin-stream": "./node/src/cli.mjs"
   },
@@ -14,7 +14,10 @@
     "host": "node node/src/cli.mjs host",
     "connect": "node node/src/cli.mjs connect",
     "rendezvous": "node node/src/cli.mjs rendezvous",
-    "turn": "node turn/src/server.mjs"
+    "turn": "node turn/src/server.mjs",
+    "app": "electron .",
+    "dist:linux": "scripts/build-desktop.sh linux",
+    "dist:win": "scripts/build-desktop.sh win"
   },
   "dependencies": {
     "@noble/secp256k1": "^3.2.0",
@@ -24,5 +27,10 @@
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3"
+  },
+  "main": "desktop/main.mjs"
 }

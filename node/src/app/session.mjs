@@ -22,6 +22,7 @@ import { Chunker, Reassembler } from '../media/chunker.mjs';
 import { CaptureEngine, ViewEngine } from '../media/engine.mjs';
 import { AudioCapture, AudioPlayer } from '../media/audio.mjs';
 import { createInputValidator, inputClass } from '../media/input.mjs';
+import { resolveRelay, describeRelay } from '../net/relay.mjs';
 
 /** Optional self-hosted rendezvous. Pairing uses public Nostr relays by default. */
 export const DEFAULT_RENDEZVOUS = process.env.PENGUIN_RENDEZVOUS || undefined;
@@ -99,6 +100,23 @@ export function resolveIceServers(opts = {}) {
 }
 
 /**
+ * STUN/TURN from options plus the saved relay. A broken relay must not stop a
+ * session that could connect directly, so failures are reported, not thrown.
+ */
+async function iceServersFor(opts, emit) {
+  const servers = resolveIceServers(opts);
+  if (!opts.relay || opts.relay.mode === 'none' || !opts.relay.mode) return servers;
+  try {
+    const relay = await resolveRelay(opts.relay);
+    emit('log', `relay ready: ${describeRelay(opts.relay)} (used only if a direct path fails)`);
+    return [...servers, ...relay];
+  } catch (err) {
+    emit('log', `relay unavailable (${describeRelay(opts.relay)}): ${err.message} - trying direct only`);
+    return servers;
+  }
+}
+
+/**
  * Host: shares this machine's screen.
  *
  * Emits: 'code', 'consent-request', 'secure', 'stats', 'log', 'closed', 'error'
@@ -145,7 +163,7 @@ export class Host extends EventEmitter {
    * @param {(info) => Promise<boolean>} approve called with { sas, fingerprint, trusted }
    */
   async start(approve) {
-    const iceServers = resolveIceServers(this.opts);
+    const iceServers = await iceServersFor(this.opts, (...a) => this.emit(...a));
 
     this.session = await hostSession({
       code: this.opts.code,
@@ -335,7 +353,7 @@ export class Viewer extends EventEmitter {
       rendezvousUrl: rendezvousUrl || DEFAULT_RENDEZVOUS,
       nostr: this.opts.nostr,
       identity: this.identity.keypair,
-      iceServers: resolveIceServers(this.opts),
+      iceServers: await iceServersFor(this.opts, (...a) => this.emit(...a)),
       iceTransportPolicy: this.opts.forceRelay ? 'relay' : 'all',
       onStatus: (s, d) => this.emit('status', s, d),
       sessionTimeoutMs: this.opts.sessionTimeoutMs ?? 120_000,

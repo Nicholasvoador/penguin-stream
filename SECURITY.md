@@ -29,3 +29,13 @@ Assets: desktop pixels, keyboard/mouse permission, system audio, identity privat
 ## Safe operating envelope
 
 Local development and explicitly approved private-network experiments only. Do not run any component as root/admin. Do not reuse TURN/share/UI secrets; do not put credentials in command arguments. Never publish captured desktop artifacts or private identity files. Keep dependencies current and review their licenses and binary supply chains. Report security defects privately to the project owner; there is no established public security-contact service.
+
+## 1.0 additions: relay credentials and settings
+
+- Relay secrets (TURN password, Cloudflare API token) live only in `settings.json` in the per-user config directory
+  (`~/.config/penguin-stream`, `%APPDATA%\penguin-stream`), written with owner-only permissions on Linux. The UI API never
+  returns them: it only reports whether one is set. Windows ACLs rely on the per-user profile default.
+- A Cloudflare API token can mint TURN credentials billed to that account; treat it like a password. Sessions only ever use
+  24-hour credentials derived from it, and the token itself never goes to the peer.
+- The desktop window loads only the loopback UI origin; navigation elsewhere is blocked and external links open in the system
+  browser. The renderer runs sandboxed with context isolation and no Node integration.

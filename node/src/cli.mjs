@@ -18,6 +18,10 @@ import { startTurnServer } from '../../turn/src/server.mjs';
 import { loadOrCreateIdentity, TrustStore, configDir } from './crypto/identity.mjs';
 import { cleanupTransport } from './transport/peer.mjs';
 import { findMediaBinary, MEDIA_MISSING } from './media/engine.mjs';
+import { SettingsStore } from './app/settings.mjs';
+
+/** The relay saved in the app's Settings also applies to CLI sessions. */
+const savedRelay = () => { try { return new SettingsStore().get().relay; } catch { return undefined; } };
 
 const C = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
@@ -64,6 +68,7 @@ async function cmdHost(args) {
 
   const control = Boolean(args['allow-control']);
   const host = new Host({
+    relay: savedRelay(),
     rendezvousUrl: args.rendezvous || DEFAULT_RENDEZVOUS,
     nostr: args['no-nostr'] ? false : undefined,
     source: args.source,
@@ -172,6 +177,7 @@ async function cmdConnect(args) {
   const viewOnly = Boolean(args['view-only'] || args['no-input']);
   const viewer = new Viewer({
     code,
+    relay: savedRelay(),
     rendezvousUrl: args.rendezvous || DEFAULT_RENDEZVOUS,
     nostr: args['no-nostr'] ? false : undefined,
     forceRelay: Boolean(args['force-relay']),

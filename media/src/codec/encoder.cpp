@@ -9,6 +9,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <cstdlib>
 #include <cstring>
 
 namespace ps {
@@ -85,21 +86,28 @@ bool Encoder::open(const EncoderConfig& cfg, std::string& error) {
   av_log_set_level(AV_LOG_QUIET);
   std::string failures;
   for (const auto& name : candidateEncoders(cfg.preferred)) {
-    std::string err;
-    if (tryOpen(name, cfg_, err)) {
-      backend_ = name;
-      av_log_set_level(savedLevel);
-      return true;
+    // NVENC accepts BGRA and converts on the GPU, which saves a full-frame CPU
+    // colour conversion per frame. Older drivers may refuse RGB input; then
+    // fall back to the classic NV12 path.
+    const bool tryRgb = name == "h264_nvenc" && !std::getenv("PS_NVENC_NV12");
+    for (const bool rgb : tryRgb ? std::vector<bool>{true, false} : std::vector<bool>{false}) {
+      std::string err;
+      if (tryOpen(name, cfg_, rgb, err)) {
+        backend_ = name;
+        av_log_set_level(savedLevel);
+        return true;
+      }
+      failures += (failures.empty() ? "" : "; ") + name + (rgb ? " (rgb)" : "") + ": " + err;
+      close();
     }
-    failures += (failures.empty() ? "" : "; ") + name + ": " + err;
-    close();
   }
   av_log_set_level(savedLevel);
   error = "no usable H.264 encoder (" + failures + ")";
   return false;
 }
 
-bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, std::string& error) {
+bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, bool rgbInput, std::string& error) {
+  rgbInput_ = rgbInput;
   const AVCodec* codec = avcodec_find_encoder_by_name(encoderName.c_str());
   if (!codec) { error = "not built into this ffmpeg"; return false; }
 
@@ -112,9 +120,9 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
   ctx_->framerate = AVRational{cfg.fps, 1};
   ctx_->bit_rate = static_cast<int64_t>(cfg.bitrateKbps) * 1000;
   ctx_->rc_max_rate = ctx_->bit_rate;
-  // A small VBV buffer keeps latency bounded: the encoder cannot bank bits and
-  // emit a huge frame later, which is what produces multi-second stalls.
-  ctx_->rc_buffer_size = static_cast<int>(ctx_->bit_rate / cfg.fps * 2);
+  // Single-frame VBV (as game streamers use): no frame may exceed one frame's
+  // worth of bits, so no frame takes longer than a frame interval to send.
+  ctx_->rc_buffer_size = static_cast<int>(ctx_->bit_rate / cfg.fps);
   ctx_->gop_size = cfg.fps * cfg.gopSeconds;
   ctx_->max_b_frames = 0;                          // B-frames add reorder latency
   ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -146,7 +154,12 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     av_opt_set_int(ctx_->priv_data, "async_depth", 1, 0);
     av_opt_set_int(ctx_->priv_data, "b_depth", 1, 0);
   } else if (encoderName == "h264_nvenc") {
-    ctx_->pix_fmt = AV_PIX_FMT_NV12;
+    // BGR0 == the capture's BGRA byte order on little-endian machines. Tag the
+    // stream BT.601 limited, which is what NVENC's RGB->YUV produces and what
+    // the viewer assumes.
+    ctx_->pix_fmt = rgbInput ? AV_PIX_FMT_BGR0 : AV_PIX_FMT_NV12;
+    ctx_->colorspace = AVCOL_SPC_SMPTE170M;
+    ctx_->color_range = AVCOL_RANGE_MPEG;
     av_opt_set(ctx_->priv_data, "preset", "p1", 0);      // fastest
     av_opt_set(ctx_->priv_data, "tune", "ull", 0);       // ultra-low latency
     av_opt_set(ctx_->priv_data, "rc", "cbr", 0);
@@ -184,7 +197,7 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
   // Staging frame in the encoder's software pixel format.
   swFrame_ = av_frame_alloc();
   if (!swFrame_) { error = "av_frame_alloc failed"; return false; }
-  swFrame_->format = hw ? AV_PIX_FMT_NV12 : ctx_->pix_fmt;
+  swFrame_->format = hw && !rgbInput_ ? AV_PIX_FMT_NV12 : ctx_->pix_fmt;
   swFrame_->width = cfg.width;
   swFrame_->height = cfg.height;
   ret = av_frame_get_buffer(swFrame_, 32);
@@ -197,11 +210,13 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     if (ret < 0) { error = "av_hwframe_get_buffer: " + avErr(ret); return false; }
   }
 
-  sws_ = sws_getContext(cfg.width, cfg.height, AV_PIX_FMT_BGRA,
-                        cfg.width, cfg.height,
-                        static_cast<AVPixelFormat>(swFrame_->format),
-                        SWS_BILINEAR, nullptr, nullptr, nullptr);
-  if (!sws_) { error = "sws_getContext failed"; return false; }
+  if (!rgbInput_) {
+    sws_ = sws_getContext(cfg.width, cfg.height, AV_PIX_FMT_BGRA,
+                          cfg.width, cfg.height,
+                          static_cast<AVPixelFormat>(swFrame_->format),
+                          SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!sws_) { error = "sws_getContext failed"; return false; }
+  }
 
   pkt_ = av_packet_alloc();
   if (!pkt_) { error = "av_packet_alloc failed"; return false; }
@@ -246,9 +261,13 @@ bool Encoder::encodeBGRA(const uint8_t* bgra, int stride, uint64_t pts_us,
   int ret = av_frame_make_writable(swFrame_);
   if (ret < 0) { error = "av_frame_make_writable: " + avErr(ret); return false; }
 
-  const uint8_t* srcSlice[1] = {bgra};
-  const int srcStride[1] = {stride};
-  sws_scale(sws_, srcSlice, srcStride, 0, cfg_.height, swFrame_->data, swFrame_->linesize);
+  if (rgbInput_) {
+    av_image_copy_plane(swFrame_->data[0], swFrame_->linesize[0], bgra, stride, cfg_.width * 4, cfg_.height);
+  } else {
+    const uint8_t* srcSlice[1] = {bgra};
+    const int srcStride[1] = {stride};
+    sws_scale(sws_, srcSlice, srcStride, 0, cfg_.height, swFrame_->data, swFrame_->linesize);
+  }
 
   AVFrame* toEncode = swFrame_;
   if (hwFrame_) {
@@ -286,7 +305,7 @@ void Encoder::applyBitrate(int bitrateKbps) {
   cfg_.bitrateKbps = bitrateKbps;
   ctx_->bit_rate = static_cast<int64_t>(bitrateKbps) * 1000;
   ctx_->rc_max_rate = ctx_->bit_rate;
-  ctx_->rc_buffer_size = static_cast<int>(ctx_->bit_rate / (cfg_.fps > 0 ? cfg_.fps : 60) * 2);
+  ctx_->rc_buffer_size = static_cast<int>(ctx_->bit_rate / (cfg_.fps > 0 ? cfg_.fps : 60));
 }
 
 }  // namespace ps

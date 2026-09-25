@@ -54,11 +54,18 @@ function initLogger(level = 'error') {
  * @param {Array<string|{urls?:string,hostname?:string,port?:number,username?:string,password?:string,credential?:string}>} servers
  * @returns {Array} shape libdatachannel expects
  */
+// libjuice (node-datachannel's ICE agent) relays over UDP only and keeps at
+// most two relay entries; TCP/TLS TURN URLs would only produce errors.
+const MAX_TURN_SERVERS = 2;
+
 export function normalizeIceServers(servers = []) {
   const out = [];
+  let turns = 0;
   for (const s of servers) {
     if (typeof s === 'string') { out.push(s); continue; }
     if (s.hostname && s.port) {
+      if (s.relayType && s.relayType !== 'TurnUdp') continue;
+      if (s.relayType && turns++ >= MAX_TURN_SERVERS) continue;
       out.push({
         hostname: s.hostname,
         port: s.port,
@@ -68,21 +75,24 @@ export function normalizeIceServers(servers = []) {
       });
       continue;
     }
-    const url = s.urls || s.url;
-    if (!url) continue;
-    const m = /^(stun|turn|turns):([^:?]+)(?::(\d+))?/i.exec(url);
-    if (!m) continue;
-    const [, scheme, host, port] = m;
-    const entry = {
-      hostname: host,
-      port: port ? Number(port) : (scheme.toLowerCase() === 'turns' ? 5349 : 3478),
-    };
-    if (s.username) entry.username = s.username;
-    if (s.credential || s.password) entry.password = s.credential || s.password;
-    if (scheme.toLowerCase().startsWith('turn')) {
-      entry.relayType = scheme.toLowerCase() === 'turns' ? 'TurnTls' : 'TurnUdp';
+    const urls = Array.isArray(s.urls) ? s.urls : [s.urls || s.url];
+    for (const url of urls) {
+      if (typeof url !== 'string') continue;
+      const m = /^(stun|turn|turns):(\[[0-9a-f:.]+\]|[^:?]+)(?::(\d+))?(?:\?transport=(udp|tcp))?/i.exec(url);
+      if (!m) continue;
+      const [, rawScheme, rawHost, port, transport] = m;
+      const scheme = rawScheme.toLowerCase();
+      const host = rawHost.replace(/^\[|\]$/g, '');
+      const entry = { hostname: host, port: port ? Number(port) : (scheme === 'turns' ? 5349 : 3478) };
+      if (scheme.startsWith('turn')) {
+        if (scheme === 'turns' || transport?.toLowerCase() === 'tcp' || entry.port === 53) continue;
+        if (turns++ >= MAX_TURN_SERVERS) continue;
+        entry.relayType = 'TurnUdp';
+        if (s.username) entry.username = s.username;
+        if (s.credential || s.password) entry.password = s.credential || s.password;
+      }
+      out.push(entry);
     }
-    out.push(entry);
   }
   return out;
 }

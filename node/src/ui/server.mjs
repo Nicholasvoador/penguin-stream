@@ -20,10 +20,12 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 
-import { Host, Viewer, DEFAULT_RENDEZVOUS } from '../app/session.mjs';
+import { Host, Viewer, DEFAULT_RENDEZVOUS, APP_VERSION } from '../app/session.mjs';
 import { normalizeShareCode, parseInvitation } from '../signal/code.mjs';
 import { loadOrCreateIdentity, TrustStore } from '../crypto/identity.mjs';
 import { cleanupTransport } from '../transport/peer.mjs';
+import { SettingsStore } from '../app/settings.mjs';
+import { runNetcheck } from '../net/netcheck.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(HERE, 'public');
@@ -42,11 +44,13 @@ function isLoopbackHost(value) {
   return name === '127.0.0.1' || name === 'localhost' || name === '[::1]' || name === '::1';
 }
 
-export async function startUi({ port = 47800, open = true, HostClass = Host, ViewerClass = Viewer,
+export async function startUi({ port = 47800, open = true, quiet = false, HostClass = Host, ViewerClass = Viewer,
   consentTimeoutMs = 120_000 } = {}) {
   const token = crypto.randomBytes(24).toString('base64url');
   const identity = loadOrCreateIdentity();
   const trust = new TrustStore();
+  const settings = new SettingsStore();
+  let netcheck = null;   // in-flight check, shared by concurrent callers
 
   /** @type {{kind:'host'|'viewer', instance:any}|null} */
   let active = null;
@@ -109,6 +113,7 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
     viewerState: state.viewerState,
     hostPermissions: state.hostPermissions,
     platform: process.platform,
+    version: APP_VERSION,
   });
 
   const stopActive = (reason = 'stopped by user') => {
@@ -134,17 +139,21 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
 
   /* ----------------------------- actions ----------------------------- */
 
-  // Network options shared by both roles. Credentials stay in memory only.
+  // Network options shared by both roles. Request fields override the saved
+  // settings; the saved relay (with its secrets) never travels through the UI.
   function commonOptions(opts) {
     const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
+    const saved = settings.get();
+    const pick = (k) => (opts[k] !== undefined ? opts[k] : saved[k]);
     return {
-      rendezvousUrl: str(opts.rendezvous) || DEFAULT_RENDEZVOUS,
-      forceRelay: Boolean(opts.forceRelay),
-      noStun: opts.noStun === true,
-      stun: str(opts.stun),
+      rendezvousUrl: str(pick('rendezvous')) || DEFAULT_RENDEZVOUS,
+      forceRelay: pick('forceRelay') === true,
+      noStun: pick('noStun') === true,
+      stun: str(pick('stun')),
       turn: str(opts.turn),
       turnUser: str(opts.turnUser),
       turnPassword: typeof opts.turnPassword === 'string' && opts.turnPassword ? opts.turnPassword : undefined,
+      relay: saved.relay,
     };
   }
 
@@ -291,10 +300,11 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
         return;
       }
 
-      const method = url.pathname === '/api/state' ? 'GET' : 'POST';
-      if (req.method !== method) {
+      const allowed = url.pathname === '/api/state' ? ['GET']
+        : url.pathname === '/api/settings' ? ['GET', 'POST'] : ['POST'];
+      if (!allowed.includes(req.method)) {
         req.resume(); // Drain rejected bodies so a keep-alive socket remains framed.
-        res.writeHead(405, { allow: method }).end(); return;
+        res.writeHead(405, { allow: allowed.join(', ') }).end(); return;
       }
       let body = {};
       if (req.method === 'POST') {
@@ -318,6 +328,13 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
       try {
         switch (url.pathname) {
           case '/api/state': return json(publicState());
+          case '/api/settings':
+            if (req.method === 'POST') settings.update(body);
+            return json(settings.publicSettings());
+          case '/api/netcheck': {
+            netcheck ??= runNetcheck(settings.get().relay).finally(() => { netcheck = null; });
+            return json(await netcheck);
+          }
           case '/api/host': return json(await startHost(body));
           case '/api/connect': return json(await startViewer(body));
           case '/api/stop': stopActive('stopped by user'); return json({ ok: true });
@@ -423,9 +440,11 @@ export async function startUi({ port = 47800, open = true, HostClass = Host, Vie
   const actualPort = server.address().port;
   const link = `http://127.0.0.1:${actualPort}/#token=${token}`;
 
-  console.log('\n  penguin-stream is running.\n');
-  console.log(`  Local UI: http://127.0.0.1:${actualPort}/ (authorized URL opened in browser; token omitted from logs)\n`);
-  console.log('  (private local capability URL; do not share it)\n');
+  if (!quiet) {
+    console.log('\n  penguin-stream is running.\n');
+    console.log(`  Local UI: http://127.0.0.1:${actualPort}/ (authorized URL opened in browser; token omitted from logs)\n`);
+    console.log('  (private local capability URL; do not share it)\n');
+  }
 
   if (open) openBrowser(link);
 

@@ -70,7 +70,7 @@ class Encoder {
   int height() const { return cfg_.height; }
 
  private:
-  bool tryOpen(const std::string& encoderName, const EncoderConfig& cfg, std::string& error);
+  bool tryOpen(const std::string& encoderName, const EncoderConfig& cfg, bool rgbInput, std::string& error);
   void close();
   bool drain(const std::function<void(const EncodedPacket&)>& sink, std::string& error);
 
@@ -82,6 +82,7 @@ class Encoder {
   AVPacket* pkt_ = nullptr;
   AVBufferRef* hwDeviceCtx_ = nullptr;
   SwsContext* sws_ = nullptr;
+  bool rgbInput_ = false;        // encoder converts BGRA on the GPU; no CPU colour conversion
   std::vector<uint8_t> extradata_;
   void applyBitrate(int bitrateKbps);
   static bool hasParameterSets(const uint8_t* data, size_t size);
