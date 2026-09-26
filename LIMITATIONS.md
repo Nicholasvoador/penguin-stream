@@ -31,8 +31,12 @@ This page is deliberately blunt: it lists what was actually checked for this rel
 
 ## Known behaviour
 
-- Wayland asks for screen-sharing consent on every share (compositor policy). The portal captures one monitor, and the capture
-  path copies through the CPU (no DMA-BUF zero-copy yet).
+- Wayland asks for screen-sharing consent the first time. After that the choice is remembered, until you revoke it or the
+  monitor layout changes. The capture path copies through the CPU (no DMA-BUF zero-copy yet).
+- Cropping one monitor out of a whole-workspace share uses the monitor layout reported by `kscreen-doctor`/`xrandr`.
+  If the desktop is scaled unusually and the crop is wrong, choose the monitor in the system prompt instead.
+- The latency meter's network figure depends on clock synchronization. Across the internet it is accurate to within
+  about half the difference between the upload and download delays (usually a few ms).
 - The relay uses UDP only (libjuice limitation). Networks that block all outbound UDP cannot connect.
 - The custom Noise implementation is tested but has not been independently audited. See [SECURITY.md](SECURITY.md).
 - Direct connections reveal your IP to the peer. Use **Relay only** to hide it (adds latency).

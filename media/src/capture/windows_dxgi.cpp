@@ -300,20 +300,19 @@ class DxgiSource final : public CaptureSource {
       return false;
     };
     monitor_ = 0;
-    primaryDefault_ = opts.display.empty();
+    wantRect_ = opts.monitor;
+    primaryDefault_ = opts.display.empty() && !wantRect_.valid();
     for (char c : opts.display) {
       if (c < '0' || c > '9' || monitor_ > 1000) return fail("DXGI display must be a small nonnegative monitor index");
       monitor_ = monitor_ * 10 + static_cast<unsigned>(c - '0');
     }
-    if (opts.width < 0 || opts.height < 0 || opts.fps < 0 || opts.fps > 1000)
-      return fail("DXGI requires nonnegative dimensions and fps in 0..1000 (0 means 60)");
+    if (opts.fps < 0 || opts.fps > 1000)
+      return fail("DXGI requires fps in 0..1000 (0 means 60)");
+    // Stream resolution is applied by the encoder's scaler; capture is always native.
 
     if (!duplicate(error)) return fail(error);
     width_ = static_cast<int>(nativeWidth_ & ~1u);
     height_ = static_cast<int>(nativeHeight_ & ~1u);
-    if ((opts.width && opts.width != width_ && opts.width != static_cast<int>(nativeWidth_)) ||
-        (opts.height && opts.height != height_ && opts.height != static_cast<int>(nativeHeight_)))
-      return fail("DXGI resizing is not supported; omit width/height or request native dimensions");
     stride_ = width_ * 4;
     try {
       desktop_.assign(static_cast<size_t>(stride_) * height_, 0);
@@ -347,7 +346,13 @@ class DxgiSource final : public CaptureSource {
       error = "DXGI capture is not running; call start() before nextFrame()";
       return false;
     }
-    std::this_thread::sleep_until(nextDue_);
+    // Latency-first pacing: wake a little before the cadence slot, then take
+    // the newest desktop image the moment Windows presents it (or right away
+    // if one is already waiting). Sleeping to a fixed tick and grabbing
+    // whatever was there added up to a whole frame of delay.
+    const auto slack = period_ / 4;
+    std::this_thread::sleep_until(nextDue_ - slack);
+    acquireTimeoutMs_ = 100;  // still desktop: repeat the last image at ~10 fps
 
     if (!duplication_) {
       // Recovering from access loss: retry a few times per second while the
@@ -394,19 +399,16 @@ class DxgiSource final : public CaptureSource {
       }
     }
 
+    const uint64_t captured = steadyMicros();
     std::memcpy(buffer_.data(), desktop_.data(), buffer_.size());
     compositePointer(pointer_, buffer_.data(), width_, height_, stride_);
 
     const auto now = Clock::now();
-    if (!haveFrame_) {
-      epoch_ = now;
-      lastPts_ = 0;
-    } else {
-      const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - epoch_).count();
-      lastPts_ = std::max(lastPts_ + 1, static_cast<uint64_t>(elapsed));
-    }
+    lastPts_ = std::max(lastPts_ + 1, steadyMicros());
     haveFrame_ = true;
-    nextDue_ = now + period_;  // never burst to catch up after a slow consumer
+    // Keep an even cadence, but never burst to catch up after a slow consumer.
+    nextDue_ = (now - nextDue_ > period_) ? now + period_ : nextDue_ + period_;
+    out.captured_us = captured;
     out.bgra = buffer_.data();
     out.stride = stride_;
     out.width = width_;
@@ -447,7 +449,11 @@ class DxgiSource final : public CaptureSource {
         // Without an explicit index, share the main monitor: the one whose
         // desktop rectangle starts at the origin.
         const bool primary = desc.DesktopCoordinates.left == 0 && desc.DesktopCoordinates.top == 0;
-        if (primaryDefault_ ? primary : remaining == 0) {
+        // A monitor picked in the UI is identified by its desktop position,
+        // which (unlike the enumeration index) survives GPU/driver reordering.
+        const bool byRect = wantRect_.valid() && desc.DesktopCoordinates.left == wantRect_.x &&
+                            desc.DesktopCoordinates.top == wantRect_.y;
+        if (wantRect_.valid() ? byRect : (primaryDefault_ ? primary : remaining == 0)) {
           selectedAdapter = adapter;
           selectedOutput = output;
           outputDesc = desc;
@@ -455,6 +461,12 @@ class DxgiSource final : public CaptureSource {
         }
         --remaining;
       }
+    }
+    if (!selectedOutput && wantRect_.valid()) {
+      // The layout changed since the monitor was picked: fall back to the index.
+      wantRect_ = {};
+      primaryDefault_ = true;
+      return duplicate(error);
     }
     if (!selectedOutput && primaryDefault_) {
       // No output at the origin (unusual layouts): fall back to the first one.
@@ -524,7 +536,7 @@ class DxgiSource final : public CaptureSource {
   HRESULT acquire(std::string& error) {
     DXGI_OUTDUPL_FRAME_INFO info{};
     ComPtr<IDXGIResource> resource;
-    HRESULT hr = duplication_->AcquireNextFrame(haveFrame_ ? 0 : 1000, &info, resource.GetAddressOf());
+    HRESULT hr = duplication_->AcquireNextFrame(haveFrame_ ? acquireTimeoutMs_ : 1000, &info, resource.GetAddressOf());
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) return hr;
     if (FAILED(hr)) { error = dxgiError("AcquireNextFrame", hr); return hr; }
     AcquiredFrame acquired(duplication_.Get());
@@ -598,6 +610,8 @@ class DxgiSource final : public CaptureSource {
   int width_ = 0, height_ = 0, stride_ = 0;
   bool running_ = false, haveFrame_ = false;
   uint64_t lastPts_ = 0;
+  UINT acquireTimeoutMs_ = 0;
+  Rect wantRect_;
   Clock::time_point epoch_{}, nextDue_{}, retryAt_{};
   std::chrono::microseconds period_{16666};
 };
@@ -627,7 +641,15 @@ class GdiSource final : public CaptureSource {
       return TRUE;
     }, reinterpret_cast<LPARAM>(&ctx));
     if (monitors.empty()) { error = "GDI: no monitors found"; return false; }
-    if (opts.display.empty()) {
+    const RECT* byRect = nullptr;
+    if (opts.monitor.valid()) {
+      // Same monitor the user picked from the DXGI list: match by position.
+      for (const RECT& m : monitors)
+        if (m.left == opts.monitor.x && m.top == opts.monitor.y) { byRect = &m; break; }
+    }
+    if (byRect) {
+      rect_ = *byRect;
+    } else if (opts.display.empty()) {
       rect_ = (primary.right > primary.left) ? primary : monitors[0];
     } else {
       unsigned index = 0;
@@ -645,11 +667,6 @@ class GdiSource final : public CaptureSource {
     }
     width_ = nativeW & ~1;
     height_ = nativeH & ~1;
-    if ((opts.width && opts.width != width_ && opts.width != nativeW) ||
-        (opts.height && opts.height != height_ && opts.height != nativeH)) {
-      error = "GDI resizing is not supported; omit width/height";
-      return false;
-    }
     screen_ = GetDC(nullptr);
     mem_ = CreateCompatibleDC(screen_);
     BITMAPINFO bmi{};
@@ -708,6 +725,7 @@ class GdiSource final : public CaptureSource {
       }
     }
     GdiFlush();
+    out.captured_us = steadyMicros();
     const auto now = Clock::now();
     nextDue_ = now + period_;
     const uint64_t pts = static_cast<uint64_t>(
@@ -741,6 +759,46 @@ class GdiSource final : public CaptureSource {
   std::chrono::microseconds period_{16666};
 };
 }  // namespace
+
+std::string listWindowsMonitorsJson() {
+  makeDpiAware();
+  struct Mon { RECT rc; bool primary; std::wstring device; };
+  std::vector<Mon> mons;
+  EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM data) -> BOOL {
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(m, &mi))
+      reinterpret_cast<std::vector<Mon>*>(data)->push_back({mi.rcMonitor, (mi.dwFlags & MONITORINFOF_PRIMARY) != 0, mi.szDevice});
+    return TRUE;
+  }, reinterpret_cast<LPARAM>(&mons));
+  // Printable ASCII only (JSON-safe); "\\.\DISPLAY1" becomes "DISPLAY1".
+  auto narrow = [](const std::wstring& w) {
+    std::string s;
+    for (wchar_t c : w) {
+      if (c == L'\\') { s.clear(); continue; }
+      s += (c >= 32 && c < 127 && c != '"') ? static_cast<char>(c) : '?';
+    }
+    return s;
+  };
+  std::string out = "[";
+  int n = 0;
+  for (const auto& m : mons) {
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    std::string label = "Display " + std::to_string(n + 1);
+    if (EnumDisplayDevicesW(m.device.c_str(), 0, &dd, 0) && dd.DeviceString[0]) label = narrow(dd.DeviceString);
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    int hz = 0;
+    if (EnumDisplaySettingsW(m.device.c_str(), ENUM_CURRENT_SETTINGS, &dm)) hz = static_cast<int>(dm.dmDisplayFrequency);
+    if (n++) out += ",";
+    out += "{\"name\":\"" + narrow(m.device) + "\",\"label\":\"" + label + "\",\"x\":" +
+           std::to_string(m.rc.left) + ",\"y\":" + std::to_string(m.rc.top) + ",\"w\":" +
+           std::to_string(m.rc.right - m.rc.left) + ",\"h\":" + std::to_string(m.rc.bottom - m.rc.top) +
+           ",\"hz\":" + std::to_string(hz) + ",\"primary\":" + (m.primary ? "true" : "false") + "}";
+  }
+  return out + "]";
+}
 
 std::unique_ptr<CaptureSource> makeDxgiSource() { return std::make_unique<DxgiSource>(); }
 std::unique_ptr<CaptureSource> makeGdiSource() { return std::make_unique<GdiSource>(); }

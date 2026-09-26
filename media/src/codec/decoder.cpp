@@ -22,14 +22,18 @@ std::string avErr(int code) {
 
 Decoder::Decoder() = default;
 
-Decoder::~Decoder() {
-  if (sws_) sws_freeContext(sws_);
+Decoder::~Decoder() { close(); }
+
+void Decoder::close() {
+  if (sws_) { sws_freeContext(sws_); sws_ = nullptr; }
+  scalerW_ = scalerH_ = 0;
   if (pkt_) av_packet_free(&pkt_);
   if (frame_) av_frame_free(&frame_);
   if (ctx_) avcodec_free_context(&ctx_);
 }
 
 bool Decoder::open(const std::vector<uint8_t>& extradata, std::string& error) {
+  close();  // a new stream configuration (e.g. resolution change) replaces the old decoder
   const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
   if (!codec) { error = "no H.264 decoder available"; return false; }
 

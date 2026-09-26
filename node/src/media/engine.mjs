@@ -148,6 +148,13 @@ export class CaptureEngine extends EventEmitter {
     if (this.opts.height) args.push('--height', String(this.opts.height));
     if (this.opts.maxFrames) args.push('--max-frames', String(this.opts.maxFrames));
     if (this.opts.display !== undefined && this.opts.display !== '') args.push('--display', String(this.opts.display));
+    const rect = (r) => (r && [r.x, r.y, r.w, r.h].every(Number.isFinite) && r.w > 0 && r.h > 0
+      ? `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}` : null);
+    if (rect(this.opts.monitor)) args.push('--monitor', rect(this.opts.monitor));
+    if (rect(this.opts.workspace)) args.push('--workspace', rect(this.opts.workspace));
+    if (typeof this.opts.restoreToken === 'string' && /^[\w-]{1,256}$/.test(this.opts.restoreToken)) {
+      args.push('--restore-token', this.opts.restoreToken);
+    }
     if (this.opts.allowInput === true) args.push('--allow-input');
     if (this.opts.allowGamepad === true) args.push('--allow-gamepad');
     // Ask the OS for remote-control permission up front (Wayland prompts only
@@ -206,6 +213,7 @@ export class CaptureEngine extends EventEmitter {
         try { m = JSON.parse(msg.payload.toString('utf8')); } catch { break; }
         if (m?.t === 'input-status') this.emit('input-status', m);
         else if (m?.t === 'rumble') this.emit('rumble', m);
+        else if (m?.t === 'restore-token' && typeof m.token === 'string') this.emit('restore-token', m.token);
         break;
       }
       default:
@@ -305,6 +313,7 @@ export class ViewEngine extends EventEmitter {
           try {
             const m = JSON.parse(msg.payload.toString('utf8'));
             if (m?.t === 'viewer-state') this.emit('viewer-state', m);
+            else if (m?.t === 'view-stats') this.emit('view-stats', m);
           } catch { /* ignore */ }
         } else if (msg.type === MsgType.Log) {
           this.emit('log', msg.payload.toString('utf8'));

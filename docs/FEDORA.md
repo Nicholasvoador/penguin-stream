@@ -25,8 +25,9 @@ encoder was chosen (`encoding with h264_nvenc`).
 
 ## Wayland
 
-- Every share shows KDE/GNOME's screen-sharing dialog: pick the monitor, and tick *Allow remote interaction* to allow
-  keyboard/mouse control. This is the compositor's security boundary; the app can't skip it.
+- The first share shows KDE/GNOME's screen-sharing dialog: pick the monitor you chose in Penguin Stream, and tick *Allow
+  remote interaction* to allow keyboard/mouse control. The choice is remembered, so later shares start straight away.
+  If you pick "Full workspace", Penguin Stream still streams only the monitor chosen on its Home page.
 - Controllers on a Linux host use `/dev/uinput`, which must be writable by your user. If the app reports controllers as
   unavailable, `sudo dnf install steam-devices` adds the standard udev rule (log out and back in afterwards).
 

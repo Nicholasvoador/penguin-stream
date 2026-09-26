@@ -62,7 +62,10 @@ let settings = null;
 let saveTimer;
 
 function applySettingsToForm(s) {
+  renderProfiles(s);
+  renderResolution(s.resolution);
   for (const el of document.querySelectorAll('[data-setting]')) {
+    if (el.id === 'opt-resolution' || el.id === 'opt-monitor') continue;  // handled by their renderers
     const v = s[el.dataset.setting];
     if (el.type === 'checkbox') el.checked = Boolean(v);
     else if (el.tagName === 'SELECT') {
@@ -90,6 +93,8 @@ function readSetting(el) {
 async function saveSettings(patch) {
   try {
     settings = await api('settings', patch);
+    // Changing a stream setting by hand means we are no longer on a preset.
+    if (PROFILE_KEYS.some((k) => k in patch) && !('profile' in patch)) markCustomProfile();
     $('settings-saved').textContent = 'Saved ✓';
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => { $('settings-saved').textContent = 'Saved automatically'; }, 1600);
@@ -97,9 +102,158 @@ async function saveSettings(patch) {
 }
 
 for (const el of document.querySelectorAll('[data-setting]')) {
+  if (el.id === 'opt-resolution') continue;  // has its own handler (custom sizes)
   const handler = () => saveSettings({ [el.dataset.setting]: readSetting(el) });
   el.addEventListener(el.tagName === 'INPUT' && el.type !== 'checkbox' ? 'change' : 'input', handler);
 }
+
+/* ------------------------------ profiles ------------------------------ */
+
+const PROFILE_KEYS = ['fps', 'bitrate', 'resolution', 'encoder', 'lowLatency', 'adaptiveBitrate', 'audio', 'forceRelay'];
+
+function allProfiles(s = settings) {
+  return [...(s?.builtinProfiles || []), ...(s?.profiles || [])];
+}
+
+function profileMatches(p, s) {
+  return PROFILE_KEYS.every((k) => p.values[k] === undefined || p.values[k] === s[k]);
+}
+
+function renderProfiles(s) {
+  const sel = $('opt-profile');
+  sel.textContent = '';
+  const list = allProfiles(s);
+  const current = list.find((p) => p.id === s.profile && profileMatches(p, s));
+  for (const p of list) sel.add(new Option(p.builtin ? p.name : `★ ${p.name}`, p.id));
+  if (!current) sel.add(new Option('Custom (your changes)', 'custom'));
+  sel.value = current ? current.id : 'custom';
+  $('profile-hint').textContent = current?.hint || (current ? 'Your saved profile.' : 'Settings changed by hand. Save them as a profile in Settings to reuse them.');
+
+  const box = $('profile-list');
+  box.textContent = '';
+  for (const p of list) {
+    const row = document.createElement('div');
+    row.className = `profile-row${current?.id === p.id ? ' active' : ''}`;
+    const text = document.createElement('div');
+    const name = document.createElement('b');
+    name.textContent = p.name;
+    const sub = document.createElement('small');
+    const v = p.values;
+    sub.textContent = [resolutionLabel(v.resolution), v.fps && `${v.fps} fps`, v.bitrate && `${v.bitrate / 1000} Mbps`,
+      v.adaptiveBitrate === false ? 'fixed bitrate' : null].filter(Boolean).join(' · ');
+    text.append(name, sub);
+    const actions = document.createElement('div');
+    const use = document.createElement('button');
+    use.className = 'btn';
+    use.type = 'button';
+    use.textContent = current?.id === p.id ? 'In use' : 'Use';
+    use.disabled = current?.id === p.id;
+    use.onclick = () => applyProfile(p.id);
+    actions.append(use);
+    if (!p.builtin) {
+      const del = document.createElement('button');
+      del.className = 'btn ghost';
+      del.type = 'button';
+      del.textContent = 'Delete';
+      del.onclick = async () => {
+        try { settings = await api('profile', { action: 'delete', id: p.id }); applySettingsToForm(settings); }
+        catch (e) { toast(e.message, true); }
+      };
+      actions.append(del);
+    }
+    row.append(text, actions);
+    box.append(row);
+  }
+}
+
+function markCustomProfile() { if (settings) renderProfiles(settings); }
+
+async function applyProfile(id) {
+  try {
+    settings = await api('profile', { action: 'apply', id });
+    applySettingsToForm(settings);
+    const p = allProfiles().find((x) => x.id === id);
+    toast(`Profile “${p?.name || id}” applied${lastState?.mode === 'hosting-live' ? ' (bitrate changed live; resolution and fps apply on the next share)' : ''}`);
+  } catch (e) { toast(e.message, true); }
+}
+
+$('opt-profile').onchange = () => { const id = $('opt-profile').value; if (id !== 'custom') applyProfile(id); };
+$('profile-save').onsubmit = async (e) => {
+  e.preventDefault();
+  const name = $('profile-name').value.trim();
+  if (!name) { $('profile-name').focus(); return; }
+  try {
+    settings = await api('profile', { action: 'save', name });
+    applySettingsToForm(settings);
+    $('profile-name').value = '';
+    toast(`Saved “${name}”`);
+  } catch (err) { toast(err.message, true); }
+};
+
+/* ------------------------------ resolution ------------------------------ */
+
+function resolutionLabel(res) {
+  if (!res) return null;
+  if (res === 'native') return 'native resolution';
+  if (/^\d+x\d+$/.test(res)) return res.replace('x', '×');
+  return `${res}p`;
+}
+
+function renderResolution(res) {
+  const sel = $('opt-resolution');
+  const custom = /^\d+x\d+$/.test(res || '');
+  for (const o of [...sel.options]) if (o.dataset.custom) o.remove();
+  if (custom) {
+    const o = new Option(`${res.replace('x', '×')} (custom)`, res);
+    o.dataset.custom = '1';
+    sel.add(o, sel.options[sel.options.length - 1]);
+  }
+  sel.value = res || '1080';
+  $('custom-res').hidden = true;
+}
+
+$('opt-resolution').onchange = () => {
+  const v = $('opt-resolution').value;
+  if (v === 'custom') {
+    $('custom-res').hidden = false;
+    $('res-w').focus();
+    return;
+  }
+  $('custom-res').hidden = true;
+  saveSettings({ resolution: v }).then(() => renderResolution(settings.resolution));
+};
+$('res-apply').onclick = async () => {
+  const w = parseInt($('res-w').value, 10), h = parseInt($('res-h').value, 10);
+  if (!(w >= 320 && w <= 7680 && h >= 240 && h <= 4320)) { toast('Use a width of 320–7680 and a height of 240–4320', true); return; }
+  await saveSettings({ resolution: `${w}x${h}` });
+  renderResolution(settings.resolution);
+};
+
+/* ------------------------------ monitors ------------------------------ */
+
+let monitors = [];
+async function loadMonitors() {
+  try { monitors = (await api('monitors')).monitors || []; } catch { monitors = []; }
+  const sel = $('opt-monitor');
+  sel.textContent = '';
+  const primary = monitors.find((m) => m.primary);
+  sel.add(new Option(primary ? `Main monitor (${primary.label})` : 'Main monitor', 'primary'));
+  for (const m of monitors) sel.add(new Option(`${m.label}${m.primary ? ' — main' : ''}`, m.id));
+  sel.add(new Option('Let me choose each time', 'all'));
+  const want = settings?.monitor || 'primary';
+  sel.value = [...sel.options].some((o) => o.value === want) ? want : 'primary';
+  describeMonitor();
+}
+function describeMonitor() {
+  const v = $('opt-monitor').value;
+  const wayland = lastState?.platform === 'linux';
+  $('monitor-hint').textContent = v === 'all'
+    ? (wayland ? 'Your desktop asks which screen to share every time.' : 'The main monitor is shared.')
+    : wayland ? 'Only this monitor is streamed. The first time, confirm the screen in the system prompt; it is remembered after that.'
+      : 'Only this monitor is streamed.';
+}
+$('opt-monitor').addEventListener('input', describeMonitor);
+$('opt-monitor').addEventListener('focus', () => { if (!lastState?.mode?.startsWith('hosting')) loadMonitors(); });
 
 /* relay */
 let relayMode = 'none';
@@ -220,7 +374,100 @@ function renderMetrics(prefix, state) {
   $(`${prefix}-metric-frames`).textContent = prefix === 'host'
     ? `${s.framesSent ?? 0}${s.dropped ? ` · ${s.dropped} skipped` : ''}`
     : `${s.framesShown ?? 0}${s.lost ? ` · ${s.lost} lost` : ''}`;
+  renderLatency(prefix, s.latency, cfg);
 }
+
+/* ------------------------------ latency panel ------------------------------ */
+
+const STAGES = [
+  { key: 'captureMs', label: 'Capture', cls: 's-cap' },
+  { key: 'encodeMs', label: 'Encode', cls: 's-enc' },
+  { key: 'networkMs', label: 'Network', cls: 's-net' },
+  { key: 'decodeMs', label: 'Decode', cls: 's-dec' },
+  { key: 'displayMs', label: 'Display', cls: 's-dis' },
+];
+const fmt = (v) => (Number.isFinite(v) ? (v < 10 ? v.toFixed(1) : Math.round(v)) : '—');
+
+function renderLatency(prefix, lat, cfg) {
+  const card = $(`${prefix}-latency`);
+  if (!lat) { card.hidden = true; return; }
+  card.hidden = false;
+  // The host sees the viewer's report (network + totals) when available.
+  const view = prefix === 'host' ? {
+    captureMs: lat.captureMs, encodeMs: lat.encodeMs,
+    networkMs: lat.viewer?.networkMs, totalMs: lat.viewer?.totalMs,
+  } : lat;
+  const total = $(`${prefix}-latency-total`);
+  if (Number.isFinite(view.totalMs)) {
+    const t = view.totalMs;
+    total.textContent = `${fmt(t)} ms capture → screen`;
+    total.className = `hint-inline lat-total ${t < 40 ? 'good' : t < 80 ? 'ok' : 'bad'}`;
+  } else {
+    total.textContent = prefix === 'viewer' && !lat.synced ? 'syncing clocks…' : 'measuring…';
+    total.className = 'hint-inline';
+  }
+  const bar = $(`${prefix}-lat-bar`);
+  const legend = $(`${prefix}-lat-legend`);
+  bar.textContent = '';
+  legend.textContent = '';
+  const parts = STAGES.map((st) => ({ ...st, v: view[st.key] })).filter((p) => Number.isFinite(p.v));
+  const sum = parts.reduce((a, p) => a + Math.max(p.v, 0.2), 0) || 1;
+  for (const p of parts) {
+    const seg = document.createElement('i');
+    seg.className = p.cls;
+    seg.style.flexGrow = String(Math.max(p.v, 0.2) / sum);
+    seg.title = `${p.label}: ${fmt(p.v)} ms`;
+    bar.append(seg);
+    const item = document.createElement('span');
+    const dot = document.createElement('i');
+    dot.className = p.cls;
+    item.append(dot, `${p.label} ${fmt(p.v)} ms`);
+    legend.append(item);
+  }
+  const extra = document.createElement('span');
+  extra.className = 'muted';
+  const bits = [];
+  if (prefix === 'viewer' && Number.isFinite(lat.rttMs)) bits.push(`ping ${fmt(lat.rttMs)} ms`);
+  if (prefix === 'host' && Number.isFinite(lat.queueKb)) bits.push(`send queue ${lat.queueKb} KB`);
+  if (Number.isFinite(lat.targetKbps)) bits.push(`encoder ${(lat.targetKbps / 1000).toFixed(1)} Mbps`);
+  if (cfg?.sourceWidth && cfg.sourceWidth !== cfg.width) bits.push(`scaled from ${cfg.sourceWidth}×${cfg.sourceHeight}`);
+  extra.textContent = bits.join(' · ');
+  legend.append(extra);
+
+  const tips = $(`${prefix}-lat-tips`);
+  tips.textContent = '';
+  for (const tip of (prefix === 'viewer' ? lat.tips : []) || []) {
+    const li = document.createElement('li');
+    li.className = tip.level;
+    li.textContent = tip.text;
+    tips.append(li);
+  }
+  // Live bitrate slider follows the setting unless the user is dragging it.
+  const slider = $(`${prefix}-bitrate`);
+  if (document.activeElement !== slider) {
+    const kbps = prefix === 'host' ? (settings?.bitrate ?? 15000) : (lat.targetKbps ?? settings?.bitrate ?? 15000);
+    slider.value = String(kbps);
+    $(`${prefix}-bitrate-val`).textContent = `${(kbps / 1000).toFixed(0)} Mbps`;
+  }
+  if (prefix === 'host') $('host-adaptive').checked = settings?.adaptiveBitrate !== false;
+}
+
+for (const prefix of ['host', 'viewer']) {
+  const slider = $(`${prefix}-bitrate`);
+  slider.oninput = () => { $(`${prefix}-bitrate-val`).textContent = `${(Number(slider.value) / 1000).toFixed(0)} Mbps`; };
+  slider.onchange = async () => {
+    const kbps = Number(slider.value);
+    try {
+      await api('stream', { bitrate: kbps });
+      if (prefix === 'host') await saveSettings({ bitrate: kbps });
+      toast(prefix === 'host' ? `Bitrate set to ${kbps / 1000} Mbps` : `Asked the host for ${kbps / 1000} Mbps`);
+    } catch (e) { toast(e.message, true); }
+  };
+}
+$('host-adaptive').onchange = async () => {
+  const on = $('host-adaptive').checked;
+  try { await api('stream', { adaptive: on }); await saveSettings({ adaptiveBitrate: on }); } catch (e) { toast(e.message, true); }
+};
 
 const VIGEM_URL = 'https://github.com/nefarius/ViGEmBus/releases/latest';
 function statusLines(el, parts) {
@@ -422,7 +669,7 @@ function sessionOptions() {
   const s = settings || {};
   return {
     fps: s.fps, bitrate: s.bitrate, encoder: s.encoder || undefined, source: s.source || undefined,
-    display: /^[0-9]{1,2}$/.test(s.display || '') ? s.display : undefined,
+    resolution: s.resolution, monitor: s.monitor, adaptiveBitrate: s.adaptiveBitrate !== false,
     lowLatency: s.lowLatency !== false, audio: s.audio === true,
   };
 }
@@ -515,5 +762,6 @@ function connectWs() {
   go('home');
   connectWs();
   await refresh();
+  await loadMonitors();
   runNetcheck();
 })();

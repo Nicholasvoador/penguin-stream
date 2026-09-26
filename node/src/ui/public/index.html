@@ -24,6 +24,8 @@
   <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></symbol>
   <symbol id="i-sound" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></symbol>
   <symbol id="i-mute" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="m16 9.5 5 5M21 9.5l-5 5"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 18a9 9 0 1 1 16 0"/><path d="m12 13 4-5"/><circle cx="12" cy="13" r="1.3"/></symbol>
   <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4.5 6v5.5c0 4.5 3.2 8.2 7.5 9.5 4.3-1.3 7.5-5 7.5-9.5V6z"/><path d="m9 12 2 2 4-4"/></symbol>
 </svg>
 
@@ -68,6 +70,38 @@
           <small>Paste an invitation from the host to view and control their desktop.</small>
           <span class="action-cta">Enter invitation →</span>
         </button>
+      </div>
+
+      <div class="card stream-setup">
+        <div class="card-head"><h2>What to share</h2><span class="hint-inline" id="setup-saved">Remembered for next time</span></div>
+        <div class="field-grid three">
+          <label class="field">Profile
+            <select id="opt-profile" aria-describedby="profile-hint"></select>
+          </label>
+          <label class="field">Monitor
+            <select id="opt-monitor" data-setting="monitor"></select>
+          </label>
+          <label class="field">Stream resolution
+            <select id="opt-resolution" data-setting="resolution">
+              <option value="native">Native (monitor size)</option>
+              <option value="2160">2160p (4K)</option>
+              <option value="1440">1440p</option>
+              <option value="1080">1080p (1920×1080)</option>
+              <option value="900">900p</option>
+              <option value="720">720p</option>
+              <option value="540">540p</option>
+              <option value="custom">Custom…</option>
+            </select>
+          </label>
+        </div>
+        <div class="custom-res" id="custom-res" hidden>
+          <label class="field">Width <input id="res-w" inputmode="numeric" maxlength="4" placeholder="1920"></label>
+          <span class="times">×</span>
+          <label class="field">Height <input id="res-h" inputmode="numeric" maxlength="4" placeholder="1080"></label>
+          <button class="btn" type="button" id="res-apply">Use</button>
+        </div>
+        <p class="muted small" id="profile-hint"></p>
+        <p class="muted small" id="monitor-hint"></p>
       </div>
 
       <div class="card">
@@ -133,6 +167,19 @@
         <div class="metric"><span>Frames</span><b id="host-metric-frames">—</b></div>
       </div>
 
+      <div class="card latency-card" id="host-latency" hidden>
+        <div class="card-head"><h2><svg class="h-ico"><use href="#i-gauge"/></svg> Latency</h2><span class="hint-inline" id="host-latency-total">measuring…</span></div>
+        <div class="lat-bar" id="host-lat-bar"></div>
+        <div class="lat-legend" id="host-lat-legend"></div>
+        <ul class="tips" id="host-lat-tips"></ul>
+        <div class="live-controls">
+          <label class="field">Bitrate <b id="host-bitrate-val">—</b>
+            <input type="range" id="host-bitrate" min="2000" max="80000" step="1000">
+          </label>
+          <label class="toggle mini"><span class="t-text"><b>Adapt to the connection</b></span><input type="checkbox" id="host-adaptive"><i class="switch"></i></label>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-head"><h2>Remote control</h2><span class="hint-inline">Changes apply instantly</span></div>
         <div class="toggle-list">
@@ -163,6 +210,18 @@
         <div class="metric"><span>Frames</span><b id="viewer-metric-frames">—</b></div>
       </div>
 
+      <div class="card latency-card" id="viewer-latency" hidden>
+        <div class="card-head"><h2><svg class="h-ico"><use href="#i-gauge"/></svg> Latency</h2><span class="hint-inline" id="viewer-latency-total">measuring…</span></div>
+        <div class="lat-bar" id="viewer-lat-bar"></div>
+        <div class="lat-legend" id="viewer-lat-legend"></div>
+        <ul class="tips" id="viewer-lat-tips"></ul>
+        <div class="live-controls">
+          <label class="field">Ask the host for <b id="viewer-bitrate-val">—</b>
+            <input type="range" id="viewer-bitrate" min="2000" max="80000" step="1000">
+          </label>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-head"><h2>Your input</h2><span class="hint-inline">Changes apply instantly</span></div>
         <div class="toggle-list">
@@ -181,6 +240,15 @@
     <!-- SETTINGS --------------------------------------------------------->
     <section class="page" id="page-settings">
       <div class="card">
+        <div class="card-head"><h2>Profiles</h2><span class="hint-inline">One click to switch between setups</span></div>
+        <div class="profile-list" id="profile-list"></div>
+        <form class="profile-save" id="profile-save">
+          <input id="profile-name" maxlength="40" placeholder="Name for the current settings, e.g. “Elden Ring with Leo”" spellcheck="false" aria-label="Profile name">
+          <button class="btn" type="submit">Save as profile</button>
+        </form>
+      </div>
+
+      <div class="card">
         <div class="card-head"><h2>Video</h2><span class="hint-inline" id="settings-saved">Saved automatically</span></div>
         <div class="field-grid">
           <label class="field">Frame rate
@@ -193,11 +261,14 @@
           </label>
           <label class="field">Bitrate
             <select id="opt-bitrate" data-setting="bitrate" data-type="int">
-              <option value="5000">5 Mbps — Wi-Fi / mobile</option>
-              <option value="10000">10 Mbps — 1080p</option>
-              <option value="20000">20 Mbps (recommended)</option>
-              <option value="35000">35 Mbps — 1440p</option>
+              <option value="3000">3 Mbps — mobile data</option>
+              <option value="6000">6 Mbps — weak connection / 720p</option>
+              <option value="10000">10 Mbps — 1080p, typical upload</option>
+              <option value="15000">15 Mbps — 1080p (recommended)</option>
+              <option value="20000">20 Mbps — 1080p high quality</option>
+              <option value="30000">30 Mbps — 1440p</option>
               <option value="50000">50 Mbps — 4K / LAN</option>
+              <option value="80000">80 Mbps — LAN only</option>
             </select>
           </label>
           <label class="field">Encoder
@@ -221,11 +292,9 @@
               <option value="synthetic">Test pattern</option>
             </select>
           </label>
-          <label class="field">Monitor (Windows)
-            <input id="opt-display" data-setting="display" inputmode="numeric" maxlength="2" placeholder="Main monitor">
-          </label>
         </div>
         <div class="toggle-list compact">
+          <label class="toggle"><svg class="t-ico"><use href="#i-gauge"/></svg><span class="t-text"><b>Adapt bitrate to the connection</b><small>Lowers the bitrate the moment video starts queueing, then slowly raises it back. Keeps latency low on busy or slow uploads.</small></span><input type="checkbox" id="opt-adaptive" data-setting="adaptiveBitrate"><i class="switch"></i></label>
           <label class="toggle"><svg class="t-ico"><use href="#i-bolt"/></svg><span class="t-text"><b>Lowest latency display</b><small>Show each frame the instant it is decoded (no V-Sync wait). May tear slightly.</small></span><input type="checkbox" id="opt-low-latency" data-setting="lowLatency"><i class="switch"></i></label>
         </div>
       </div>

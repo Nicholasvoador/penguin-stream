@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.2.0 — 2026-09-26
+
+### Monitors
+- **Shares one monitor by default** instead of every screen side by side. Pick it on Home: *Main monitor*, any monitor
+  by name, or *Let me choose each time*.
+- Wayland: if the system prompt shares the whole workspace (KDE's "Full workspace"), only the chosen monitor is streamed,
+  and remote mouse input is mapped to it. The screen choice is remembered, so later shares skip the prompt.
+- Windows: the monitor is matched by its desktop position, which is stable when drivers reorder outputs.
+- `penguin-stream monitors` lists monitors; `--monitor` picks one from the command line.
+
+### Stream resolution
+- Choose Native, 2160p, 1440p, 1080p (default), 900p, 720p, 540p or a custom size such as 1600×900. The picture keeps the
+  monitor's shape and is never enlarged. Scaling runs on several CPU cores: 1440p → 1080p costs about 1 ms per frame.
+
+### Latency
+- **Latency meter** on the live page, on both computers: capture, encode, network, decode and display in milliseconds, plus
+  the total from capture to screen. The two computers' clocks are synchronized over the encrypted connection. Tips name
+  the setting that would help.
+- **Adapt bitrate to the connection** (on by default): the bitrate drops as soon as video starts queueing, then slowly
+  returns. A bitrate that is too high for the connection is the most common cause of a laggy stream.
+- Live bitrate slider on both sides, with no restart. The viewer can ask the host for more or less.
+- New frames go to the encoder as soon as the desktop produces them, instead of waiting for a fixed timer. This removes up
+  to one frame of delay.
+- Frames are split into 4 slices so the viewer decodes each one on several cores.
+- Keyframes every 10 s instead of 4 s. Lost frames are still repaired immediately on request.
+- The host skips frames once about two frames of video are waiting to send, then resends a full frame so the picture
+  recovers.
+- Windows: 1 ms timer resolution and higher process priority. Windows normally sleeps in 15.6 ms steps, which made
+  frame timing jitter.
+- The default bitrate is 15 Mbps (was 20) at 1080p.
+
+### Profiles
+- Five presets: **Competitive**, **Balanced (internet)**, **Same house (LAN)**, **Weak connection / relay** and
+  **Desktop work**. Save your own setups by name in Settings → Profiles.
+
+### Compatibility
+- Works with 1.1.2 in both directions (tested). The latency meter needs 1.2.0 on both computers.
+
+### Tests
+- 125 tests: monitor detection and choice, resolution, clock sync, adaptive bitrate, profiles, and an end-to-end session
+  that checks scaling, a live bitrate change and the full latency breakdown.
+
 ## 1.1.2 — 2026-09-25
 
 ### Fixed

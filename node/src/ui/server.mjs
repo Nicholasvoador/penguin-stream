@@ -24,7 +24,8 @@ import { Host, Viewer, DEFAULT_RENDEZVOUS, APP_VERSION } from '../app/session.mj
 import { normalizeShareCode, parseInvitation } from '../signal/code.mjs';
 import { loadOrCreateIdentity, TrustStore } from '../crypto/identity.mjs';
 import { cleanupTransport } from '../transport/peer.mjs';
-import { SettingsStore } from '../app/settings.mjs';
+import { SettingsStore, resolutionBox, sanitizeResolution } from '../app/settings.mjs';
+import { listMonitors, resolveMonitor, workspaceOf } from '../app/monitors.mjs';
 import { runNetcheck } from '../net/netcheck.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -160,14 +161,32 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
   async function startHost(opts) {
     if (active) throw new Error('a session is already running');
 
+    // Stream settings: the request may override the saved ones for this share.
+    const saved = settings.get();
+    const pick = (k) => (opts[k] !== undefined ? opts[k] : saved[k]);
+    const box = resolutionBox(sanitizeResolution(pick('resolution')) ?? saved.resolution);
+    const monitors = await listMonitors({ fresh: true }).catch(() => []);
+    const monitorChoice = typeof pick('monitor') === 'string' ? pick('monitor') : 'primary';
+    const monitor = resolveMonitor(monitors, monitorChoice);
+    // Remote-desktop and screen-cast grants are different kinds of token.
+    const tokenKey = `${process.platform}:rd:${monitor ? monitor.id : 'all'}`;
+    const restoreToken = saved.portalTokens?.[tokenKey];
+    const num = (v) => (v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : undefined);
+
     const host = new HostClass({
       ...commonOptions(opts),
-      source: typeof opts.source === 'string' && /^(dxgi|gdi|portal|x11|synthetic)$/.test(opts.source) ? opts.source : undefined,
+      source: typeof pick('source') === 'string' && /^(dxgi|gdi|portal|x11|synthetic)$/.test(pick('source')) ? pick('source') : undefined,
       display: typeof opts.display === 'string' && /^[0-9]{1,2}$/.test(opts.display) ? opts.display : undefined,
-      fps: opts.fps ? Number(opts.fps) : undefined,
-      bitrateKbps: opts.bitrate ? Number(opts.bitrate) : undefined,
-      encoder: typeof opts.encoder === 'string' && /^(auto|nvenc|amf|qsv|mf|vaapi|x264|software)$/.test(opts.encoder)
-        ? opts.encoder : undefined,
+      fps: num(pick('fps')),
+      bitrateKbps: num(pick('bitrate')),
+      adaptiveBitrate: pick('adaptiveBitrate') !== false,
+      width: box.width || undefined,
+      height: box.height || undefined,
+      monitor: monitor ?? undefined,
+      workspace: monitor ? workspaceOf(monitors) ?? undefined : undefined,
+      restoreToken,
+      encoder: typeof pick('encoder') === 'string' && /^(auto|nvenc|amf|qsv|mf|vaapi|x264|software)$/.test(pick('encoder'))
+        ? pick('encoder') : undefined,
       allowInput: opts.allowInput === true,
       allowGamepad: opts.allowGamepad === true,
       // Ask Wayland for remote-control permission up front, so control can be
@@ -189,6 +208,11 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     scope.on('viewer-state', (v) => { state.remoteViewer = v; broadcast('state', publicState()); });
 
     scope.on('code', (code) => { state.code = code; broadcast('state', publicState()); });
+    // Wayland remembered the screen choice: reuse it next time (no picker).
+    scope.on('restore-token', (tok) => {
+      try { settings.update({ portalTokens: { ...(settings.get().portalTokens || {}), [tokenKey]: tok } }); } catch { /* best effort */ }
+    });
+    if (monitor) pushLog(`sharing monitor ${monitor.label || monitor.id}`);
     scope.on('audio-warning', (w) => { pushLog(`audio warning: ${w}`); broadcast('notice', w); });
     scope.on('log', pushLog);
     scope.on('stats', (s) => { state.stats = s; broadcast('stats', s); });
@@ -305,7 +329,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
         return;
       }
 
-      const allowed = url.pathname === '/api/state' ? ['GET']
+      const allowed = url.pathname === '/api/state' || url.pathname === '/api/monitors' ? ['GET']
         : url.pathname === '/api/settings' ? ['GET', 'POST'] : ['POST'];
       if (!allowed.includes(req.method)) {
         req.resume(); // Drain rejected bodies so a keep-alive socket remains framed.
@@ -336,6 +360,37 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
           case '/api/settings':
             if (req.method === 'POST') settings.update(body);
             return json(settings.publicSettings());
+          case '/api/monitors': return json({ monitors: await listMonitors({ fresh: true }) });
+          case '/api/profile': {
+            if (body.action === 'apply') settings.applyProfile(String(body.id ?? ''));
+            else if (body.action === 'save') settings.saveProfile(String(body.name ?? ''));
+            else if (body.action === 'delete') settings.deleteProfile(String(body.id ?? ''));
+            else return json({ error: 'action must be apply, save or delete' }, 400);
+            const s = settings.get();
+            // A live share follows the new bitrate right away.
+            if (active?.kind === 'host' && body.action === 'apply') {
+              active.instance.setBitrate(s.bitrate);
+              active.instance.setAdaptive(s.adaptiveBitrate);
+            }
+            return json(settings.publicSettings());
+          }
+          case '/api/stream': {
+            // Live changes during a session (no restart needed).
+            const kbps = Number(body.bitrate);
+            if (body.bitrate !== undefined && !(Number.isInteger(kbps) && kbps >= 500 && kbps <= 200000)) {
+              return json({ error: 'bitrate must be 500..200000 kbps' }, 400);
+            }
+            if (body.adaptive !== undefined && typeof body.adaptive !== 'boolean') return json({ error: 'adaptive must be boolean' }, 400);
+            if (active?.kind === 'host') {
+              if (body.bitrate !== undefined) active.instance.setBitrate(kbps);
+              if (body.adaptive !== undefined) active.instance.setAdaptive(body.adaptive);
+            } else if (active?.kind === 'viewer') {
+              if (body.bitrate !== undefined) active.instance.requestBitrate(kbps);
+            } else {
+              return json({ error: 'no session' }, 409);
+            }
+            return json({ ok: true });
+          }
           case '/api/netcheck': {
             netcheck ??= runNetcheck(settings.get().relay).finally(() => { netcheck = null; });
             return json(await netcheck);

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { normalizeIceServers } from '../../src/transport/peer.mjs';
 import { resolveRelay, cleanIceList, describeRelay } from '../../src/net/relay.mjs';
 import { probeTurn } from '../../src/net/netcheck.mjs';
-import { SettingsStore, sanitizeSettings } from '../../src/app/settings.mjs';
+import { SettingsStore, sanitizeSettings, DEFAULT_SETTINGS } from '../../src/app/settings.mjs';
 import { startTurnServer } from '../../../turn/src/server.mjs';
 
 const CLOUDFLARE_SHAPE = {
@@ -58,7 +58,7 @@ test('settings persist privately, validate input and never expose secrets', () =
     store.update({ fps: 120, bitrate: 'lots', encoder: 'rm -rf', relay: { mode: 'manual', turn: 'h:1', turnPassword: 'hunter2' } });
     const again = new SettingsStore(dir).get();
     assert.equal(again.fps, 120);
-    assert.equal(again.bitrate, 20000, 'invalid bitrate ignored');
+    assert.equal(again.bitrate, DEFAULT_SETTINGS.bitrate, 'invalid bitrate ignored');
     assert.equal(again.encoder, '', 'invalid encoder ignored');
     assert.equal(again.relay.turnPassword, 'hunter2');
     if (process.platform !== 'win32') {

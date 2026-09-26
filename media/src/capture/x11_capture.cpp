@@ -48,9 +48,11 @@ class X11Source : public CaptureSource {
     av_dict_set(&options, "draw_mouse", "1", 0);
     // Without this, x11grab buffers frames and latency creeps up over time.
     av_dict_set(&options, "fflags", "nobuffer", 0);
-    if (opts.width > 0 && opts.height > 0) {
+    if (opts.monitor.valid() && opts.monitor.x >= 0 && opts.monitor.y >= 0) {
+      // x11grab reads a sub-rectangle given as "display+x,y" plus video_size.
       av_dict_set(&options, "video_size",
-                  (std::to_string(opts.width) + "x" + std::to_string(opts.height)).c_str(), 0);
+                  (std::to_string(opts.monitor.w) + "x" + std::to_string(opts.monitor.h)).c_str(), 0);
+      target += "+" + std::to_string(opts.monitor.x) + "," + std::to_string(opts.monitor.y);
     }
 
     int ret = avformat_open_input(&fmt_, target.c_str(), input, &options);

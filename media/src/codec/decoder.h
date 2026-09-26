@@ -33,6 +33,7 @@ class Decoder {
  public:
   Decoder();
   ~Decoder();
+  void close();
   Decoder(const Decoder&) = delete;
   Decoder& operator=(const Decoder&) = delete;
 

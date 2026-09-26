@@ -20,6 +20,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -48,7 +49,19 @@ struct SharedFrame {
   int width = 0;
   int height = 0;
   bool dirty = false;
+  // Latency accounting (steady-clock microseconds) for the newest frame.
+  uint64_t recvUs = 0;      // packet arrived from Node
+  uint64_t decodedUs = 0;   // decoder produced the picture
+  uint64_t pts = 0;         // host capture timestamp (host clock), echoed back
+  uint64_t replaced = 0;    // decoded frames overwritten before they could be shown
+  double decodeMsSum = 0;   // accumulated by the reader thread
+  uint64_t decoded = 0;
 };
+
+uint64_t nowUs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 // Control messages from Node, forwarded to the SDL thread as user events.
 Uint32 g_controlEvent = 0;
@@ -355,7 +368,9 @@ class Viewer {
         break;
       }
       case SDL_CONTROLLERDEVICEADDED:
-        addController(ev.cdevice.which);
+        // Automated tests inject controller events themselves; a pad that
+        // happens to be plugged into the test machine must not interfere.
+        if (!std::getenv("PS_IGNORE_LOCAL_CONTROLLERS")) addController(ev.cdevice.which);
         break;
       case SDL_CONTROLLERDEVICEREMOVED:
         removeController(ev.cdevice.which);
@@ -513,12 +528,15 @@ int Viewer::run(std::shared_ptr<SharedFrame> sharedOwner, bool vsync) {
     // Controllers already plugged in arrive as CONTROLLERDEVICEADDED events.
   }
 
+  uint64_t statsAt = nowUs(), presented = 0, lastPts = 0;
+  double displaySum = 0, displayMax = 0, pipeSum = 0;
   while (!g_quit) {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) handleEvent(ev);
     flushMotion();
 
     bool present = false;
+    uint64_t frameRecv = 0, frameDecoded = 0, framePts = 0;
     {
       std::unique_lock<std::mutex> lock(shared.mu);
       if (!shared.dirty && !g_quit) {
@@ -534,6 +552,9 @@ int Viewer::run(std::shared_ptr<SharedFrame> sharedOwner, bool vsync) {
           textureYuv = shared.yuv;
           SDL_RenderSetLogicalSize(renderer_, texW_, texH_);  // letterbox, keep aspect ratio
         }
+        frameRecv = shared.recvUs;
+        frameDecoded = shared.decodedUs;
+        framePts = shared.pts;
         if (texture) {
           if (shared.yuv) {
             const size_t ySize = size_t(texW_) * texH_;
@@ -555,6 +576,43 @@ int Viewer::run(std::shared_ptr<SharedFrame> sharedOwner, bool vsync) {
       SDL_RenderClear(renderer_);
       SDL_RenderCopy(renderer_, texture, nullptr, nullptr);
       SDL_RenderPresent(renderer_);
+      const uint64_t shown = nowUs();
+      if (frameDecoded && shown >= frameDecoded) {
+        const double ms = (shown - frameDecoded) / 1000.0;
+        displaySum += ms;
+        displayMax = std::max(displayMax, ms);
+      }
+      if (frameRecv && shown >= frameRecv) pipeSum += (shown - frameRecv) / 1000.0;
+      lastPts = framePts;
+      ++presented;
+    }
+
+    // Once a second: how long frames spend here (decode, then waiting for and
+    // doing the upload + present). Node adds network and host timings.
+    const uint64_t now = nowUs();
+    if (now - statsAt >= 1000000) {
+      double decodeAvg = 0;
+      uint64_t replaced = 0;
+      {
+        std::lock_guard<std::mutex> lock(shared.mu);
+        decodeAvg = shared.decoded ? shared.decodeMsSum / shared.decoded : 0;
+        replaced = shared.replaced;
+        shared.decodeMsSum = 0;
+        shared.decoded = 0;
+        shared.replaced = 0;
+      }
+      char buf[320];
+      std::snprintf(buf, sizeof(buf),
+                    "{\"t\":\"view-stats\",\"presented\":%llu,\"replaced\":%llu,\"decodeMs\":%.2f,"
+                    "\"displayMs\":%.2f,\"displayMaxMs\":%.2f,\"viewerMs\":%.2f,\"vsync\":%s,\"pts\":%llu,\"now\":%llu}",
+                    static_cast<unsigned long long>(presented), static_cast<unsigned long long>(replaced), decodeAvg,
+                    presented ? displaySum / presented : 0.0, displayMax, presented ? pipeSum / presented : 0.0,
+                    vsync ? "true" : "false", static_cast<unsigned long long>(lastPts),
+                    static_cast<unsigned long long>(now));
+      emitControl(buf);
+      statsAt = now;
+      presented = 0;
+      displaySum = displayMax = pipeSum = 0;
     }
   }
 
@@ -657,8 +715,16 @@ int runView(int argc, char** argv) {
         size_t len = 0;
         if (!parseVideoPacket(msg.payload, hdr, &data, &len)) continue;
         std::string derr;
+        const uint64_t recv = nowUs();
         decoder.decode(data, len, hdr.pts_us, [&](const DecodedFrame& f) {
+          const uint64_t decoded = nowUs();
           std::lock_guard<std::mutex> lock(shared->mu);
+          if (shared->dirty) ++shared->replaced;  // renderer had not shown the previous one yet
+          shared->recvUs = recv;
+          shared->decodedUs = decoded;
+          shared->pts = f.pts_us;
+          shared->decodeMsSum += (decoded - recv) / 1000.0;
+          ++shared->decoded;
           if (f.bgra) {
             shared->yuv = false;
             shared->pixels.resize(size_t(f.width) * f.height * 4);

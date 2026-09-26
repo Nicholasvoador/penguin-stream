@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ps_media VERSION 1.1.2 LANGUAGES CXX)
+project(ps_media VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,7 +48,7 @@ if(WIN32)
     list(APPEND PS_LIBRARY_DIRS ${FFMPEG_LIBRARY_DIRS})
     list(APPEND PS_LIBS ${FFMPEG_LIBRARIES})
   endif()
-  list(APPEND PS_LIBS d3d11 dxgi setupapi ole32 uuid)
+  list(APPEND PS_LIBS d3d11 dxgi setupapi ole32 uuid winmm)
   list(APPEND PS_SOURCES
     src/audio/audio_capture_wasapi.cpp
     src/capture/windows_dxgi.cpp

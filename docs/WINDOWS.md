@@ -60,13 +60,14 @@ pkg-config discovery for FFmpeg, SDL2, and optional capture dependencies.
 ## Capture behavior
 
 - Auto-selection chooses DXGI on Windows; `--source dxgi` selects it explicitly.
-- `--display N` is a zero-based index over attached outputs in DXGI adapter/output
-  enumeration order. Empty means index 0, **not necessarily the primary monitor**.
-  Invalid indices fail startup. A D3D11 device is created on the selected output's
-  adapter rather than assuming adapter 0 owns it.
-- Captures one native-size BGRA8 desktop. Odd right/bottom edges are cropped by at
-  most one pixel for the encoder's even-dimension requirement. Width/height may
-  be omitted or equal native/even-cropped dimensions; resizing is not implemented.
+- The app picks the monitor chosen on its Home page (`--monitor x,y,w,h`), matched
+  by desktop position. Without one it shares the primary monitor. `ps-media
+  list-monitors` prints the layout. The legacy `--display N` index still works.
+  A D3D11 device is created on the selected output's adapter rather than assuming
+  adapter 0 owns it.
+- Captures one native-size BGRA8 desktop. The stream resolution (`--width/--height`
+  box) is applied by the encoder's multi-threaded scaler, which keeps the aspect
+  ratio and never upscales.
 - Rotated outputs are explicitly rejected. Multi-monitor stitching, HDR fidelity,
   dirty-rectangle optimizations, and separate hardware cursor composition are not
   implemented. A separately supplied DXGI cursor may therefore be absent.

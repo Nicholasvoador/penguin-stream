@@ -23,6 +23,7 @@ import { CaptureEngine, ViewEngine } from '../media/engine.mjs';
 import { AudioCapture, AudioPlayer } from '../media/audio.mjs';
 import { createInputValidator, inputClass } from '../media/input.mjs';
 import { resolveRelay, describeRelay } from '../net/relay.mjs';
+import { AdaptiveBitrate, ClockSync, Summary, nowUs, latencyTips } from './latency.mjs';
 
 /** Optional self-hosted rendezvous. Pairing uses public Nostr relays by default. */
 export const DEFAULT_RENDEZVOUS = process.env.PENGUIN_RENDEZVOUS || undefined;
@@ -131,6 +132,13 @@ export class Host extends EventEmitter {
     this.engine = null;
     this.chunker = new Chunker({ maxPayload: MAX_PAYLOAD });
     this.stats = { framesSent: 0, bytesSent: 0, dropped: 0 };
+    this.abr = new AdaptiveBitrate({
+      maxKbps: opts.bitrateKbps ?? 15000,
+      enabled: opts.adaptiveBitrate !== false,
+    });
+    this.hostLatency = { send: new Summary() };   // engine output -> handed to the network
+    this.engineStats = null;
+    this.viewerReport = null;
     // Live-switchable: the host can grant or revoke control mid-session.
     this.permissions = { kbm: opts.allowInput === true, pad: opts.allowGamepad === true };
     this.inputStatus = null;
@@ -218,7 +226,11 @@ export class Host extends EventEmitter {
       encoder: this.opts.encoder,
       width: this.opts.width,
       height: this.opts.height,
+      monitor: this.opts.monitor,
+      workspace: this.opts.workspace,
+      restoreToken: this.opts.restoreToken,
     });
+    this.engine.on('restore-token', (token) => this.emit('restore-token', token));
 
     this.engine.on('config', (config) => {
       this.emit('log', `capturing with ${config.capture}, encoding with ${config.encoder}`);
@@ -229,12 +241,24 @@ export class Host extends EventEmitter {
 
     this.engine.on('video', (v) => {
       if (peer.state !== 'secure') return;
-      // Low-latency pacing: if SCTP queue has built up (>128KB), drop intermediate
-      // non-keyframes immediately to prevent bufferbloat and latency buildup.
-      if (!v.keyframe && peer.bufferedAmount > 128 * 1024) {
+      const queued = peer.bufferedAmount;
+      this.abr.observeQueue(queued);
+      // Never let video pile up behind the network: if more than ~2 frames are
+      // still waiting to be sent, skip this frame (the encoder's next frame
+      // references it, so ask for a fresh keyframe once the queue drains).
+      const budget = Math.max(64 * 1024, (this.abr.current * 1000 / 8) * (2 / (this.opts.fps ?? 60)));
+      if (!v.keyframe && queued > budget) {
         this.stats.dropped++;
+        this._needKeyframe = true;
         return;
       }
+      if (this._needKeyframe && queued < budget / 2) {
+        this._needKeyframe = false;
+        this.engine?.requestKeyframe();
+      }
+      // pts = the frame's capture time on this machine's monotonic clock.
+      const pts = Number(v.ptsUs);
+      if (pts > 0) this.hostLatency.send.add((nowUs() - pts) / 1000);
       const chunks = this.chunker.split(v.data, { ptsUs: v.ptsUs, keyframe: v.keyframe });
       for (const chunk of chunks) {
         try {
@@ -248,8 +272,24 @@ export class Host extends EventEmitter {
     });
 
     this.engine.on('stats', (s) => {
+      this.engineStats = s;
       const transport = peer.transportInfo();
-      this.emit('stats', { ...s, ...this.stats, transport });
+      const sendMs = this.hostLatency.send.take();
+      const latency = {
+        captureMs: s.captureMs?.avg ?? null,
+        encodeMs: s.encodeMs?.avg ?? null,
+        sendMs: sendMs?.avg ?? null,           // capture -> handed to the network
+        targetKbps: this.abr.current,
+        queueKb: Math.round(peer.bufferedAmount / 1024),
+        viewer: this.viewerReport,             // what the viewer measured (latest)
+      };
+      this.emit('stats', { ...s, ...this.stats, transport, latency });
+      // Share host-side timings so the viewer can show the full breakdown.
+      try {
+        peer.sendControl({ t: 'host-stats', captureMs: latency.captureMs, encodeMs: latency.encodeMs,
+          sendMs: latency.sendMs, kbps: Math.round(s.kbps ?? 0), targetKbps: this.abr.current,
+          fps: Math.round(s.fps ?? 0), maxFrameBytes: s.maxFrameBytes ?? 0, dropped: this.stats.dropped });
+      } catch { /* closing */ }
     });
     this.engine.on('log', (m) => this.emit('log', m));
     this.engine.on('input-status', (st) => {
@@ -272,7 +312,21 @@ export class Host extends EventEmitter {
     peer.on('control', (msg) => {
       if (msg?.t === 'keyframe-request') this.engine?.requestKeyframe();
       if (msg?.t === 'set-bitrate' && Number.isFinite(msg.kbps) && msg.kbps >= 500 && msg.kbps <= 200000) {
-        this.engine?.setBitrate(Math.round(msg.kbps));
+        this.setBitrate(Math.round(msg.kbps));
+      }
+      // Clock sync for the latency meter: answer with our monotonic clock.
+      if (msg?.t === 'ping' && Number.isFinite(msg.t0)) {
+        try { peer.sendControl({ t: 'pong', t0: msg.t0, th: nowUs() }); } catch { /* closing */ }
+      }
+      if (msg?.t === 'viewer-report' && Number.isFinite(msg.delayRiseMs)) {
+        const rep = {
+          delayRiseMs: Math.max(0, Math.min(10000, msg.delayRiseMs)),
+          lost: Number.isInteger(msg.lost) ? Math.max(0, Math.min(100000, msg.lost)) : 0,
+          totalMs: Number.isFinite(msg.totalMs) ? msg.totalMs : null,
+          networkMs: Number.isFinite(msg.networkMs) ? msg.networkMs : null,
+        };
+        this.viewerReport = rep;
+        this.abr.observeViewer(rep);
       }
       if (msg?.t === 'viewer-state' && typeof msg.kbm === 'boolean' && typeof msg.pad === 'boolean') {
         this.emit('viewer-state', { kbm: msg.kbm, pad: msg.pad, pads: Number.isInteger(msg.pads) ? msg.pads : 0 });
@@ -295,6 +349,15 @@ export class Host extends EventEmitter {
 
     peer.on('closed', (reason) => this.close(reason));
 
+    this._abrTimer = setInterval(() => {
+      const kbps = this.abr.tick();
+      if (kbps) {
+        this.engine?.setBitrate(kbps);
+        this.emit('log', `bitrate ${kbps >= this.abr.maxKbps ? 'restored' : 'adapted'} to ${(kbps / 1000).toFixed(1)} Mbps`);
+      }
+    }, 500);
+    this._abrTimer.unref?.();
+
     this.engine.start();
     if (this.opts.audio === true) {
       this.audio = new AudioCapture({ enabled: true, maxPayload: MAX_PAYLOAD, filter: this.opts.audioFilter });
@@ -311,9 +374,23 @@ export class Host extends EventEmitter {
     }
   }
 
+  /** Live bitrate change (UI or viewer): becomes the new ceiling for adaptation. */
+  setBitrate(kbps) {
+    if (!Number.isInteger(kbps) || kbps < 500 || kbps > 200000) return;
+    this.opts.bitrateKbps = kbps;
+    this.abr.setMax(kbps);
+    this.engine?.setBitrate(this.abr.current);
+  }
+
+  setAdaptive(on) {
+    this.abr.enabled = on === true;
+    if (!this.abr.enabled) { this.abr.current = this.abr.maxKbps; this.engine?.setBitrate(this.abr.current); }
+  }
+
   close(reason = 'closed') {
     if (this._closed) return;
     this._closed = true;
+    if (this._abrTimer) clearInterval(this._abrTimer);
     this.engine?.sendInput({ t: 'release_all' });
     void this.audio?.stop();
     this.engine?.stop();
@@ -338,6 +415,14 @@ export class Viewer extends EventEmitter {
     this.reassembler = new Reassembler();
     this.stats = { framesShown: 0, bytesReceived: 0 };
     this._keyframeTimer = null;
+    this.clock = new ClockSync();
+    this.lat = { network: new Summary(), arrival: new Summary() };
+    this.delayFloor = null;       // lowest (arrival - capture) seen recently: the "no queue" baseline
+    this.delayFloorAt = 0;
+    this.hostStats = null;
+    this.viewStats = null;
+    this.lostWindow = 0;
+    this.latency = null;
   }
 
   async start() {
@@ -387,6 +472,7 @@ export class Viewer extends EventEmitter {
       this.emit('viewer-state', st);
       try { peer.sendControl({ t: 'viewer-state', kbm: st.kbm, pad: st.pad, pads: st.pads }); } catch { /* closing */ }
     });
+    this.engine.on('view-stats', (v) => { this.viewStats = v; });
     this.engine.on('exit', () => this.close('viewer window closed'));
     this.engine.on('error', (e) => this.emit('error', e));
     this.engine.start();
@@ -416,9 +502,23 @@ export class Viewer extends EventEmitter {
         this.emit('host-permissions', this.hostPermissions);
       } else if (msg?.t === 'rumble') {
         this.engine.rumble(msg);
+      } else if (msg?.t === 'pong' && Number.isFinite(msg.t0) && Number.isFinite(msg.th)) {
+        this.clock.add(msg.t0, msg.th, nowUs());
+      } else if (msg?.t === 'host-stats') {
+        const num = (v) => (Number.isFinite(v) ? v : null);
+        this.hostStats = {
+          captureMs: num(msg.captureMs), encodeMs: num(msg.encodeMs), sendMs: num(msg.sendMs),
+          kbps: num(msg.kbps), targetKbps: num(msg.targetKbps), fps: num(msg.fps),
+          maxFrameBytes: num(msg.maxFrameBytes), dropped: num(msg.dropped),
+        };
       }
       checkHello(msg, (...a) => this.emit(...a));
     });
+    // Clock sync: a burst at start, then every 2 s (tiny, rides the control channel).
+    const ping = () => { try { peer.sendControl({ t: 'ping', t0: nowUs() }); } catch { /* closing */ } };
+    for (let i = 0; i < 5; i++) setTimeout(ping, 50 + i * 120).unref?.();
+    this._pingTimer = setInterval(ping, 2000);
+    this._pingTimer.unref?.();
     try { peer.sendControl({ t: 'hello', app: 'penguin-stream', version: APP_VERSION, protocol: PROTOCOL_VERSION }); } catch { /* closing */ }
     expectHello(peer, (...a) => this.emit(...a));
 
@@ -436,7 +536,9 @@ export class Viewer extends EventEmitter {
 
     peer.on('video', (payload) => {
       this.stats.bytesReceived += payload.length;
+      const droppedBefore = this.reassembler.stats.dropped;
       const done = this.reassembler.push(payload);
+      this.lostWindow += Math.max(0, this.reassembler.stats.dropped - droppedBefore);
       // Fast recovery: if chunks were lost, request a fresh keyframe immediately (<100ms)
       // rather than waiting for the 1-second background poll.
       if (this.reassembler.needsKeyframe) {
@@ -444,6 +546,22 @@ export class Viewer extends EventEmitter {
       }
       if (!done) return;
       this.stats.framesShown++;
+      // capture (host clock) -> complete frame here (viewer clock), via the offset.
+      const offset = this.clock.offset;
+      if (offset !== null && this.clock.ready) {
+        const arrivedHostClock = nowUs() + offset;
+        const ms = (arrivedHostClock - Number(done.ptsUs)) / 1000;
+        if (ms > -50 && ms < 10000) {
+          this.lat.arrival.add(ms);
+          const now = Date.now();
+          // Track the floor (the no-queueing delay) and let it age out slowly,
+          // so a route change does not leave a stale baseline.
+          if (this.delayFloor === null || ms < this.delayFloor || now - this.delayFloorAt > 10_000) {
+            this.delayFloor = ms;
+            this.delayFloorAt = now;
+          }
+        }
+      }
       this.engine.sendVideo({ ptsUs: done.ptsUs, keyframe: done.keyframe, frame: done.frame });
     });
 
@@ -459,11 +577,52 @@ export class Viewer extends EventEmitter {
         } catch { /* closing */ }
       }
       const transport = peer.transportInfo();
-      this.emit('stats', { ...this.stats, ...this.reassembler.stats, transport });
+      this.latency = this.#latencyBreakdown(transport);
+      try {
+        peer.sendControl({ t: 'viewer-report', delayRiseMs: this.latency.delayRiseMs ?? 0, lost: this.lostWindow,
+          totalMs: this.latency.totalMs, networkMs: this.latency.networkMs });
+      } catch { /* closing */ }
+      this.lostWindow = 0;
+      this.emit('stats', { ...this.stats, ...this.reassembler.stats, transport, latency: this.latency });
     }, 1000);
     this._keyframeTimer.unref?.();
 
     return this.session;
+  }
+
+  /**
+   * Capture-to-screen breakdown (ms):
+   *   host:    capture handoff + encode   (measured by the host engine)
+   *   network: encoded frame leaves the host engine -> complete frame here,
+   *            minus the host's own queueing (clock-synced)
+   *   viewer:  decode + upload + present  (measured by the viewer engine)
+   */
+  #latencyBreakdown(transport) {
+    const arrival = this.lat.arrival.take();
+    const h = this.hostStats ?? {};
+    const v = this.viewStats ?? {};
+    const hostMs = (h.captureMs ?? 0) + (h.encodeMs ?? 0);
+    const arrivalMs = arrival?.avg ?? null;
+    const networkMs = arrivalMs !== null ? Math.max(0, arrivalMs - hostMs) : null;
+    const viewerMs = Number.isFinite(v.viewerMs) ? v.viewerMs : null;
+    const totalMs = arrivalMs !== null && viewerMs !== null ? arrivalMs + viewerMs : null;
+    const delayRiseMs = arrivalMs !== null && this.delayFloor !== null ? Math.max(0, arrivalMs - this.delayFloor) : null;
+    const frames = arrival?.n ?? 0;
+    const lostPct = frames + this.lostWindow > 0 ? (100 * this.lostWindow) / (frames + this.lostWindow) : 0;
+    const out = {
+      synced: this.clock.ready,
+      rttMs: this.clock.rttMs, minRttMs: this.clock.minRttMs,
+      captureMs: h.captureMs, encodeMs: h.encodeMs,
+      networkMs, networkP95Ms: arrival ? Math.max(0, arrival.p95 - hostMs) : null,
+      decodeMs: Number.isFinite(v.decodeMs) ? v.decodeMs : null,
+      displayMs: Number.isFinite(v.displayMs) ? v.displayMs : null,
+      viewerMs, totalMs, delayRiseMs, lostPct,
+      queueMs: h.sendMs !== null && h.sendMs !== undefined ? Math.max(0, h.sendMs - hostMs) : null,
+      fps: h.fps, kbps: h.kbps, targetKbps: h.targetKbps, replaced: v.replaced ?? 0, vsync: v.vsync === true,
+      relayed: transport?.relayed === true,
+    };
+    out.tips = latencyTips(out);
+    return out;
   }
 
   /** Live viewer toggles: { kbm?, pad?, capture? }. */
@@ -471,10 +630,16 @@ export class Viewer extends EventEmitter {
     this.engine?.setInput(state);
   }
 
+  /** Asks the host to change the stream bitrate (kbps). */
+  requestBitrate(kbps) {
+    try { this.session?.peer.sendControl({ t: 'set-bitrate', kbps }); } catch { /* closing */ }
+  }
+
   close(reason = 'closed') {
     if (this._closed) return;
     this._closed = true;
     if (this._keyframeTimer) clearInterval(this._keyframeTimer);
+    if (this._pingTimer) clearInterval(this._pingTimer);
     void this.audio?.stop();
     this.engine?.stop();
     this.session?.close();

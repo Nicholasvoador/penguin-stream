@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DEFAULT_SETTINGS } from '../../src/app/settings.mjs';
 
 // Isolated config dir: this test writes settings.
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ps-ui-settings-'));
@@ -28,7 +29,7 @@ test('settings round-trip through the API, validated, secrets write-only', async
     fps: 120, bitrate: -5, relay: { mode: 'manual', turn: 'turn:relay.example.com:3478', turnUser: 'u', turnPassword: 'p4ss' },
   })).json();
   assert.equal(saved.fps, 120);
-  assert.equal(saved.bitrate, 20000, 'invalid bitrate rejected');
+  assert.equal(saved.bitrate, DEFAULT_SETTINGS.bitrate, 'invalid bitrate rejected');
   assert.equal(saved.relay.mode, 'manual');
   assert.equal(saved.relay.turnPasswordSet, true);
 

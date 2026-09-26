@@ -74,6 +74,11 @@ async function cmdHost(args) {
   }
 
   const control = Boolean(args['allow-control']);
+  const { resolutionBox, sanitizeResolution } = await import('./app/settings.mjs');
+  const { listMonitors, resolveMonitor, workspaceOf } = await import('./app/monitors.mjs');
+  const box = resolutionBox(sanitizeResolution(String(args.resolution ?? 'native')) ?? 'native');
+  const monitors = args.source === 'synthetic' ? [] : await listMonitors().catch(() => []);
+  const monitor = resolveMonitor(monitors, typeof args.monitor === 'string' ? args.monitor : 'primary');
   const host = new Host({
     relay: savedRelay(),
     audioFilter: savedAudioFilter(),
@@ -83,6 +88,11 @@ async function cmdHost(args) {
     display: args.display,
     fps: args.fps ? Number(args.fps) : undefined,
     bitrateKbps: args.bitrate ? Number(args.bitrate) : undefined,
+    adaptiveBitrate: !args['fixed-bitrate'],
+    width: box.width || undefined,
+    height: box.height || undefined,
+    monitor: monitor ?? undefined,
+    workspace: monitor ? workspaceOf(monitors) ?? undefined : undefined,
     encoder: args.encoder,
     forceRelay: Boolean(args['force-relay']),
     allowInput: (control || Boolean(args['allow-input'])) && !args['no-input'],
@@ -320,6 +330,15 @@ function cmdRevoke(args) {
   console.log(`revoked ${match.fingerprint} (${match.label})`);
 }
 
+async function cmdMonitors() {
+  const { listMonitors } = await import('./app/monitors.mjs');
+  const list = await listMonitors({ fresh: true });
+  if (!list.length) { console.log('no monitors detected (the main monitor will be shared)'); return; }
+  for (const m of list) {
+    console.log(`  ${m.primary ? '*' : ' '} ${m.label.padEnd(34)} --monitor ${m.id}`);
+  }
+}
+
 function usage() {
   console.log(`${c.bold}penguin-stream${c.reset} - peer-to-peer remote desktop
 
@@ -332,6 +351,7 @@ ${c.bold}Usage${c.reset}
   penguin-stream id                          show this device and paired peers
   penguin-stream revoke <fingerprint|all>    forget a paired device
   penguin-stream doctor                      check what works on this machine
+  penguin-stream monitors                    list monitors (for --monitor)
 
 ${c.bold}Common options${c.reset}
   --rendezvous <ws://host:port>   also use a self-hosted rendezvous (pairing uses public
@@ -344,7 +364,10 @@ ${c.bold}Common options${c.reset}
 
 ${c.bold}Host options${c.reset}
   --source <dxgi|gdi|portal|x11|synthetic>  capture backend (default: auto)
-  --display <n>                   monitor index (Windows; default: first/primary)
+  --monitor <primary|all|x,y,w,h> which monitor to share (see: penguin-stream monitors)
+  --resolution <native|1080|720|WxH>  stream size; fits inside, keeps aspect, never upscales
+  --fixed-bitrate                 do not lower the bitrate when the connection queues
+  --display <n>                   monitor index (Windows; legacy, prefer --monitor)
   --fps <n>                       target frame rate (default 60)
   --bitrate <kbps>                target bitrate (default 15000)
   --encoder <auto|nvenc|amf|qsv|mf|vaapi|x264>
@@ -379,6 +402,7 @@ const commands = {
   turn: cmdTurn,
   id: cmdId,
   revoke: cmdRevoke,
+  monitors: cmdMonitors,
 };
 
 try {

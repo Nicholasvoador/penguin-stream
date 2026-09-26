@@ -51,6 +51,7 @@ extern "C" {
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <timeapi.h>
 #endif
 
 #ifndef PS_VERSION
@@ -115,6 +116,51 @@ int intArg(int argc, char** argv, const std::string& flag, int fallback) {
   if (v.empty()) return fallback;
   try { return std::stoi(v); } catch (...) { return fallback; }
 }
+
+// "x,y,w,h" -> Rect (invalid/empty on any parse problem).
+Rect rectArg(int argc, char** argv, const std::string& flag) {
+  const std::string v = getArg(argc, argv, flag, "");
+  Rect r;
+  if (v.empty() || v.size() > 64) return {};
+  if (std::sscanf(v.c_str(), "%d,%d,%d,%d", &r.x, &r.y, &r.w, &r.h) != 4) return {};
+  if (r.w <= 0 || r.h <= 0 || r.w > 16384 || r.h > 16384 || std::abs(r.x) > 65536 || std::abs(r.y) > 65536) return {};
+  return r;
+}
+
+// Fits the captured size inside the requested box, keeping the aspect ratio
+// and never upscaling (that would cost bandwidth and add nothing).
+void fitStreamSize(int srcW, int srcH, int boxW, int boxH, int& outW, int& outH) {
+  outW = srcW & ~1;
+  outH = srcH & ~1;
+  if (boxW <= 0 && boxH <= 0) return;
+  // A portrait monitor with a landscape box: compare like with like.
+  if ((srcH > srcW) != (boxH > boxW) && boxW > 0 && boxH > 0) std::swap(boxW, boxH);
+  double s = 1.0;
+  if (boxW > 0) s = std::min(s, double(boxW) / srcW);
+  if (boxH > 0) s = std::min(s, double(boxH) / srcH);
+  if (s >= 0.999) return;
+  outW = std::max(160, static_cast<int>(srcW * s + 0.5)) & ~1;
+  outH = std::max(90, static_cast<int>(srcH * s + 0.5)) & ~1;
+}
+
+// Rolling latency statistics (milliseconds) for the stats message.
+struct Timing {
+  std::vector<double> samples;
+  void add(double ms) { if (ms >= 0 && ms < 10000) samples.push_back(ms); }
+  std::string json(const char* name) {
+    if (samples.empty()) return std::string("\"") + name + "\":null";
+    std::sort(samples.begin(), samples.end());
+    double sum = 0;
+    for (double v : samples) sum += v;
+    const double avg = sum / samples.size();
+    const double p95 = samples[std::min(samples.size() - 1, static_cast<size_t>(samples.size() * 0.95))];
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "\"%s\":{\"avg\":%.2f,\"p95\":%.2f,\"max\":%.2f}", name, avg, p95,
+                  samples.back());
+    samples.clear();
+    return buf;
+  }
+};
 
 /* ------------------------------- probe -------------------------------- */
 
@@ -624,9 +670,15 @@ int runCapture(int argc, char** argv) {
 
   CaptureOptions copts;
   copts.fps = fps;
-  copts.width = intArg(argc, argv, "--width", 0);
-  copts.height = intArg(argc, argv, "--height", 0);
+  // --width/--height are the stream size box; capture itself stays native and
+  // the encoder scales (the X11 grabber would otherwise crop, not scale).
+  const int boxW = std::clamp(intArg(argc, argv, "--width", 0), 0, 8192);
+  const int boxH = std::clamp(intArg(argc, argv, "--height", 0), 0, 8192);
   copts.display = getArg(argc, argv, "--display", "");
+  copts.monitor = rectArg(argc, argv, "--monitor");
+  copts.workspace = rectArg(argc, argv, "--workspace");
+  copts.restoreToken = getArg(argc, argv, "--restore-token", "");
+  if (copts.restoreToken.size() > 512) copts.restoreToken.clear();
   copts.allowInput = kbmCapable && (chosen == "portal" || chosen == "dxgi" || chosen == "gdi");
   if (kbmCapable && !copts.allowInput) {
     writeLog(stdout, "keyboard/mouse control is not available with the '" + chosen +
@@ -649,10 +701,17 @@ int runCapture(int argc, char** argv) {
     return 1;
   }
 
+  if (!source->captureNote().empty()) writeLog(stdout, source->captureNote());
+  if (!source->restoreToken().empty()) {
+    writeJson(stdout, MsgType::Control,
+              "{\"t\":\"restore-token\",\"token\":\"" + jsonEscape(source->restoreToken()) + "\"}");
+  }
+
   Encoder enc;
   EncoderConfig ecfg;
-  ecfg.width = source->width();
-  ecfg.height = source->height();
+  ecfg.srcWidth = source->width();
+  ecfg.srcHeight = source->height();
+  fitStreamSize(ecfg.srcWidth, ecfg.srcHeight, boxW, boxH, ecfg.width, ecfg.height);
   ecfg.fps = fps;
   ecfg.bitrateKbps = bitrate;
   ecfg.preferred = preferred;
@@ -672,20 +731,27 @@ int runCapture(int argc, char** argv) {
   const std::string config =
       "{\"codec\":\"h264\",\"width\":" + std::to_string(enc.width()) +
       ",\"height\":" + std::to_string(enc.height()) +
+      ",\"sourceWidth\":" + std::to_string(ecfg.srcWidth) +
+      ",\"sourceHeight\":" + std::to_string(ecfg.srcHeight) +
       ",\"fps\":" + std::to_string(fps) +
       ",\"encoder\":\"" + jsonEscape(enc.backendName()) + "\"" +
       ",\"capture\":\"" + jsonEscape(source->name()) + "\"" +
       ",\"extradata\":\"" + extraHex + "\"}";
   if (!writeJson(stdout, MsgType::Config, config)) return 1;
 
-  uint64_t frames = 0, bytes = 0;
+  uint64_t frames = 0, bytes = 0, windowFrames = 0, windowBytes = 0;
   const uint64_t started = nowMicros();
   uint64_t lastStats = started;
+  Timing tCapture, tEncode;  // capture->encoder input, encoder input->packet out
+  uint64_t lastPts = 0;
+  uint64_t maxFrameBytes = 0;
 
   auto controls = std::make_unique<CaptureControls>(*source, enc, allowKbm && copts.allowInput, allowPad);
   bool failed = false, writeFailed = false;
   const auto sink = [&](const EncodedPacket& p) {
     bytes += p.size;
+    windowBytes += p.size;
+    maxFrameBytes = std::max<uint64_t>(maxFrameBytes, p.size);
     if (!writeFailed && !writeVideoPacket(stdout, p.pts_us,
         p.keyframe ? kFlagKeyframe : 0, p.data, p.size)) writeFailed = true;
   };
@@ -701,28 +767,41 @@ int runCapture(int argc, char** argv) {
       failed = true; break;
     }
 
-    if (cf.width != ecfg.width || cf.height != ecfg.height || !cf.bgra || cf.stride < cf.width * 4) {
+    if (cf.width != ecfg.srcWidth || cf.height != ecfg.srcHeight || !cf.bgra || cf.stride < cf.width * 4) {
       writeLog(stdout, "capture dimensions changed or invalid frame");
       failed = true; break;
     }
-    if (!enc.encodeBGRA(cf.bgra, cf.stride, cf.pts_us, sink, err)) {
+    // pts is the capture timestamp on the steady clock: the viewer uses it,
+    // with a clock offset from ping/pong, to measure glass-to-glass latency.
+    const uint64_t encStart = nowMicros();
+    if (cf.captured_us && cf.captured_us <= encStart) tCapture.add((encStart - cf.captured_us) / 1000.0);
+    // Backends without a grab timestamp (X11, test pattern) use "now".
+    // Encoders require strictly increasing timestamps.
+    lastPts = std::max(lastPts + 1, cf.captured_us ? cf.captured_us : encStart);
+    if (!enc.encodeBGRA(cf.bgra, cf.stride, lastPts, sink, err)) {
       writeJson(stdout, MsgType::Log, "encode failed: " + err);
       failed = true; break;
     }
+    tEncode.add((nowMicros() - encStart) / 1000.0);
     if (writeFailed) break;  // peer closed the pipe
     controls->flushRumble();
 
     ++frames;
+    ++windowFrames;
     const uint64_t now = nowMicros();
-    if (now - lastStats > 2000000) {
-      const double secs = double(now - started) / 1e6;
+    if (now - lastStats > 1000000) {
+      const double secs = double(now - lastStats) / 1e6;
       const std::string stats =
           "{\"frames\":" + std::to_string(frames) +
           ",\"bytes\":" + std::to_string(bytes) +
-          ",\"fps\":" + std::to_string(secs > 0 ? frames / secs : 0) +
-          ",\"kbps\":" + std::to_string(secs > 0 ? (bytes * 8.0 / 1000.0) / secs : 0) + "}";
+          ",\"fps\":" + std::to_string(secs > 0 ? windowFrames / secs : 0) +
+          ",\"kbps\":" + std::to_string(secs > 0 ? (windowBytes * 8.0 / 1000.0) / secs : 0) +
+          ",\"targetKbps\":" + std::to_string(enc.bitrateKbps()) +
+          ",\"maxFrameBytes\":" + std::to_string(maxFrameBytes) +
+          "," + tCapture.json("captureMs") + "," + tEncode.json("encodeMs") + "}";
       writeJson(stdout, MsgType::Stats, stats);
       lastStats = now;
+      windowFrames = windowBytes = maxFrameBytes = 0;
     }
 
     if (maxFrames > 0 && frames >= static_cast<uint64_t>(maxFrames)) break;
@@ -745,6 +824,19 @@ namespace ps { int runView(int argc, char** argv); }
 
 int main(int argc, char** argv) {
   av_log_set_level(AV_LOG_ERROR);
+#ifdef _WIN32
+  // Windows sleeps in 15.6 ms steps by default, which made capture pacing
+  // (and therefore latency) jitter by up to a whole frame. Ask for 1 ms for
+  // the life of this process, and tell the scheduler this is real-time-ish
+  // media work so it is not starved by a busy game.
+  timeBeginPeriod(1);
+  SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+  PROCESS_POWER_THROTTLING_STATE throttle{};
+  throttle.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  throttle.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+  throttle.StateMask = 0;  // never run this process in efficiency mode
+  SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttle, sizeof(throttle));
+#endif
 
   if (argc < 2) {
     fprintf(stderr,
@@ -764,6 +856,14 @@ int main(int argc, char** argv) {
   const std::string mode = argv[1];
   if (mode == "--version" || mode == "version") { printf("%s\n", PS_VERSION); return 0; }
   if (mode == "probe") return ps::runProbe();
+  if (mode == "list-monitors") {
+#ifdef PS_HAVE_DXGI
+    printf("%s\n", ps::listWindowsMonitorsJson().c_str());
+#else
+    printf("[]\n");  // Linux: the app asks the compositor (kscreen/xrandr) directly
+#endif
+    return 0;
+  }
   if (mode == "selftest") return ps::runSelftest(argc, argv);
   if (mode == "capture") return ps::runCapture(argc, argv);
 #ifdef PS_HAVE_AUDIO_CAPTURE

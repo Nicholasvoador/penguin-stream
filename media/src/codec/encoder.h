@@ -22,11 +22,16 @@ struct SwsContext;
 namespace ps {
 
 struct EncoderConfig {
-  int width = 1920;
+  int width = 1920;            // stream (output) size
   int height = 1080;
+  int srcWidth = 0;            // captured size; 0 = same as width/height (no scaling)
+  int srcHeight = 0;
   int fps = 60;
   int bitrateKbps = 15000;
-  int gopSeconds = 4;          // keyframe interval; also the recovery interval
+  // Periodic keyframes are only a safety net: loss is repaired by on-demand
+  // keyframes the viewer requests. Frequent IDRs are big frames that either
+  // blur (constant bitrate) or add a latency spike.
+  int gopSeconds = 10;
   std::string preferred;       // "auto", "vaapi", "nvenc", "x264"
 };
 
@@ -68,6 +73,8 @@ class Encoder {
   const std::vector<uint8_t>& extradata() const { return extradata_; }
   int width() const { return cfg_.width; }
   int height() const { return cfg_.height; }
+  int bitrateKbps() const { return cfg_.bitrateKbps; }
+  bool scaling() const { return srcW_ != cfg_.width || srcH_ != cfg_.height; }
 
  private:
   bool tryOpen(const std::string& encoderName, const EncoderConfig& cfg, bool rgbInput, std::string& error);
@@ -79,10 +86,12 @@ class Encoder {
   AVCodecContext* ctx_ = nullptr;
   AVFrame* swFrame_ = nullptr;   // NV12/YUV420P staging
   AVFrame* hwFrame_ = nullptr;   // hardware surface, when applicable
+  AVFrame* srcFrame_ = nullptr;  // wraps the caller's BGRA pixels (no copy)
   AVPacket* pkt_ = nullptr;
   AVBufferRef* hwDeviceCtx_ = nullptr;
   SwsContext* sws_ = nullptr;
   bool rgbInput_ = false;        // encoder converts BGRA on the GPU; no CPU colour conversion
+  int srcW_ = 0, srcH_ = 0;      // input (captured) size
   std::vector<uint8_t> extradata_;
   void applyBitrate(int bitrateKbps);
   static bool hasParameterSets(const uint8_t* data, size_t size);

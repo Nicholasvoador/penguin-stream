@@ -79,7 +79,8 @@ normally. You can also leave out other apps, or stream only one app (just the ga
 
 Every stage is chosen for latency first:
 
-- **Capture:** DXGI Desktop Duplication (Windows) or the PipeWire screencast portal (Wayland), plus X11.
+- **Capture:** DXGI Desktop Duplication (Windows) or the PipeWire screencast portal (Wayland), plus X11. One monitor by
+  default, and each new desktop frame goes to the encoder the moment it arrives.
 - **Encode:** hardware H.264 (NVENC `p1`+`ull`, AMF ultra-low-latency, Quick Sync `low_delay_brc`, VA-API depth 1),
   no B-frames, zero lookahead, **single-frame VBV** so no frame takes longer than one frame interval to send. On NVIDIA the GPU does
   the BGRA→YUV conversion (about 3 ms/frame less CPU work at 1440p).
@@ -89,6 +90,10 @@ Every stage is chosen for latency first:
 - **Display:** decoded with slice threads (no frame-threading delay) in a native SDL window, not a browser. By default each frame is
   presented the moment it's decoded (no V-Sync wait).
 - **Input** runs on its own path, and relative mouse motion is coalesced per frame.
+- **Adaptive bitrate:** the host lowers the bitrate as soon as video starts queueing and restores it when the connection is
+  clean, so a busy upload doesn't turn into seconds of delay.
+- **See it:** the live page measures every stage in milliseconds (capture → encode → network → decode → display) and tells
+  you which setting would help. Profiles switch between setups in one click.
 
 <img src="docs/assets/h-security.svg" alt="Security" width="100%">
 

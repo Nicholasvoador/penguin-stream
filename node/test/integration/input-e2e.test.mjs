@@ -37,6 +37,7 @@ test.after(() => cleanupTransport());
 
 test('input permissions, live toggles, controllers and rumble across a real session',
   { skip: !findMediaBinary() && 'media engine not built' }, async () => {
+    process.env.PS_IGNORE_LOCAL_CONTROLLERS = '1';  // a real pad plugged in here must not add events
     const rv = await startRendezvous({ port: 0, host: '127.0.0.1' });
     const homes = [fs.mkdtempSync(path.join(os.tmpdir(), 'ps-h-')), fs.mkdtempSync(path.join(os.tmpdir(), 'ps-v-'))];
     let host;
@@ -114,6 +115,7 @@ test('input permissions, live toggles, controllers and rumble across a real sess
       await rv.close();
       for (const h of homes) fs.rmSync(h, { recursive: true, force: true });
       delete process.env.PENGUIN_STREAM_HOME;
+      delete process.env.PS_IGNORE_LOCAL_CONTROLLERS;
     }
     if (uinputUsable) assert.equal(padDevices(), 0, 'no virtual controller may outlive the session');
   });

@@ -26,6 +26,7 @@
 #include <spa/param/props.h>
 #include <spa/utils/result.h>
 
+#include <algorithm>
 #include <condition_variable>
 #include <cmath>
 #include <map>
@@ -112,6 +113,13 @@ class PortalSource : public CaptureSource {
     width_ = height_ = 0;
     frameCount_ = 0;
     captureError_.clear();
+    wantMonitor_ = opts.monitor;
+    workspace_ = opts.workspace;
+    restoreTokenIn_ = opts.restoreToken;
+    restoreToken_.clear();
+    cropL_ = {};
+    cropPx_ = {};
+    note_.clear();
 
     if (!openPortalSession(error)) { stop(); return false; }
     if (!connectPipeWire(error)) { stop(); return false; }
@@ -149,25 +157,51 @@ class PortalSource : public CaptureSource {
   }
 
   bool nextFrame(CaptureFrame& out, std::string& error) override {
-    pumpPortal();
+    using Clock = std::chrono::steady_clock;
+    // Latency-first pacing: hand a new compositor frame to the encoder the
+    // moment it arrives (instead of sleeping to a fixed tick and taking
+    // whatever is there, which added up to one whole frame of delay), while a
+    // cadence grid keeps the average rate at the requested fps. Compositors
+    // only send frames when something changed; on a still desktop the last
+    // frame is repeated at a low rate so loss recovery keeps working.
+    const auto period = std::chrono::microseconds(1000000 / fps_);
+    const auto slack = period / 4;
+    const auto idleRepeat = std::chrono::milliseconds(100);
     std::unique_lock<std::mutex> lock(mu_);
-    // Compositors may send only damaged frames. Repeat the last owned frame
-    // on idle desktops, with bounded waits so stdin input remains responsive.
-    const auto now = std::chrono::steady_clock::now();
-    if (nextDue_ > now) cv_.wait_until(lock, nextDue_, [&] { return !running_; });
-    if (!running_) { error = captureError_.empty() ? "capture stopped" : captureError_; return false; }
-    nextDue_ = std::chrono::steady_clock::now() + std::chrono::microseconds(1000000 / fps_);
-    if (frontBuffer_.empty() && consumerBuffer_.empty()) { error = "no mapped compositor frame"; return false; }
-    if (frameReady_) {
+    bool fresh = false;
+    for (;;) {
+      if (!running_) { error = captureError_.empty() ? "capture stopped" : captureError_; return false; }
+      const auto now = Clock::now();
+      if (frameReady_ && now + slack >= nextDue_) { fresh = true; break; }
+      if (now >= lastEmit_ + idleRepeat && !(frontBuffer_.empty() && consumerBuffer_.empty())) {
+        fresh = frameReady_;
+        break;
+      }
+      auto wakeAt = frameReady_ ? nextDue_ - slack : lastEmit_ + idleRepeat;
+      if (wakeAt > now + std::chrono::milliseconds(20)) wakeAt = now + std::chrono::milliseconds(20);
+      cv_.wait_until(lock, wakeAt);
+      if (!frameReady_) {  // keep portal signals (session closed) flowing while idle
+        lock.unlock(); pumpPortal(); lock.lock();
+      }
+    }
+    const auto now = Clock::now();
+    nextDue_ = (now - nextDue_ > period) ? now + period : nextDue_ + period;
+    lastEmit_ = now;
+    uint64_t captured = steadyMicros();
+    if (fresh) {
       // O(1) buffer swap: eliminates copying full-resolution frame (~15 MB) on every frame.
       consumerBuffer_.swap(frontBuffer_);
       frameReady_ = false;
+      captured = frontCapturedUs_;
     }
     out.bgra = consumerBuffer_.data();
     out.stride = width_ * 4;
     out.width = width_;
     out.height = height_;
-    out.pts_us = emitted_++ * 1000000ull / static_cast<uint64_t>(fps_);
+    const uint64_t t = steadyMicros();
+    lastPts_ = std::max(lastPts_ + 1, t);
+    out.pts_us = lastPts_;
+    out.captured_us = captured;
     return true;
   }
 
@@ -233,6 +267,8 @@ class PortalSource : public CaptureSource {
   int width() const override { std::lock_guard<std::mutex> lock(mu_); return width_; }
   int height() const override { std::lock_guard<std::mutex> lock(mu_); return height_; }
   const char* name() const override { return "portal"; }
+  std::string restoreToken() const override { return restoreToken_; }
+  std::string captureNote() const override { return note_; }
 
  private:
   /* ------------------------------ portal ------------------------------ */
@@ -250,7 +286,16 @@ class PortalSource : public CaptureSource {
                       nullptr, nullptr, nullptr);
   }
   bool motion(double nx, double ny) {
-    const double x = nx * (inputWidth_ - 1), y = ny * (inputHeight_ - 1);
+    // Coordinates are in the stream's logical space. When we crop one monitor
+    // out of a whole-workspace stream, map into that monitor's rectangle.
+    double x, y;
+    if (cropL_.valid()) {
+      x = cropL_.x + nx * (cropL_.w - 1);
+      y = cropL_.y + ny * (cropL_.h - 1);
+    } else {
+      x = nx * (inputWidth_ - 1);
+      y = ny * (inputHeight_ - 1);
+    }
     notify("NotifyPointerMotionAbsolute", g_variant_new("(o@a{sv}udd)",
         sessionHandle_.c_str(), g_variant_new_array(G_VARIANT_TYPE("{sv}"), nullptr, 0), nodeId_, x, y));
     return true;
@@ -399,6 +444,12 @@ class PortalSource : public CaptureSource {
       g_variant_builder_init(&opts, G_VARIANT_TYPE_VARDICT);
       g_variant_builder_add(&opts, "{sv}", "handle_token", g_variant_new_string(token.c_str()));
       g_variant_builder_add(&opts, "{sv}", "types", g_variant_new_uint32(3)); // keyboard + pointer
+      // Remember the choice (screen + control) until revoked, so the next
+      // share starts without the picker. Remote desktop sessions persist via
+      // SelectDevices; screen-cast-only sessions via SelectSources.
+      g_variant_builder_add(&opts, "{sv}", "persist_mode", g_variant_new_uint32(2));
+      if (!restoreTokenIn_.empty())
+        g_variant_builder_add(&opts, "{sv}", "restore_token", g_variant_new_string(restoreTokenIn_.c_str()));
       if (!callAndWait("SelectDevices", g_variant_new("(oa{sv})", sessionHandle_.c_str(), &opts),
                        token, nullptr, error, 30)) return false;
     }
@@ -413,6 +464,11 @@ class PortalSource : public CaptureSource {
       g_variant_builder_add(&opts, "{sv}", "multiple", g_variant_new_boolean(FALSE));
       // Cursor must be drawn into the frame, or the remote user cannot aim.
       g_variant_builder_add(&opts, "{sv}", "cursor_mode", g_variant_new_uint32(2));
+      if (!allowInput_) {
+        g_variant_builder_add(&opts, "{sv}", "persist_mode", g_variant_new_uint32(2));
+        if (!restoreTokenIn_.empty())
+          g_variant_builder_add(&opts, "{sv}", "restore_token", g_variant_new_string(restoreTokenIn_.c_str()));
+      }
 
       GVariant* results = nullptr;
       if (!callAndWait("SelectSources",
@@ -454,8 +510,15 @@ class PortalSource : public CaptureSource {
         return false;
       }
 
+      {
+        const char* tok = nullptr;
+        if (g_variant_lookup(results, "restore_token", "&s", &tok) && tok && std::strlen(tok) < 512)
+          restoreToken_ = tok;
+      }
       GVariant* first = g_variant_get_child_value(streams, 0);
       GVariant* props = nullptr;
+      bool havePos = false;
+      gint32 px = 0, py = 0;
       g_variant_get(first, "(u@a{sv})", &nodeId_, &props);
       if (props) {
         gint32 w = 0, h = 0;
@@ -463,14 +526,17 @@ class PortalSource : public CaptureSource {
         if (size) {
           g_variant_get(size, "(ii)", &w, &h);
           g_variant_unref(size);
-          if (w > 0 && h > 0 && w <= 8192 && h <= 8192) {
+          if (w > 0 && h > 0 && w <= 16384 && h <= 16384) {
             width_ = w & ~1; height_ = h & ~1;
             inputWidth_ = w; inputHeight_ = h;
           }
         }
+        GVariant* pos = g_variant_lookup_value(props, "position", G_VARIANT_TYPE("(ii)"));
+        if (pos) { g_variant_get(pos, "(ii)", &px, &py); g_variant_unref(pos); havePos = true; }
         g_variant_unref(props);
       }
       g_variant_unref(first);
+      chooseCrop(havePos, px, py);
       g_variant_unref(streams);
       g_variant_unref(results);
     }
@@ -559,8 +625,21 @@ class PortalSource : public CaptureSource {
     self->formatHeight_ = info.size.height;
     self->format_ = info.format;
     if (info.size.width > 0 && info.size.height > 0) {
-      self->width_ = static_cast<int>(info.size.width) & ~1;
-      self->height_ = static_cast<int>(info.size.height) & ~1;
+      self->cropPx_ = {0, 0, static_cast<int>(info.size.width), static_cast<int>(info.size.height)};
+      if (self->cropL_.valid() && self->inputWidth_ > 0 && self->inputHeight_ > 0) {
+        // Logical -> buffer pixels (differs when the desktop is scaled).
+        const double sx = double(info.size.width) / self->inputWidth_;
+        const double sy = double(info.size.height) / self->inputHeight_;
+        Rect c{int(self->cropL_.x * sx + 0.5), int(self->cropL_.y * sy + 0.5),
+               int(self->cropL_.w * sx + 0.5), int(self->cropL_.h * sy + 0.5)};
+        c.x = std::clamp(c.x, 0, int(info.size.width) - 2);
+        c.y = std::clamp(c.y, 0, int(info.size.height) - 2);
+        c.w = std::min(c.w, int(info.size.width) - c.x);
+        c.h = std::min(c.h, int(info.size.height) - c.y);
+        if (c.w >= 2 && c.h >= 2) self->cropPx_ = c;
+      }
+      self->width_ = self->cropPx_.w & ~1;
+      self->height_ = self->cropPx_.h & ~1;
       self->backBuffer_.assign(static_cast<size_t>(self->width_) * self->height_ * 4, 0);
       self->frontBuffer_.assign(self->backBuffer_.size(), 0);
     }
@@ -587,10 +666,11 @@ class PortalSource : public CaptureSource {
       std::lock_guard<std::mutex> lock(mu_);
       if (width_ <= 0 || height_ <= 0 || width_ > 8192 || height_ > 8192) return;
       const size_t rowBytes = static_cast<size_t>(width_) * 4;
-      const size_t needed = static_cast<size_t>(height_ - 1) * srcStride + rowBytes;
-      if (static_cast<size_t>(srcStride) < rowBytes || plane.chunk->offset > plane.maxsize ||
+      const size_t cx = static_cast<size_t>(cropPx_.x), cy = static_cast<size_t>(cropPx_.y);
+      const size_t needed = (cy + height_ - 1) * srcStride + (cx * 4) + rowBytes;
+      if (static_cast<size_t>(srcStride) < (cx * 4) + rowBytes || plane.chunk->offset > plane.maxsize ||
           needed > plane.maxsize - plane.chunk->offset || needed > plane.chunk->size) return;
-      const uint8_t* src = static_cast<const uint8_t*>(plane.data) + plane.chunk->offset;
+      const uint8_t* src = static_cast<const uint8_t*>(plane.data) + plane.chunk->offset + cy * srcStride + cx * 4;
       if (backBuffer_.size() != static_cast<size_t>(width_) * height_ * 4) {
         backBuffer_.assign(static_cast<size_t>(width_) * height_ * 4, 0);
       }
@@ -620,7 +700,8 @@ class PortalSource : public CaptureSource {
         }
       }
       frontBuffer_.swap(backBuffer_);
-      ptsUs_ = static_cast<uint64_t>(frameCount_++) * 1000000ull / static_cast<uint64_t>(fps_);
+      frontCapturedUs_ = steadyMicros();
+      ++frameCount_;
       frameReady_ = true;
     }
     cv_.notify_one();
@@ -749,9 +830,40 @@ class PortalSource : public CaptureSource {
   int height_ = 0;
   int fps_ = 60;
   uint64_t frameCount_ = 0;
-  uint64_t ptsUs_ = 0;
-  uint64_t emitted_ = 0;
+  uint64_t frontCapturedUs_ = 0;
+  uint64_t lastPts_ = 0;
   std::chrono::steady_clock::time_point nextDue_{};
+  std::chrono::steady_clock::time_point lastEmit_{};
+
+  // monitor selection
+  Rect wantMonitor_, workspace_;
+  Rect cropL_;    // logical crop inside the stream (empty = whole stream)
+  Rect cropPx_;   // same in buffer pixels
+  std::string restoreTokenIn_, restoreToken_, note_;
+
+  // Picks the monitor out of a whole-workspace stream. KDE's picker offers
+  // "Full workspace" (all screens as one wide image); if that is what came
+  // back and the user chose a monitor in Penguin Stream, crop to it.
+  void chooseCrop(bool havePos, int px, int py) {
+    cropL_ = {};
+    const int sw = inputWidth_, sh = inputHeight_;
+    if (!wantMonitor_.valid() || sw <= 0 || sh <= 0) return;
+    const bool biggerThanMonitor = sw > wantMonitor_.w + 8 || sh > wantMonitor_.h + 8;
+    if (!biggerThanMonitor) return;  // user picked a single screen in the dialog: honour it
+    int ox = 0, oy = 0;
+    if (havePos) { ox = px; oy = py; }
+    else if (workspace_.valid()) { ox = workspace_.x; oy = workspace_.y; }
+    Rect c{wantMonitor_.x - ox, wantMonitor_.y - oy, wantMonitor_.w, wantMonitor_.h};
+    if (c.x < 0 || c.y < 0 || c.x + c.w > sw + 2 || c.y + c.h > sh + 2) {
+      note_ = "the shared area does not contain the chosen monitor; streaming everything that was shared";
+      return;
+    }
+    c.w = std::min(c.w, sw - c.x);
+    c.h = std::min(c.h, sh - c.y);
+    cropL_ = c;
+    note_ = "whole workspace shared; streaming only the chosen monitor (" + std::to_string(c.w) + "x" +
+            std::to_string(c.h) + " at " + std::to_string(c.x) + "," + std::to_string(c.y) + ")";
+  }
 };
 
 }  // namespace
