@@ -68,6 +68,27 @@ export function findMediaBinary() {
   return null;
 }
 
+/**
+ * Maps the media engine's monotonic clock onto this process's.
+ *
+ * On Linux both are CLOCK_MONOTONIC, but on Windows std::chrono::steady_clock
+ * (QueryPerformanceCounter) and Node's hrtime have different origins, so a raw
+ * engine timestamp is meaningless here. Each stats message carries the
+ * engine's "now"; the smallest (node - engine) difference seen is the best
+ * estimate of the offset (pipe delay only ever adds to it).
+ */
+export class EngineClock {
+  constructor() { this.offset = null; }
+  observe(engineNow) {
+    if (!Number.isFinite(engineNow) || engineNow <= 0) return;
+    const d = Number(process.hrtime.bigint() / 1000n) - engineNow;
+    if (this.offset === null || d < this.offset) this.offset = d;
+  }
+  /** engine µs -> node µs (identity until the first observation). */
+  toNode(engineUs) { return engineUs + (this.offset ?? 0); }
+  toEngine(nodeUs) { return nodeUs - (this.offset ?? 0); }
+}
+
 /** Incremental parser for the framed stdio protocol. */
 export class FrameParser {
   constructor() {
@@ -133,6 +154,7 @@ export class CaptureEngine extends EventEmitter {
     this.config = null;
     this.parser = new FrameParser();
     this.stats = { frames: 0, bytes: 0 };
+    this.clock = new EngineClock();
   }
 
   start() {
@@ -188,6 +210,8 @@ export class CaptureEngine extends EventEmitter {
       case MsgType.Config: {
         try {
           this.config = JSON.parse(msg.payload.toString('utf8'));
+          this.clock.observe(this.config.now);
+          delete this.config.now;   // engine-local; meaningless to the peer
           this.emit('config', this.config);
         } catch {
           this.emit('error', new Error('ps-media sent malformed config'));
@@ -203,7 +227,11 @@ export class CaptureEngine extends EventEmitter {
         break;
       }
       case MsgType.Stats:
-        try { this.emit('stats', JSON.parse(msg.payload.toString('utf8'))); } catch { /* ignore */ }
+        try {
+          const s = JSON.parse(msg.payload.toString('utf8'));
+          this.clock.observe(s.now);
+          this.emit('stats', s);
+        } catch { /* ignore */ }
         break;
       case MsgType.Log:
         this.emit('log', msg.payload.toString('utf8'));
@@ -281,6 +309,7 @@ export class ViewEngine extends EventEmitter {
     this.proc = null;
     this.parser = new FrameParser();
     this.configSent = false;
+    this.clock = new EngineClock();
   }
 
   start() {
@@ -293,6 +322,7 @@ export class ViewEngine extends EventEmitter {
     if (this.opts.sendKbm === false) args.push('--no-kbm');
     if (this.opts.sendPad === false) args.push('--no-gamepad');
     if (this.opts.lowLatency || this.opts.noVsync) args.push('--low-latency');
+    if (this.opts.overlay === true) args.push('--overlay');
 
     // No windowsHide here: on Windows it sets SW_HIDE in STARTUPINFO, which
     // the child's first ShowWindow obeys - the stream window would stay hidden.
@@ -313,7 +343,7 @@ export class ViewEngine extends EventEmitter {
           try {
             const m = JSON.parse(msg.payload.toString('utf8'));
             if (m?.t === 'viewer-state') this.emit('viewer-state', m);
-            else if (m?.t === 'view-stats') this.emit('view-stats', m);
+            else if (m?.t === 'view-stats') { this.clock.observe(m.now); this.emit('view-stats', m); }
           } catch { /* ignore */ }
         } else if (msg.type === MsgType.Log) {
           this.emit('log', msg.payload.toString('utf8'));
@@ -340,11 +370,16 @@ export class ViewEngine extends EventEmitter {
     return this.#write(encodeMessage(MsgType.VideoPacket, payload));
   }
 
-  /** Live toggles from the UI: { kbm?, pad?, capture? } (booleans). */
+  /** Live toggles from the UI: { kbm?, pad?, capture?, overlay? } (booleans). */
   setInput(state) {
     const msg = { t: 'viewer-set' };
-    for (const k of ['kbm', 'pad', 'capture']) if (typeof state?.[k] === 'boolean') msg[k] = state[k];
+    for (const k of ['kbm', 'pad', 'capture', 'overlay']) if (typeof state?.[k] === 'boolean') msg[k] = state[k];
     return this.#control(msg);
+  }
+
+  /** Stats text for the in-window overlay (shown only while it is switched on). */
+  overlay(text) {
+    return this.#control({ t: 'overlay', text: String(text).slice(0, 3000) });
   }
 
   /** What the host currently allows, shown in the viewer's title bar. */

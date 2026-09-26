@@ -52,6 +52,7 @@ function go(name) {
   for (const b of document.querySelectorAll('.nav-item')) b.classList.toggle('active', b.dataset.page === navKey);
   $('page-title').textContent = TITLES[name] || '';
   if (name === 'network' && !netResult) runNetcheck();
+  if (name === 'log') loadLogFile();
 }
 for (const b of document.querySelectorAll('.nav-item')) b.onclick = () => go(b.dataset.page);
 $('net-mini').onclick = () => go('network');
@@ -517,6 +518,7 @@ function renderInput(state) {
   $('live-send-kbm').checked = vs ? vs.kbm : $('view-send-kbm').checked;
   $('live-send-pad').checked = vs ? vs.pad : $('view-send-pad').checked;
   $('live-capture').checked = vs ? vs.capture : false;
+  $('live-overlay').checked = vs ? vs.overlay === true : settings?.overlay === true;
   $('live-capture').disabled = !(vs ? vs.kbm : true);
   $('viewer-pad-count').textContent = vs && vs.pads ? `(${vs.pads} connected)` : '';
   const hp = state.hostPermissions;
@@ -697,7 +699,7 @@ $('connect-form').onsubmit = async (e) => {
   if (!code) { $('code-input').focus(); return; }
   try {
     await api('connect', {
-      code, ...sessionOptions(),
+      code, ...sessionOptions(), overlay: settings?.overlay === true,
       sendKbm: $('view-send-kbm').checked,
       sendPad: $('view-send-pad').checked,
     });
@@ -720,6 +722,35 @@ const liveViewerInput = async (key, el) => {
 $('live-send-kbm').onchange = () => liveViewerInput('kbm', $('live-send-kbm'));
 $('live-send-pad').onchange = () => liveViewerInput('pad', $('live-send-pad'));
 $('live-capture').onchange = () => liveViewerInput('capture', $('live-capture'));
+$('live-overlay').onchange = () => liveViewerInput('overlay', $('live-overlay'));
+
+/* ------------------------------ troubleshooting log ------------------------------ */
+
+async function loadLogFile() {
+  try {
+    const r = await api('logs');
+    $('log-path').textContent = r.path;
+    const el = $('logfile');
+    el.textContent = r.text || '(empty)';
+    el.scrollTop = el.scrollHeight;
+  } catch (e) { $('logfile').textContent = `Could not read the log: ${e.message}`; }
+}
+$('log-refresh').onclick = loadLogFile;
+$('log-open').onclick = async () => {
+  try { const r = await api('logs/open', {}); $('diag-status').textContent = `Opened ${r.dir}`; }
+  catch (e) { toast(e.message, true); }
+};
+$('diag-save').onclick = async () => {
+  const btn = $('diag-save');
+  btn.disabled = true;
+  $('diag-status').textContent = 'Collecting…';
+  try {
+    const r = await api('diagnostics', {});
+    $('diag-status').textContent = `✓ Saved ${r.path}`;
+    loadLogFile();
+  } catch (e) { $('diag-status').textContent = `✗ ${e.message}`; }
+  finally { btn.disabled = false; }
+};
 
 $('copy-invitation').onclick = async () => {
   const invitation = lastState?.code;

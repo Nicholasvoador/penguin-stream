@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.1 — 2026-09-26
+
+### Zero-copy and memory optimizations
+- **Windows cursor capture**: replaced full-frame memory copies (~15 MB/frame at 1440p) with sub-rectangle cursor compositing, saving and restoring only the small bounding box under the cursor pointer.
+- **Wayland PipeWire zero-copy**: frame buffers pass directly to the encoder without intermediate back-buffer copying whenever strides match.
+- **Direct NVENC memory access**: NVENC reads capture frames directly from capture memory without allocating and copying to intermediate staging buffers (with automatic fallback).
+
+### Latency and pacing
+- **Zero-wait frame pacing**: minimum frame spacing of `0.6 * period` with dynamic budget accounting, eliminating fixed capture wait latency across high-refresh displays (144 Hz, 165 Hz, 240 Hz) and 60 Hz sources.
+- **Monotonic clock sync**: aligned timestamp clocks between the C++ engine and Node application, ensuring accurate latency breakdown reporting on Windows hosts.
+
+### Intra-refresh loss recovery
+- **H.264 intra-refresh**: cyclic column intra-refresh for NVENC and libx264 enables smooth video recovery from packet loss within ~1 s without sending massive IDR keyframe spikes.
+- **Keyframe suppression**: suppresses redundant full keyframe requests when intra-refresh is active to prevent bandwidth spikes on lossy networks.
+
+### Diagnostics and HUD overlay
+- **Troubleshooting logbook**: rotating plain-text diagnostics saved to `%APPDATA%\penguin-stream\logbook.txt` on Windows and `~/.local/state/penguin-stream/logbook.txt` on Linux, with periodic 10s stream health metrics.
+- **Activity log export**: Web UI Activity tab allows viewing recent log entries and downloading a sanitized diagnostic report with one click.
+- **In-stream HUD overlay**: low-overhead performance HUD using an embedded Hack monospace bitmap font (toggled OFF by default; enable via Ctrl+Alt+Shift+S or settings).
+
+### Compatibility
+- Fully backwards-compatible with 1.2.0 and 1.1.2.
+
 ## 1.2.0 — 2026-09-26
 
 ### Monitors

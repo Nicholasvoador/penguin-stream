@@ -1,18 +1,21 @@
-# Dependencies and distribution limits
+# Third-party software
 
-The MIT license applies to this project's original code, not third-party software.
-This prototype does not embed Sunshine or Moonlight source. Its architecture uses
-FFmpeg and platform capture APIs plus node-datachannel/libdatachannel and ws.
+Penguin Stream's own code is MIT-licensed (see [LICENSE](LICENSE)). The apps also ship with the components below, each under
+its own license. The Windows installers include copies in `resources/bin/licenses/`.
 
-`npm ci` installs pinned dependency versions from package-lock.json, with their
-respective licenses and transitive dependencies. Node dependencies are not bundled.
-The included local Linux `ps-media` executable is dynamically linked to the local
-FFmpeg, SDL2, PipeWire, GLib and system libraries; inspect with `ldd` before use.
-Matching shared libraries must be separately installed. FFmpeg licensing depends
-on build configuration and enabled codecs (LGPL/GPL and possibly nonredistributable
-combinations). Review the exact FFmpeg build and all corresponding obligations
-before external binary distribution. This archive is a local development artifact,
-not a reviewed redistributable release or a Windows installer.
+| Component | Used for | License | Shipped in |
+|---|---|---|---|
+| [FFmpeg](https://ffmpeg.org) (`libavcodec`, `libavutil`, `libswscale`, `libswresample`) | Video encoding/decoding and scaling | GPL v3 build (BtbN win64-gpl-shared) on Windows; the distribution's build on Fedora | Windows: DLLs · Fedora: system package |
+| [SDL2](https://libsdl.org) | Stream window, input, controllers, audio playback | zlib | Windows: DLL · Fedora: system package |
+| [ViGEmClient](https://github.com/nefarius/ViGEmClient) | Virtual Xbox controllers on a Windows host (needs the ViGEmBus driver) | MIT | Compiled into `ps-media.exe` |
+| [Electron](https://www.electronjs.org) | Desktop app shell | MIT (Chromium: BSD-style + others, see `LICENSES.chromium.html` in the app folder) | Both |
+| [node-datachannel](https://github.com/murat-dogan/node-datachannel) / [libdatachannel](https://github.com/paullouisageneau/libdatachannel) | WebRTC transport (ICE, DTLS, SCTP) | MPL 2.0 | Both |
+| [ws](https://github.com/websockets/ws) | Local UI and rendezvous WebSockets | MIT | Both |
+| [@noble/secp256k1](https://github.com/paulmillr/noble-secp256k1) | Nostr signaling signatures | MIT | Both |
+| [Hack](https://sourcefoundry.org/hack/) font, bold (glyphs 32–126 baked into `media/src/render/overlay_font.h` by `scripts/gen-overlay-font.py`) | Text in the stream-window overlay | MIT + Bitstream Vera License | Compiled into `ps-media` |
+| PipeWire, GLib, libX11 | Wayland/X11 capture and audio on Linux | LGPL / MIT-style | Fedora: system packages |
 
-Rebuild from included source with CMake for other machines. No captured media,
-identity files, credentials, node_modules, Git history or test logs are included.
+FFmpeg's GPL build means the Windows `ps-media.exe` as a whole is distributed under the GPL v3 terms. Its complete source is
+this repository plus the exact upstream archives listed in `resources/bin/licenses/SOURCES.txt`.
+
+The project does not include Sunshine or Moonlight code.

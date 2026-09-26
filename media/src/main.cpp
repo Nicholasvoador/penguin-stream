@@ -731,10 +731,12 @@ int runCapture(int argc, char** argv) {
   const std::string config =
       "{\"codec\":\"h264\",\"width\":" + std::to_string(enc.width()) +
       ",\"height\":" + std::to_string(enc.height()) +
+      ",\"now\":" + std::to_string(nowMicros()) +
       ",\"sourceWidth\":" + std::to_string(ecfg.srcWidth) +
       ",\"sourceHeight\":" + std::to_string(ecfg.srcHeight) +
       ",\"fps\":" + std::to_string(fps) +
       ",\"encoder\":\"" + jsonEscape(enc.backendName()) + "\"" +
+      ",\"intraRefresh\":" + (enc.intraRefreshActive() ? "true" : "false") +
       ",\"capture\":\"" + jsonEscape(source->name()) + "\"" +
       ",\"extradata\":\"" + extraHex + "\"}";
   if (!writeJson(stdout, MsgType::Config, config)) return 1;
@@ -798,6 +800,7 @@ int runCapture(int argc, char** argv) {
           ",\"kbps\":" + std::to_string(secs > 0 ? (windowBytes * 8.0 / 1000.0) / secs : 0) +
           ",\"targetKbps\":" + std::to_string(enc.bitrateKbps()) +
           ",\"maxFrameBytes\":" + std::to_string(maxFrameBytes) +
+          ",\"now\":" + std::to_string(nowMicros()) +
           "," + tCapture.json("captureMs") + "," + tEncode.json("encodeMs") + "}";
       writeJson(stdout, MsgType::Stats, stats);
       lastStats = now;

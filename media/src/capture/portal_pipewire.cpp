@@ -27,6 +27,7 @@
 #include <spa/utils/result.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <condition_variable>
 #include <cmath>
 #include <map>
@@ -121,7 +122,15 @@ class PortalSource : public CaptureSource {
     cropPx_ = {};
     note_.clear();
 
-    if (!openPortalSession(error)) { stop(); return false; }
+    // Test hook: read a PipeWire video node directly (no portal, no dialog).
+    // Exercises exactly the same buffer/zero-copy code as a real share.
+    if (const char* node = std::getenv("PS_PIPEWIRE_NODE")) {
+      directNode_ = static_cast<uint32_t>(std::strtoul(node, nullptr, 10));
+      nodeId_ = directNode_;
+    } else {
+      directNode_ = 0;
+      if (!openPortalSession(error)) { stop(); return false; }
+    }
     if (!connectPipeWire(error)) { stop(); return false; }
     std::unique_lock<std::mutex> lock(mu_);
     if (!cv_.wait_for(lock, std::chrono::seconds(15), [&] { return frameReady_ || !running_; })) {
@@ -135,15 +144,44 @@ class PortalSource : public CaptureSource {
   }
 
   void stop() override {
+    {
+      // Wake a PipeWire thread waiting in onRemoveBuffer before joining it.
+      std::lock_guard<std::mutex> lock(mu_);
+      running_ = false;
+      inUseBusy_ = false;
+    }
+    cv_.notify_all();
     releaseHeld();
     {
       std::lock_guard<std::recursive_mutex> lock(inputMu_);
       inputGranted_ = false;
     }
+    if (threadLoop_ && stream_) {
+      // Give held buffers back and disconnect cleanly while the loop still
+      // runs. Destroying a stream that still holds dequeued buffers leaves the
+      // producer short of buffers, and the next capture of the same source
+      // received no frames at all.
+      pw_thread_loop_lock(threadLoop_);
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (pending_) pw_stream_queue_buffer(stream_, pending_);
+        if (inUse_) pw_stream_queue_buffer(stream_, inUse_);
+        pending_ = inUse_ = nullptr;
+        pendingData_ = inUseData_ = nullptr;
+      }
+      pw_stream_disconnect(stream_);
+      pw_thread_loop_unlock(threadLoop_);
+    }
     if (threadLoop_) {
       pw_thread_loop_stop(threadLoop_);
     }
     if (stream_) { pw_stream_destroy(stream_); stream_ = nullptr; }
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      pending_ = inUse_ = nullptr;
+      pendingData_ = inUseData_ = nullptr;
+      buffers_ = 0;
+    }
     if (core_) { pw_core_disconnect(core_); core_ = nullptr; }
     if (context_) { pw_context_destroy(context_); context_ = nullptr; }
     if (threadLoop_) { pw_thread_loop_destroy(threadLoop_); threadLoop_ = nullptr; }
@@ -158,26 +196,59 @@ class PortalSource : public CaptureSource {
 
   bool nextFrame(CaptureFrame& out, std::string& error) override {
     using Clock = std::chrono::steady_clock;
-    // Latency-first pacing: hand a new compositor frame to the encoder the
-    // moment it arrives (instead of sleeping to a fixed tick and taking
-    // whatever is there, which added up to one whole frame of delay), while a
-    // cadence grid keeps the average rate at the requested fps. Compositors
-    // only send frames when something changed; on a still desktop the last
-    // frame is repeated at a low rate so loss recovery keeps working.
+    // Latency-first pacing: a new compositor frame goes to the encoder the
+    // moment it arrives. A token bucket keeps the average at the requested
+    // fps (one token per frame period, at most one banked) and a minimum
+    // spacing of 0.6 periods stops bursts. Unlike a fixed timer grid, a frame
+    // never waits for a tick: simulated over 30-240 Hz desktops this removes
+    // an average of 2-4 ms (up to 16 ms) of waiting per frame when the
+    // desktop refreshes faster than the stream (e.g. 144 Hz -> 60 fps).
+    // On a still desktop the last frame is repeated at ~10 fps so loss
+    // recovery keeps working.
     const auto period = std::chrono::microseconds(1000000 / fps_);
-    const auto slack = period / 4;
+    const auto minGap = period * 6 / 10;
     const auto idleRepeat = std::chrono::milliseconds(100);
     std::unique_lock<std::mutex> lock(mu_);
+    // The encoder is done with the frame we handed out last time.
+    inUseBusy_ = false;
+    cv_.notify_all();
     bool fresh = false;
     for (;;) {
       if (!running_) { error = captureError_.empty() ? "capture stopped" : captureError_; return false; }
       const auto now = Clock::now();
-      if (frameReady_ && now + slack >= nextDue_) { fresh = true; break; }
-      if (now >= lastEmit_ + idleRepeat && !(frontBuffer_.empty() && consumerBuffer_.empty())) {
+      // Tokens accrue one per period, capped at one banked frame.
+      const double tokens = std::min(1.0, tokens_ + std::chrono::duration<double>(now - tokensAt_) /
+                                              std::chrono::duration<double>(period));
+      // Earliest moment a fresh frame may go: spacing met and at least half a
+      // token in the bucket (the bucket may dip to -0.5, then must refill).
+      const auto budgetAt = now + std::chrono::duration_cast<Clock::duration>(
+          std::chrono::duration<double, std::micro>(std::max(0.0, 0.5 - tokens) * period.count()));
+      auto readyAt = std::max(lastEmit_ + minGap, budgetAt);
+      // Desktop faster than the stream (e.g. 144 Hz -> 60 fps): if the frame
+      // we are holding has already aged past half the desktop's frame
+      // interval, the next one is closer than the old one is stale - wait for
+      // it (bounded) and send fresh pixels instead.
+      if (frameReady_ && now >= readyAt && arrivalUs_ > 0 && arrivalUs_ < period.count() * 0.9) {
+        const int64_t age = static_cast<int64_t>(steadyMicros()) - static_cast<int64_t>(frontCapturedUs_);
+        const int64_t giveUp = static_cast<int64_t>(frontCapturedUs_) + static_cast<int64_t>(arrivalUs_ * 1.5);
+        if (age > arrivalUs_ / 2 && static_cast<int64_t>(steadyMicros()) < giveUp) {
+          readyAt = now + std::chrono::microseconds(giveUp - static_cast<int64_t>(steadyMicros()));
+          heldFor_ = frontCapturedUs_;
+        }
+      }
+      if (frameReady_ && now >= readyAt) { fresh = true; tokens_ = tokens - 1.0; tokensAt_ = now; break; }
+      // A newer frame replaced the one we were holding back for: take it now.
+      if (frameReady_ && heldFor_ && frontCapturedUs_ != heldFor_ && now >= lastEmit_ + minGap && tokens >= 0.5) {
+        fresh = true; tokens_ = tokens - 1.0; tokensAt_ = now; heldFor_ = 0; break;
+      }
+      const bool haveImage = inUseData_ || !(frontBuffer_.empty() && consumerBuffer_.empty());
+      if (now >= lastEmit_ + idleRepeat && haveImage) {
         fresh = frameReady_;
+        tokens_ = tokens - 1.0;
+        tokensAt_ = now;
         break;
       }
-      auto wakeAt = frameReady_ ? nextDue_ - slack : lastEmit_ + idleRepeat;
+      auto wakeAt = frameReady_ ? readyAt : lastEmit_ + idleRepeat;
       if (wakeAt > now + std::chrono::milliseconds(20)) wakeAt = now + std::chrono::milliseconds(20);
       cv_.wait_until(lock, wakeAt);
       if (!frameReady_) {  // keep portal signals (session closed) flowing while idle
@@ -185,17 +256,44 @@ class PortalSource : public CaptureSource {
       }
     }
     const auto now = Clock::now();
-    nextDue_ = (now - nextDue_ > period) ? now + period : nextDue_ + period;
     lastEmit_ = now;
+    heldFor_ = 0;
     uint64_t captured = steadyMicros();
-    if (fresh) {
-      // O(1) buffer swap: eliminates copying full-resolution frame (~15 MB) on every frame.
+    if (fresh && pending_) {
+      // Zero-copy frame: promote it and hand the previous one back to
+      // PipeWire. Lock order everywhere is PipeWire loop -> mu_.
+      lock.unlock();
+      pw_thread_loop_lock(threadLoop_);
+      lock.lock();
+      struct pw_buffer* old = nullptr;
+      if (pending_) {
+        old = inUse_;
+        inUse_ = pending_;
+        inUseData_ = pendingData_;
+        inUseStride_ = pendingStride_;
+        pending_ = nullptr;
+        captured = frontCapturedUs_;
+      }
+      frameReady_ = false;
+      if (old) pw_stream_queue_buffer(stream_, old);
+      pw_thread_loop_unlock(threadLoop_);
+      if (!running_) { error = captureError_.empty() ? "capture stopped" : captureError_; return false; }
+    } else if (fresh) {
+      // Copy path: O(1) swap with the buffer the PipeWire thread filled.
       consumerBuffer_.swap(frontBuffer_);
       frameReady_ = false;
       captured = frontCapturedUs_;
+      inUseData_ = nullptr;   // switched back to copying (e.g. format change)
     }
-    out.bgra = consumerBuffer_.data();
-    out.stride = width_ * 4;
+    if (inUseData_) {
+      inUseBusy_ = true;      // PipeWire must not free it until the next call
+      out.bgra = inUseData_;
+      out.stride = inUseStride_;
+    } else {
+      if (consumerBuffer_.empty()) { error = "no mapped compositor frame"; return false; }
+      out.bgra = consumerBuffer_.data();
+      out.stride = width_ * 4;
+    }
     out.width = width_;
     out.height = height_;
     const uint64_t t = steadyMicros();
@@ -624,6 +722,8 @@ class PortalSource : public CaptureSource {
     self->formatWidth_ = info.size.width;
     self->formatHeight_ = info.size.height;
     self->format_ = info.format;
+    self->zeroCopy_ = (info.format == SPA_VIDEO_FORMAT_BGRx || info.format == SPA_VIDEO_FORMAT_BGRA) &&
+                      !std::getenv("PS_PORTAL_COPY");
     if (info.size.width > 0 && info.size.height > 0) {
       self->cropPx_ = {0, 0, static_cast<int>(info.size.width), static_cast<int>(info.size.height)};
       if (self->cropL_.valid() && self->inputWidth_ > 0 && self->inputHeight_ > 0) {
@@ -647,14 +747,71 @@ class PortalSource : public CaptureSource {
 
   static void onStreamProcess(void* data) {
     auto* self = static_cast<PortalSource*>(data);
-    struct pw_buffer* b = pw_stream_dequeue_buffer(self->stream_);
+    // Only the newest frame matters: give older queued ones straight back.
+    struct pw_buffer* b = nullptr;
+    while (struct pw_buffer* nb = pw_stream_dequeue_buffer(self->stream_)) {
+      if (b) pw_stream_queue_buffer(self->stream_, b);
+      b = nb;
+    }
     if (!b) return;
 
     struct spa_buffer* buf = b->buffer;
     if (buf->n_datas > 0 && buf->datas[0].data) {
+      if (self->holdForEncoder(b)) return;   // zero-copy: the encoder reads PipeWire's memory
       self->consume(buf);
     }
     pw_stream_queue_buffer(self->stream_, b);
+  }
+
+  static void onAddBuffer(void* data, struct pw_buffer*) {
+    auto* self = static_cast<PortalSource*>(data);
+    std::lock_guard<std::mutex> lock(self->mu_);
+    ++self->buffers_;
+  }
+
+  // PipeWire is about to free this buffer (renegotiation or shutdown). If the
+  // encoder is still reading it, wait until it has finished with that frame.
+  static void onRemoveBuffer(void* data, struct pw_buffer* b) {
+    auto* self = static_cast<PortalSource*>(data);
+    std::unique_lock<std::mutex> lock(self->mu_);
+    --self->buffers_;
+    if (b == self->pending_) { self->pending_ = nullptr; self->frameReady_ = false; }
+    if (b == self->inUse_) {
+      self->cv_.wait(lock, [&] { return !self->inUseBusy_ || !self->running_; });
+      self->inUse_ = nullptr;
+      self->inUseData_ = nullptr;
+    }
+  }
+
+  // Zero-copy path: keep the dequeued buffer (instead of copying the frame
+  // out of it) and let the encoder read it directly. It goes back to
+  // PipeWire when the encoder takes the next frame. Needs a byte order the
+  // encoder accepts (BGRx/BGRA) and at least 3 buffers, so the compositor
+  // always has one to draw into while we hold two.
+  bool holdForEncoder(struct pw_buffer* b) {
+    const auto& plane = b->buffer->datas[0];
+    if (!plane.chunk || !plane.data) return false;
+    if (plane.chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) return false;
+    const int32_t srcStride = plane.chunk->stride;
+    std::unique_lock<std::mutex> lock(mu_);
+    if (!zeroCopy_ || buffers_ < 3 || srcStride <= 0) return false;
+    if (width_ <= 0 || height_ <= 0 || width_ > 8192 || height_ > 8192) return false;
+    const size_t rowBytes = static_cast<size_t>(width_) * 4;
+    const size_t cx = static_cast<size_t>(cropPx_.x), cy = static_cast<size_t>(cropPx_.y);
+    const size_t needed = (cy + height_ - 1) * srcStride + (cx * 4) + rowBytes;
+    if (static_cast<size_t>(srcStride) < (cx * 4) + rowBytes || plane.chunk->offset > plane.maxsize ||
+        needed > plane.maxsize - plane.chunk->offset || needed > plane.chunk->size) return false;
+    if (pending_) pw_stream_queue_buffer(stream_, pending_);   // superseded before the encoder took it
+    pending_ = b;
+    pendingData_ = static_cast<const uint8_t*>(plane.data) + plane.chunk->offset + cy * srcStride + cx * 4;
+    pendingStride_ = srcStride;
+    noteArrival(steadyMicros());
+    frontCapturedUs_ = steadyMicros();
+    ++frameCount_;
+    frameReady_ = true;
+    lock.unlock();
+    cv_.notify_all();
+    return true;
   }
 
   void consume(struct spa_buffer* buf) {
@@ -662,11 +819,22 @@ class PortalSource : public CaptureSource {
     if (!plane.chunk || !plane.data) return;
     const int32_t srcStride = plane.chunk->stride;
     if (srcStride <= 0) return;
+    // Geometry is only changed by onStreamParamChanged, which runs on this same
+    // PipeWire thread, as does every write to backBuffer_. So the full-frame
+    // copy (several ms at 1440p) happens WITHOUT the lock the encoder thread
+    // waits on; only the O(1) buffer swap is done under it.
+    int width, height, format;
+    Rect crop;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      if (width_ <= 0 || height_ <= 0 || width_ > 8192 || height_ > 8192) return;
+      width = width_; height = height_; crop = cropPx_; format = static_cast<int>(format_);
+    }
+    {
+      if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return;
+      const int width_ = width, height_ = height;  // shadow members: nothing below touches shared state
+      const uint32_t format_ = static_cast<uint32_t>(format);
       const size_t rowBytes = static_cast<size_t>(width_) * 4;
-      const size_t cx = static_cast<size_t>(cropPx_.x), cy = static_cast<size_t>(cropPx_.y);
+      const size_t cx = static_cast<size_t>(crop.x), cy = static_cast<size_t>(crop.y);
       const size_t needed = (cy + height_ - 1) * srcStride + (cx * 4) + rowBytes;
       if (static_cast<size_t>(srcStride) < (cx * 4) + rowBytes || plane.chunk->offset > plane.maxsize ||
           needed > plane.maxsize - plane.chunk->offset || needed > plane.chunk->size) return;
@@ -699,8 +867,15 @@ class PortalSource : public CaptureSource {
             break;
         }
       }
+    }
+    {
+      const uint64_t captured = steadyMicros();
+      std::lock_guard<std::mutex> lock(mu_);
+      // Geometry changed while we copied: this frame is the wrong size.
+      if (width != width_ || height != height_) return;
       frontBuffer_.swap(backBuffer_);
-      frontCapturedUs_ = steadyMicros();
+      noteArrival(captured);
+      frontCapturedUs_ = captured;
       ++frameCount_;
       frameReady_ = true;
     }
@@ -723,19 +898,21 @@ class PortalSource : public CaptureSource {
     }
 
     // connect_fd takes ownership of the descriptor.
-    core_ = pw_context_connect_fd(context_, pwFd_, nullptr, 0);
+    core_ = directNode_ ? pw_context_connect(context_, nullptr, 0) : pw_context_connect_fd(context_, pwFd_, nullptr, 0);
     if (!core_) {
       pw_thread_loop_unlock(threadLoop_);
       error = "could not connect to the PipeWire remote from the portal";
       return false;
     }
-    pwFd_ = -1;
+    if (!directNode_) pwFd_ = -1;
 
     static const pw_stream_events events = [] {
       pw_stream_events e{};
       e.version = PW_VERSION_STREAM_EVENTS;
       e.param_changed = onStreamParamChanged;
       e.process = onStreamProcess;
+      e.add_buffer = onAddBuffer;
+      e.remove_buffer = onRemoveBuffer;
       return e;
     }();
 
@@ -806,6 +983,7 @@ class PortalSource : public CaptureSource {
   mutable std::recursive_mutex inputMu_;  // input thread vs. frame thread
   std::string sessionHandle_;
   uint32_t nodeId_ = 0;
+  uint32_t directNode_ = 0;   // test hook (PS_PIPEWIRE_NODE)
   int pwFd_ = -1;
 
   // pipewire state
@@ -831,9 +1009,29 @@ class PortalSource : public CaptureSource {
   int fps_ = 60;
   uint64_t frameCount_ = 0;
   uint64_t frontCapturedUs_ = 0;
+  // zero-copy state (guarded by mu_)
+  bool zeroCopy_ = false;
+  int buffers_ = 0;
+  struct pw_buffer* pending_ = nullptr;   // newest frame, not yet taken by the encoder
+  struct pw_buffer* inUse_ = nullptr;     // frame the encoder is reading
+  const uint8_t* pendingData_ = nullptr;
+  const uint8_t* inUseData_ = nullptr;
+  int pendingStride_ = 0, inUseStride_ = 0;
+  bool inUseBusy_ = false;
+  // Desktop frame interval (EMA, µs) and the frame we are holding back for.
+  double arrivalUs_ = 0;
+  uint64_t lastArrival_ = 0, heldFor_ = 0;
+  void noteArrival(uint64_t t) {   // mu_ held
+    if (lastArrival_ && t > lastArrival_) {
+      const double d = static_cast<double>(t - lastArrival_);
+      if (d < 200000) arrivalUs_ = arrivalUs_ > 0 ? arrivalUs_ * 0.8 + d * 0.2 : d;
+    }
+    lastArrival_ = t;
+  }
   uint64_t lastPts_ = 0;
-  std::chrono::steady_clock::time_point nextDue_{};
   std::chrono::steady_clock::time_point lastEmit_{};
+  std::chrono::steady_clock::time_point tokensAt_{};
+  double tokens_ = 1.0;
 
   // monitor selection
   Rect wantMonitor_, workspace_;

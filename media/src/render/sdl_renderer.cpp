@@ -11,6 +11,7 @@
 #include "capture/source.h"
 #include "codec/decoder.h"
 #include "ipc/framing.h"
+#include "render/overlay_font.h"
 
 #include <SDL2/SDL.h>
 
@@ -56,6 +57,73 @@ struct SharedFrame {
   uint64_t replaced = 0;    // decoded frames overwritten before they could be shown
   double decodeMsSum = 0;   // accumulated by the reader thread
   uint64_t decoded = 0;
+};
+
+// Stats overlay drawn over the stream (off by default; Ctrl+Alt+Shift+S). Text
+// comes from Node once a second. Nothing is drawn, and nothing costs time,
+// while it is off.
+class Overlay {
+ public:
+  ~Overlay() { if (atlas_) SDL_DestroyTexture(atlas_); }
+  void setText(std::string t) { text_ = std::move(t); }
+
+  void draw(SDL_Renderer* r, int outW, int outH) {
+    if (text_.empty() || outW <= 0 || outH <= 0) return;
+    if (!atlas_ && !build(r)) return;
+    std::vector<std::string> lines;
+    size_t start = 0, longest = 0;
+    while (start <= text_.size() && lines.size() < 12) {
+      const size_t nl = text_.find('\n', start);
+      lines.push_back(text_.substr(start, nl == std::string::npos ? std::string::npos : nl - start));
+      const std::string& l = lines.back();
+      longest = std::max(longest, l.size() - ((!l.empty() && (l[0] == '!' || l[0] == '#')) ? 1 : 0));
+      if (nl == std::string::npos) break;
+      start = nl + 1;
+    }
+    const int s = outH >= 2000 ? 2 : 1;
+    const int gw = kOverlayGlyphW * s, gh = kOverlayGlyphH * s, lh = gh + 2 * s, pad = 9 * s;
+    SDL_Rect panel{12 * s, 12 * s, int(longest) * gw + 2 * pad, int(lines.size()) * lh + 2 * pad - 2 * s};
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 8, 13, 26, 200);
+    SDL_RenderFillRect(r, &panel);
+    int y = panel.y + pad;
+    for (const std::string& raw : lines) {
+      std::string l = raw;
+      Uint8 cr = 231, cg = 236, cb = 245;                      // text
+      if (!l.empty() && l[0] == '#') { cr = 56; cg = 189; cb = 248; l.erase(0, 1); }   // heading
+      else if (!l.empty() && l[0] == '!') { cr = 251; cg = 191; cb = 36; l.erase(0, 1); }  // warning
+      SDL_SetTextureColorMod(atlas_, cr, cg, cb);
+      int x = panel.x + pad;
+      for (unsigned char c : l) {
+        if (c >= kOverlayFirstChar && c < kOverlayFirstChar + kOverlayGlyphCount && c != ' ') {
+          SDL_Rect src{(c - kOverlayFirstChar) * kOverlayGlyphW, 0, kOverlayGlyphW, kOverlayGlyphH};
+          SDL_Rect dst{x, y, gw, gh};
+          SDL_RenderCopy(r, atlas_, &src, &dst);
+        }
+        x += gw;
+      }
+      y += lh;
+    }
+  }
+
+ private:
+  bool build(SDL_Renderer* r) {
+    const int w = kOverlayGlyphW * kOverlayGlyphCount, h = kOverlayGlyphH;
+    atlas_ = SDL_CreateTexture(r, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, w, h);
+    if (!atlas_) return false;
+    std::vector<uint32_t> px(size_t(w) * h);
+    for (int g = 0; g < kOverlayGlyphCount; ++g)
+      for (int y = 0; y < h; ++y)
+        for (int x = 0; x < kOverlayGlyphW; ++x) {
+          const uint8_t a = kOverlayFont[(size_t(g) * h + y) * kOverlayGlyphW + x];
+          px[size_t(y) * w + g * kOverlayGlyphW + x] = (uint32_t(a) << 24) | 0x00ffffffu;
+        }
+    SDL_UpdateTexture(atlas_, nullptr, px.data(), w * 4);
+    SDL_SetTextureBlendMode(atlas_, SDL_BLENDMODE_BLEND);
+    return true;
+  }
+  SDL_Texture* atlas_ = nullptr;
+  std::string text_;
 };
 
 uint64_t nowUs() {
@@ -137,7 +205,8 @@ struct Pad {
 
 class Viewer {
  public:
-  Viewer(bool kbm, bool pad, std::string title) : kbm_(kbm), pad_(pad), baseTitle_(std::move(title)) {}
+  Viewer(bool kbm, bool pad, bool overlay, std::string title)
+      : kbm_(kbm), pad_(pad), overlayOn_(overlay), baseTitle_(std::move(title)) {}
 
   int run(std::shared_ptr<SharedFrame> shared, bool vsync);
 
@@ -148,6 +217,13 @@ class Viewer {
     if (!on) releaseKeysAndButtons();
     kbm_ = on;
     if (!on && capture_) setCapture(false);
+    stateChanged();
+  }
+
+  void setOverlay(bool on) {
+    if (on == overlayOn_) return;
+    overlayOn_ = on;
+    redraw_ = true;
     stateChanged();
   }
 
@@ -286,6 +362,7 @@ class Viewer {
       case SDL_SCANCODE_M: if (k.type == SDL_KEYDOWN && !k.repeat) setKbm(!kbm_); return true;
       case SDL_SCANCODE_G: if (k.type == SDL_KEYDOWN && !k.repeat) setPad(!pad_); return true;
       case SDL_SCANCODE_Z: if (k.type == SDL_KEYDOWN && !k.repeat) setCapture(!capture_); return true;
+      case SDL_SCANCODE_S: if (k.type == SDL_KEYDOWN && !k.repeat) setOverlay(!overlayOn_); return true;
       default: return false;
     }
   }
@@ -420,6 +497,13 @@ class Viewer {
       if (jsonGetBool(json, "kbm", v)) setKbm(v);
       if (jsonGetBool(json, "pad", v)) setPad(v);
       if (jsonGetBool(json, "capture", v)) setCapture(v);
+      if (jsonGetBool(json, "overlay", v)) setOverlay(v);
+    } else if (t == "overlay") {
+      std::string text;
+      if (jsonGetString(json, "text", text) && text.size() < 4096) {
+        overlay_.setText(std::move(text));
+        if (overlayOn_) redraw_ = true;
+      }
     } else if (t == "host-permissions") {
       bool v = false;
       if (jsonGetBool(json, "kbm", v)) hostKbm_ = v;
@@ -443,7 +527,8 @@ class Viewer {
     emitControl(std::string("{\"t\":\"viewer-state\",\"kbm\":") + (kbm_ ? "true" : "false") +
                 ",\"pad\":" + (pad_ ? "true" : "false") + ",\"pads\":" + std::to_string(controllerCount()) +
                 ",\"capture\":" + (capture_ ? "true" : "false") +
-                ",\"fullscreen\":" + (fullscreen_ ? "true" : "false") + "}");
+                ",\"fullscreen\":" + (fullscreen_ ? "true" : "false") +
+                ",\"overlay\":" + (overlayOn_ ? "true" : "false") + "}");
   }
 
   void updateTitle() {
@@ -454,13 +539,16 @@ class Viewer {
     if (controllerCount()) title += " (" + std::to_string(controllerCount()) + ")";
     if (pad_ && !hostPad_) title += " (host blocked)";
     if (capture_) title += "  |  GAME MODE";
-    title += "  |  Ctrl+Alt+Shift: Q quit, M/G toggle, Z game mode, X fullscreen";
+    title += "  |  Ctrl+Alt+Shift: Q quit, M/G toggle, Z game mode, X fullscreen, S stats";
     SDL_SetWindowTitle(window_, title.c_str());
   }
 
   bool kbm_, pad_;
   bool hostKbm_ = true, hostPad_ = true;
   bool capture_ = false, fullscreen_ = false;
+  bool overlayOn_ = false, redraw_ = false;
+  Overlay overlay_;
+  std::vector<uint8_t> renderBuf_;   // frame being uploaded; swapped with the decoder's, never copied
   std::string baseTitle_;
   SDL_Window* window_ = nullptr;
   SDL_Renderer* renderer_ = nullptr;
@@ -537,45 +625,66 @@ int Viewer::run(std::shared_ptr<SharedFrame> sharedOwner, bool vsync) {
 
     bool present = false;
     uint64_t frameRecv = 0, frameDecoded = 0, framePts = 0;
+    int fw = 0, fh = 0;
+    bool fyuv = false;
     {
+      // Only an O(1) buffer swap happens under the lock: the decoder thread is
+      // never blocked behind the GPU upload below.
       std::unique_lock<std::mutex> lock(shared.mu);
-      if (!shared.dirty && !g_quit) {
+      if (!shared.dirty && !g_quit && !redraw_) {
         shared.cv.wait_for(lock, std::chrono::milliseconds(2), [&] { return shared.dirty || g_quit.load(); });
       }
       if (shared.dirty && renderer_) {
-        if (!texture || texW_ != shared.width || texH_ != shared.height || textureYuv != shared.yuv) {
-          if (texture) SDL_DestroyTexture(texture);
-          texture = SDL_CreateTexture(renderer_, shared.yuv ? SDL_PIXELFORMAT_IYUV : SDL_PIXELFORMAT_ARGB8888,
-                                      SDL_TEXTUREACCESS_STREAMING, shared.width, shared.height);
-          texW_ = shared.width;
-          texH_ = shared.height;
-          textureYuv = shared.yuv;
-          SDL_RenderSetLogicalSize(renderer_, texW_, texH_);  // letterbox, keep aspect ratio
-        }
+        renderBuf_.swap(shared.pixels);
+        fw = shared.width;
+        fh = shared.height;
+        fyuv = shared.yuv;
         frameRecv = shared.recvUs;
         frameDecoded = shared.decodedUs;
         framePts = shared.pts;
-        if (texture) {
-          if (shared.yuv) {
-            const size_t ySize = size_t(texW_) * texH_;
-            const int cw = (texW_ + 1) / 2, ch = (texH_ + 1) / 2;
-            const size_t cSize = size_t(cw) * ch;
-            SDL_UpdateYUVTexture(texture, nullptr, shared.pixels.data(), texW_,
-                                 shared.pixels.data() + ySize, cw, shared.pixels.data() + ySize + cSize, cw);
-          } else {
-            SDL_UpdateTexture(texture, nullptr, shared.pixels.data(), shared.width * 4);
-          }
-          present = true;
-        }
         shared.dirty = false;
+        present = true;
+      }
+    }
+    if (present) {
+      if (!texture || texW_ != fw || texH_ != fh || textureYuv != fyuv) {
+        if (texture) SDL_DestroyTexture(texture);
+        texture = SDL_CreateTexture(renderer_, fyuv ? SDL_PIXELFORMAT_IYUV : SDL_PIXELFORMAT_ARGB8888,
+                                    SDL_TEXTUREACCESS_STREAMING, fw, fh);
+        texW_ = fw;
+        texH_ = fh;
+        textureYuv = fyuv;
+        SDL_RenderSetLogicalSize(renderer_, texW_, texH_);  // letterbox, keep aspect ratio
+      }
+      if (!texture) {
+        present = false;
+      } else if (fyuv) {
+        const size_t ySize = size_t(fw) * fh;
+        const int cw = (fw + 1) / 2, ch = (fh + 1) / 2;
+        const size_t cSize = size_t(cw) * ch;
+        SDL_UpdateYUVTexture(texture, nullptr, renderBuf_.data(), fw,
+                             renderBuf_.data() + ySize, cw, renderBuf_.data() + ySize + cSize, cw);
+      } else {
+        SDL_UpdateTexture(texture, nullptr, renderBuf_.data(), fw * 4);
       }
     }
 
-    if (present) {
+    if ((present || redraw_) && texture) {
+      redraw_ = false;
       SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
       SDL_RenderClear(renderer_);
       SDL_RenderCopy(renderer_, texture, nullptr, nullptr);
+      if (overlayOn_) {
+        // Draw in window pixels, not stream pixels, so text stays crisp.
+        int ow = 0, oh = 0;
+        SDL_RenderSetLogicalSize(renderer_, 0, 0);
+        SDL_GetRendererOutputSize(renderer_, &ow, &oh);
+        overlay_.draw(renderer_, ow, oh);
+        SDL_RenderSetLogicalSize(renderer_, texW_, texH_);
+      }
       SDL_RenderPresent(renderer_);
+    }
+    if (present) {
       const uint64_t shown = nowUs();
       if (frameDecoded && shown >= frameDecoded) {
         const double ms = (shown - frameDecoded) / 1000.0;
@@ -639,7 +748,7 @@ int runView(int argc, char** argv) {
   _setmode(_fileno(stdin), _O_BINARY);
   _setmode(_fileno(stdout), _O_BINARY);
 #endif
-  bool kbm = true, pad = true, vsync = true;
+  bool kbm = true, pad = true, vsync = true, overlay = false;
   std::string title = "Penguin Stream";
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -648,6 +757,7 @@ int runView(int argc, char** argv) {
     else if (a == "--no-gamepad") pad = false;
     else if (a == "--title" && i + 1 < argc) title = argv[++i];
     else if (a == "--no-vsync" || a == "--low-latency") vsync = false;
+    else if (a == "--overlay") overlay = true;
   }
 
   SDL_SetHint(SDL_HINT_RENDER_VSYNC, vsync ? "1" : "0");
@@ -677,6 +787,7 @@ int runView(int argc, char** argv) {
   std::thread reader([shared] {
     Decoder decoder;
     decoder.setYuvOutput(true);
+    std::vector<uint8_t> work;   // next frame is packed here, then swapped into shared->pixels
     bool decoderOpen = false;
     Message msg;
     std::string err;
@@ -718,26 +829,20 @@ int runView(int argc, char** argv) {
         const uint64_t recv = nowUs();
         decoder.decode(data, len, hdr.pts_us, [&](const DecodedFrame& f) {
           const uint64_t decoded = nowUs();
-          std::lock_guard<std::mutex> lock(shared->mu);
-          if (shared->dirty) ++shared->replaced;  // renderer had not shown the previous one yet
-          shared->recvUs = recv;
-          shared->decodedUs = decoded;
-          shared->pts = f.pts_us;
-          shared->decodeMsSum += (decoded - recv) / 1000.0;
-          ++shared->decoded;
+          // Pack the picture into our own buffer WITHOUT the lock, then swap it
+          // in: the renderer can upload the previous frame meanwhile.
+          std::vector<uint8_t>& dstBuf = work;
           if (f.bgra) {
-            shared->yuv = false;
-            shared->pixels.resize(size_t(f.width) * f.height * 4);
+            dstBuf.resize(size_t(f.width) * f.height * 4);
             for (int y = 0; y < f.height; ++y)
-              memcpy(shared->pixels.data() + size_t(y) * f.width * 4, f.bgra + size_t(y) * f.stride,
+              memcpy(dstBuf.data() + size_t(y) * f.width * 4, f.bgra + size_t(y) * f.stride,
                      size_t(f.width) * 4);
           } else {
             // Tightly pack Y, U, V for SDL_UpdateYUVTexture.
             const int cw = (f.width + 1) / 2, ch = (f.height + 1) / 2;
             const size_t ySize = size_t(f.width) * f.height, cSize = size_t(cw) * ch;
-            shared->yuv = true;
-            shared->pixels.resize(ySize + 2 * cSize);
-            uint8_t* dst = shared->pixels.data();
+            dstBuf.resize(ySize + 2 * cSize);
+            uint8_t* dst = dstBuf.data();
             for (int y = 0; y < f.height; ++y)
               memcpy(dst + size_t(y) * f.width, f.planes[0] + size_t(y) * f.linesize[0], size_t(f.width));
             for (int p = 1; p < 3; ++p) {
@@ -746,9 +851,20 @@ int runView(int argc, char** argv) {
                 memcpy(plane + size_t(y) * cw, f.planes[p] + size_t(y) * f.linesize[p], size_t(cw));
             }
           }
-          shared->width = f.width;
-          shared->height = f.height;
-          shared->dirty = true;
+          {
+            std::lock_guard<std::mutex> lock(shared->mu);
+            if (shared->dirty) ++shared->replaced;  // renderer had not shown the previous one yet
+            shared->pixels.swap(dstBuf);
+            shared->yuv = f.bgra == nullptr;
+            shared->width = f.width;
+            shared->height = f.height;
+            shared->recvUs = recv;
+            shared->decodedUs = decoded;
+            shared->pts = f.pts_us;
+            shared->decodeMsSum += (decoded - recv) / 1000.0;
+            ++shared->decoded;
+            shared->dirty = true;
+          }
           shared->cv.notify_one();
         }, derr);
       } else if (msg.type == MsgType::Control) {
@@ -764,7 +880,7 @@ int runView(int argc, char** argv) {
     g_quit = true;  // pipe closed
   });
 
-  Viewer viewer(kbm, pad, title);
+  Viewer viewer(kbm, pad, overlay, title);
   viewer.run(shared, vsync);
 
   g_quit = true;

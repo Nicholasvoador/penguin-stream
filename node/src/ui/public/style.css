@@ -303,3 +303,10 @@ pre#log { margin: 0; max-height: calc(100vh - 190px); overflow: auto; font-size:
 .live-controls .field b { color: var(--text); font-weight: 600; }
 .live-controls input[type=range] { width: 100%; accent-color: var(--accent); }
 .toggle.mini { border: 0; padding: 4px; }
+
+/* ---------- troubleshooting log ---------- */
+.logfile { max-height: 360px; overflow: auto; margin: 12px 0 0; padding: 12px 14px; border-radius: 12px;
+  background: var(--bg-2); border: 1px solid var(--border); font: 12px/1.5 "JetBrains Mono", ui-monospace, Consolas, monospace;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.log-path { margin-bottom: 8px; }
+.log-path .v { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; font-size: 12.5px; overflow-wrap: anywhere; }

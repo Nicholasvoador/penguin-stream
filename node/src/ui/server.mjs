@@ -27,6 +27,10 @@ import { cleanupTransport } from '../transport/peer.mjs';
 import { SettingsStore, resolutionBox, sanitizeResolution } from '../app/settings.mjs';
 import { listMonitors, resolveMonitor, workspaceOf } from '../app/monitors.mjs';
 import { runNetcheck } from '../net/netcheck.mjs';
+import { Logbook, statLine } from '../app/logbook.mjs';
+import { findMediaBinary } from '../media/engine.mjs';
+import { execFile } from 'node:child_process';
+import os from 'node:os';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(HERE, 'public');
@@ -51,6 +55,10 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
   const identity = loadOrCreateIdentity();
   const trust = new TrustStore();
   const settings = new SettingsStore();
+  const logbook = new Logbook();
+  logbook.startup({ version: APP_VERSION, extra: { device: identity.fingerprint } });
+  let lastNetcheck = null;
+  let lastStatLog = 0;
   let netcheck = null;   // in-flight check, shared by concurrent callers
 
   /** @type {{kind:'host'|'viewer', instance:any}|null} */
@@ -87,12 +95,22 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
   };
 
   const pushLog = (line) => {
+    logbook.write(/^(error|host failed|connect failed)/.test(line) ? 'error' : /warn/i.test(line) ? 'warn' : 'info', line);
     state.log.push(`${new Date().toISOString().slice(11, 19)}  ${line}`);
     if (state.log.length > 200) state.log.shift();
     broadcast('log', line);
   };
 
+  // Every ~10 s during a session: one line with the numbers that matter.
+  const logStats = (role, s) => {
+    const now = Date.now();
+    if (now - lastStatLog < 10_000) return;
+    lastStatLog = now;
+    logbook.stat(statLine(role, s));
+  };
+
   const setMode = (mode) => {
+    if (mode !== state.mode) logbook.info(`mode ${state.mode} -> ${mode}`);
     state.mode = mode;
     broadcast('state', publicState());
   };
@@ -215,10 +233,19 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     if (monitor) pushLog(`sharing monitor ${monitor.label || monitor.id}`);
     scope.on('audio-warning', (w) => { pushLog(`audio warning: ${w}`); broadcast('notice', w); });
     scope.on('log', pushLog);
-    scope.on('stats', (s) => { state.stats = s; broadcast('stats', s); });
-    scope.on('media-config', (cfg) => { state.mediaConfig = cfg; broadcast('state', publicState()); });
+    scope.on('stats', (s) => { state.stats = s; broadcast('stats', s); logStats('host', s); });
+    scope.on('media-config', (cfg) => {
+      state.mediaConfig = cfg;
+      logbook.info(`stream ${cfg.width}x${cfg.height}@${cfg.fps} from ${cfg.sourceWidth ?? cfg.width}x${cfg.sourceHeight ?? cfg.height} ` +
+        `encoder=${cfg.encoder} capture=${cfg.capture}${cfg.intraRefresh ? ' intra-refresh' : ''}`);
+      broadcast('state', publicState());
+    });
+    scope.on('secure', (t) => logbook.info(`connected: ${t?.relayed ? 'relay' : 'direct'} ${t?.localType ?? ''}->${t?.remoteType ?? ''} ${t?.protocol ?? ''}`));
     scope.on('error', (e) => pushLog(`error: ${e.message}`));
     scope.on('closed', (reason) => { pushLog(`session ended: ${reason}`); stopActive(reason); });
+    logbook.info(`share: fps=${num(pick('fps')) ?? 60} bitrate=${num(pick('bitrate')) ?? 15000} resolution=${pick('resolution')} ` +
+      `adaptive=${pick('adaptiveBitrate') !== false} monitor=${monitor ? monitor.label : 'system picker'} ` +
+      `monitors=${monitors.map((m) => `${m.name}:${m.id}${m.primary ? '*' : ''}`).join(' ') || 'unknown'}`);
 
     // Resolved by the /api/consent endpoint when the user clicks.
     host.start(async (request) => {
@@ -275,6 +302,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
       sendKbm: opts.sendKbm !== false,
       sendPad: opts.sendPad !== false,
       lowLatency: opts.lowLatency !== false,
+      overlay: (opts.overlay !== undefined ? opts.overlay : settings.get().overlay) === true,
       audio: opts.audio === true,
     });
 
@@ -286,9 +314,17 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     scope.on('log', pushLog);
 
     scope.on('sas', (sas) => { state.sas = sas.phrase; broadcast('state', publicState()); });
-    scope.on('secure', (t) => { state.transport = t; setMode('viewing'); });
-    scope.on('media-config', (cfg) => { state.mediaConfig = cfg; broadcast('state', publicState()); });
-    scope.on('stats', (s) => { state.stats = s; broadcast('stats', s); });
+    scope.on('secure', (t) => {
+      state.transport = t;
+      logbook.info(`connected: ${t?.relayed ? 'relay' : 'direct'} ${t?.localType ?? ''}->${t?.remoteType ?? ''} ${t?.protocol ?? ''}`);
+      setMode('viewing');
+    });
+    scope.on('media-config', (cfg) => {
+      state.mediaConfig = cfg;
+      logbook.info(`receiving ${cfg.width}x${cfg.height}@${cfg.fps} encoder=${cfg.encoder} capture=${cfg.capture}`);
+      broadcast('state', publicState());
+    });
+    scope.on('stats', (s) => { state.stats = s; broadcast('stats', s); logStats('view', s); });
     scope.on('error', (e) => pushLog(`error: ${e.message}`));
     scope.on('closed', (reason) => { pushLog(`disconnected: ${reason}`); stopActive(reason); });
 
@@ -299,6 +335,38 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     });
 
     return { ok: true };
+  }
+
+  /* ---------------------------- diagnostics ---------------------------- */
+
+  // A single file a friend can send: environment, engine capabilities,
+  // monitors, settings (no secrets), last network check and the recent log.
+  async function writeDiagnostics() {
+    const bin = findMediaBinary();
+    const probe = bin ? await new Promise((resolve) => execFile(bin, ['probe'], { timeout: 8000, windowsHide: true },
+      (err, out) => resolve(err ? `probe failed: ${err.message}` : String(out).trim()))) : 'media engine not found';
+    const pub = settings.publicSettings();
+    delete pub.builtinProfiles;
+    const report = [
+      `Penguin Stream diagnostics - ${new Date().toISOString()}`,
+      `version ${APP_VERSION} · ${process.platform} ${os.release()} ${process.arch} · node ${process.versions.node}` +
+        (process.versions.electron ? ` · electron ${process.versions.electron}` : ''),
+      `cpu ${os.cpus()[0]?.model?.trim() ?? '?'} ×${os.cpus().length} · ram ${Math.round(os.totalmem() / 2 ** 30)} GB` +
+        (process.env.XDG_SESSION_TYPE ? ` · ${process.env.XDG_SESSION_TYPE} ${process.env.XDG_CURRENT_DESKTOP ?? ''}` : ''),
+      `mode ${state.mode}`,
+      '', '--- media engine ---', probe,
+      '', '--- monitors ---', JSON.stringify(await listMonitors({ fresh: true }).catch(() => []), null, 1),
+      '', '--- settings (secrets removed) ---', JSON.stringify(pub, null, 1),
+      '', '--- last network check ---', lastNetcheck ? JSON.stringify(lastNetcheck, null, 1) : 'not run',
+      '', '--- current session stats ---', JSON.stringify(state.stats ?? {}, null, 1),
+      '', '--- recent log ---', logbook.tail(600),
+    ].join('\n');
+    const { redact } = await import('../app/logbook.mjs');
+    const file = path.join(logbook.dir, `diagnostics-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.txt`);
+    fs.mkdirSync(logbook.dir, { recursive: true });
+    fs.writeFileSync(file, redact(report), { mode: 0o600 });
+    logbook.info(`diagnostics written: ${path.basename(file)}`);
+    return file;
   }
 
   /* ------------------------------ server ------------------------------ */
@@ -329,7 +397,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
         return;
       }
 
-      const allowed = url.pathname === '/api/state' || url.pathname === '/api/monitors' ? ['GET']
+      const allowed = ['/api/state', '/api/monitors', '/api/logs'].includes(url.pathname) ? ['GET']
         : url.pathname === '/api/settings' ? ['GET', 'POST'] : ['POST'];
       if (!allowed.includes(req.method)) {
         req.resume(); // Drain rejected bodies so a keep-alive socket remains framed.
@@ -361,6 +429,13 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
             if (req.method === 'POST') settings.update(body);
             return json(settings.publicSettings());
           case '/api/monitors': return json({ monitors: await listMonitors({ fresh: true }) });
+          case '/api/logs': return json({ path: logbook.file, dir: logbook.dir, text: logbook.tail(500) });
+          case '/api/logs/open': openPath(logbook.dir); return json({ ok: true, dir: logbook.dir });
+          case '/api/diagnostics': {
+            const file = await writeDiagnostics();
+            openPath(logbook.dir);
+            return json({ ok: true, path: file });
+          }
           case '/api/profile': {
             if (body.action === 'apply') settings.applyProfile(String(body.id ?? ''));
             else if (body.action === 'save') settings.saveProfile(String(body.name ?? ''));
@@ -392,7 +467,12 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
             return json({ ok: true });
           }
           case '/api/netcheck': {
-            netcheck ??= runNetcheck(settings.get().relay).finally(() => { netcheck = null; });
+            netcheck ??= runNetcheck(settings.get().relay).then((r) => {
+              lastNetcheck = r;
+              logbook.info(`network check: ${r.verdict?.level} - ${r.verdict?.text ?? ''} | v4 ${r.v4?.ok ? `nat=${r.v4.natted} mapping=${r.v4.mapping}` : 'unavailable'} ` +
+                `| v6 ${r.v6?.ok ? 'yes' : 'no'} | relay ${r.relay?.configured ? (r.relay.ok ? 'ok' : 'failed') : 'none'}`);
+              return r;
+            }).finally(() => { netcheck = null; });
             return json(await netcheck);
           }
           case '/api/host': return json(await startHost(body));
@@ -410,7 +490,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
           case '/api/viewer-input': {
             if (active?.kind !== 'viewer') return json({ error: 'not connected' }, 409);
             const change = {};
-            for (const k of ['kbm', 'pad', 'capture']) {
+            for (const k of ['kbm', 'pad', 'capture', 'overlay']) {
               if (body[k] === undefined) continue;
               if (typeof body[k] !== 'boolean') return json({ error: `${k} must be a boolean` }, 400);
               change[k] = body[k];
@@ -510,6 +590,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
 
   const close = async () => {
     stopActive('shutting down');
+    logbook.info('=== Penguin Stream stop ===');
     process.off('SIGINT', shutdown);
     process.off('SIGTERM', shutdown);
     for (const ws of clients) ws.terminate();
@@ -524,6 +605,17 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
   process.on('SIGTERM', shutdown);
 
   return { port: actualPort, token, url: link, close };
+}
+
+/** Opens a folder in the system file manager (log folder). */
+function openPath(dir) {
+  try {
+    if (process.platform === 'win32') {
+      spawn('explorer.exe', [dir], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
+    } else {
+      spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [dir], { detached: true, stdio: 'ignore' }).unref();
+    }
+  } catch { /* no file manager: the path is shown in the UI */ }
 }
 
 function openBrowser(url) {

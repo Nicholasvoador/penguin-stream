@@ -92,6 +92,18 @@ struct PointerState {
 };
 
 // Draws the DXGI pointer shape onto a BGRA frame (all three shape types).
+// Clipped rectangle the pointer covers in the frame (empty when hidden).
+Rect pointerRect(const PointerState& p, int width, int height) {
+  if (!p.visible || p.shape.empty()) return {};
+  const int w = static_cast<int>(p.info.Width);
+  const int h = p.info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME ? static_cast<int>(p.info.Height / 2)
+                                                                        : static_cast<int>(p.info.Height);
+  const int x0 = std::max(0, p.x), y0 = std::max(0, p.y);
+  const int x1 = std::min(width, p.x + w), y1 = std::min(height, p.y + h);
+  if (x1 <= x0 || y1 <= y0) return {};
+  return {x0, y0, x1 - x0, y1 - y0};
+}
+
 void compositePointer(const PointerState& p, uint8_t* frame, int width, int height, int stride) {
   if (!p.visible || p.shape.empty()) return;
   const int type = static_cast<int>(p.info.Type);
@@ -316,7 +328,8 @@ class DxgiSource final : public CaptureSource {
     stride_ = width_ * 4;
     try {
       desktop_.assign(static_cast<size_t>(stride_) * height_, 0);
-      buffer_.assign(desktop_.size(), 0);
+      under_.clear();
+      underRect_ = {};
     } catch (const std::exception&) {
       return fail("DXGI BGRA buffer allocation failed");
     }
@@ -332,7 +345,8 @@ class DxgiSource final : public CaptureSource {
     haveFrame_ = false;
     releaseDuplication();
     desktop_.clear();
-    buffer_.clear();
+    under_.clear();
+    underRect_ = {};
     pointer_ = PointerState{};
     width_ = height_ = stride_ = 0;
     nativeWidth_ = nativeHeight_ = 0;
@@ -350,6 +364,9 @@ class DxgiSource final : public CaptureSource {
     // the newest desktop image the moment Windows presents it (or right away
     // if one is already waiting). Sleeping to a fixed tick and grabbing
     // whatever was there added up to a whole frame of delay.
+    // The encoder has finished with the previous frame (capture and encode run
+    // in one loop), so take the cursor back out before any update lands.
+    restoreUnderPointer();
     const auto slack = period_ / 4;
     std::this_thread::sleep_until(nextDue_ - slack);
     acquireTimeoutMs_ = 100;  // still desktop: repeat the last image at ~10 fps
@@ -400,8 +417,18 @@ class DxgiSource final : public CaptureSource {
     }
 
     const uint64_t captured = steadyMicros();
-    std::memcpy(buffer_.data(), desktop_.data(), buffer_.size());
-    compositePointer(pointer_, buffer_.data(), width_, height_, stride_);
+    // The cursor is drawn straight into the desktop image; only the few
+    // pixels under it are saved and put back before the next update. This
+    // replaces a full-frame copy (15 MB per frame at 1440p) with ~16 KB.
+    underRect_ = pointerRect(pointer_, width_, height_);
+    if (underRect_.valid()) {
+      const size_t row = static_cast<size_t>(underRect_.w) * 4;
+      under_.resize(row * underRect_.h);
+      for (int y = 0; y < underRect_.h; ++y)
+        std::memcpy(under_.data() + y * row,
+                    desktop_.data() + static_cast<size_t>(underRect_.y + y) * stride_ + static_cast<size_t>(underRect_.x) * 4, row);
+      compositePointer(pointer_, desktop_.data(), width_, height_, stride_);
+    }
 
     const auto now = Clock::now();
     lastPts_ = std::max(lastPts_ + 1, steadyMicros());
@@ -409,7 +436,7 @@ class DxgiSource final : public CaptureSource {
     // Keep an even cadence, but never burst to catch up after a slow consumer.
     nextDue_ = (now - nextDue_ > period_) ? now + period_ : nextDue_ + period_;
     out.captured_us = captured;
-    out.bgra = buffer_.data();
+    out.bgra = desktop_.data();
     out.stride = stride_;
     out.width = width_;
     out.height = height_;
@@ -603,8 +630,19 @@ class DxgiSource final : public CaptureSource {
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<IDXGIOutputDuplication> duplication_;
   ComPtr<ID3D11Texture2D> staging_;
-  std::vector<uint8_t> desktop_;   // last clean desktop image
-  std::vector<uint8_t> buffer_;    // desktop + cursor, handed to the encoder
+  std::vector<uint8_t> desktop_;   // last desktop image (+ cursor while handed to the encoder)
+  std::vector<uint8_t> under_;     // pixels the cursor covers, restored before the next update
+  Rect underRect_;
+
+  // Takes the cursor back out of desktop_ so it is a clean desktop image again.
+  void restoreUnderPointer() {
+    if (!underRect_.valid() || desktop_.empty()) return;
+    const size_t row = static_cast<size_t>(underRect_.w) * 4;
+    for (int y = 0; y < underRect_.h; ++y)
+      std::memcpy(desktop_.data() + static_cast<size_t>(underRect_.y + y) * stride_ + static_cast<size_t>(underRect_.x) * 4,
+                  under_.data() + y * row, row);
+    underRect_ = {};
+  }
   PointerState pointer_;
   UINT nativeWidth_ = 0, nativeHeight_ = 0;
   int width_ = 0, height_ = 0, stride_ = 0;

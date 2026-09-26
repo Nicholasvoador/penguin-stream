@@ -78,6 +78,7 @@ cp "$NODE_DIR/LICENSE" "$STAGE/licenses/Node.js-LICENSE.txt"
 cp "$FFMPEG_DIR/LICENSE.txt" "$STAGE/licenses/FFmpeg-LICENSE-GPLv3.txt"
 cp "$WORK/SDL2-2.32.10/LICENSE.txt" "$STAGE/licenses/SDL2-LICENSE.txt"
 cp "$ROOT/media/third_party/vigem/LICENSE" "$STAGE/licenses/ViGEmClient-LICENSE.txt"
+cp "$ROOT/media/third_party/hack/LICENSE.md" "$STAGE/licenses/Hack-font-LICENSE.txt"
 cp "$ROOT/LICENSE" "$STAGE/LICENSE.txt"
 cp "$ROOT/THIRD-PARTY.md" "$STAGE/"
 cp "$ROOT"/packaging/windows/* "$STAGE/"
@@ -99,6 +100,7 @@ bin/*.dll FFmpeg n8.1.3 (GPLv3 build incl. x264) - BtbN/FFmpeg-Builds $FFMPEG_ZI
 bin/SDL2.dll SDL 2.32.10 (zlib) - $SDL_URL
 runtime/node.exe Node.js $NODE_VERSION (MIT) - https://nodejs.org/dist/$NODE_VERSION/
 ps-media.exe embeds ViGEmClient (MIT) - https://github.com/nefarius/ViGEmClient
+ps-media.exe embeds glyphs of the Hack font (MIT + Bitstream Vera License) - https://sourcefoundry.org/hack/
 EOF
 for f in "$STAGE/licenses/SOURCES.txt"; do sed -i 's/$/\r/' "$f"; done
 

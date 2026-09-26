@@ -244,22 +244,30 @@ export class Host extends EventEmitter {
       const queued = peer.bufferedAmount;
       this.abr.observeQueue(queued);
       // Never let video pile up behind the network: if more than ~2 frames are
-      // still waiting to be sent, skip this frame (the encoder's next frame
-      // references it, so ask for a fresh keyframe once the queue drains).
+      // still waiting to be sent, skip this frame. Every later frame references
+      // the skipped one, so sending them would only show a corrupted picture:
+      // hold them back too, and ask for a fresh keyframe once the queue drains.
       const budget = Math.max(64 * 1024, (this.abr.current * 1000 / 8) * (2 / (this.opts.fps ?? 60)));
-      if (!v.keyframe && queued > budget) {
+      if (!v.keyframe && (queued > budget || this._awaitingKeyframe)) {
         this.stats.dropped++;
-        this._needKeyframe = true;
+        if (!this._awaitingKeyframe) {
+          this._awaitingKeyframe = true;
+          this._keyframeAskedAt = 0;
+        }
+        const now = Date.now();
+        if (queued < budget / 2 && now - this._keyframeAskedAt > 250) {
+          this._keyframeAskedAt = now;
+          this.engine?.requestKeyframe();
+        }
         return;
       }
-      if (this._needKeyframe && queued < budget / 2) {
-        this._needKeyframe = false;
-        this.engine?.requestKeyframe();
-      }
-      // pts = the frame's capture time on this machine's monotonic clock.
+      if (v.keyframe) this._awaitingKeyframe = false;
+      // pts = the frame's capture time on the engine's monotonic clock. Put it
+      // on this process's clock (the one ping/pong syncs) before it leaves.
       const pts = Number(v.ptsUs);
-      if (pts > 0) this.hostLatency.send.add((nowUs() - pts) / 1000);
-      const chunks = this.chunker.split(v.data, { ptsUs: v.ptsUs, keyframe: v.keyframe });
+      const ptsNode = pts > 0 && this.engine.clock.offset !== null ? Math.round(this.engine.clock.toNode(pts)) : 0;
+      if (ptsNode > 0) this.hostLatency.send.add((nowUs() - ptsNode) / 1000);
+      const chunks = this.chunker.split(v.data, { ptsUs: ptsNode > 0 ? BigInt(ptsNode) : v.ptsUs, keyframe: v.keyframe });
       for (const chunk of chunks) {
         try {
           if (!peer.sendMedia(CHANNEL.VIDEO, chunk)) this.stats.dropped++;
@@ -400,6 +408,29 @@ export class Host extends EventEmitter {
 }
 
 /**
+ * Text for the stream-window overlay. Plain ASCII (the overlay font has no
+ * other glyphs); lines starting with '#' are headings, '!' warnings.
+ */
+export function overlayText(l, h = {}, v = {}, t = {}) {
+  const f = (x) => (Number.isFinite(x) ? (x < 10 ? x.toFixed(1) : String(Math.round(x))) : '--');
+  const route = t?.relayed ? 'relay' : t?.connected === false ? '--' : `direct ${t?.protocol ?? ''}`.trim();
+  const lines = [
+    `#Penguin Stream   ${route}   ${f(l.fps)} fps   ${l.kbps ? (l.kbps / 1000).toFixed(1) : '--'} Mbps`,
+    `Total      ${f(l.totalMs).padStart(5)} ms   capture -> screen`,
+    `Input      ${f(l.inputMs).padStart(5)} ms   click -> result (est.)`,
+    `Host       ${f((l.captureMs ?? 0) + (l.encodeMs ?? 0)).padStart(5)} ms   capture ${f(l.captureMs)} + encode ${f(l.encodeMs)}`,
+    `Network    ${f(l.networkMs).padStart(5)} ms   p95 ${f(l.networkP95Ms)}   ping ${f(l.rttMs)}`,
+    `Viewer     ${f(l.viewerMs).padStart(5)} ms   decode ${f(l.decodeMs)} + display ${f(l.displayMs)}`,
+    `Loss ${f(l.lostPct)}%   skipped ${h?.dropped ?? 0}   vsync ${l.vsync ? 'on' : 'off'}   target ${l.targetKbps ? (l.targetKbps / 1000).toFixed(1) : '--'} Mbps`,
+  ];
+  for (const tip of (l.tips ?? []).filter((x) => x.level === 'warn').slice(0, 2)) {
+    lines.push(`!${tip.text.replace(/[^\x20-\x7e]/g, '').slice(0, 78)}`);
+  }
+  lines.push('Ctrl+Alt+Shift+S hides this');
+  return lines.join('\n');
+}
+
+/**
  * Viewer: connects to a host and displays its screen.
  *
  * Emits: 'secure', 'sas', 'media-config', 'stats', 'closed', 'error'
@@ -462,6 +493,7 @@ export class Viewer extends EventEmitter {
       sendPad: this.opts.sendPad,
       lowLatency: this.opts.lowLatency,
       noVsync: this.opts.noVsync,
+      overlay: this.opts.overlay === true,
     });
 
     this.engine.on('input', (event) => {
@@ -609,8 +641,15 @@ export class Viewer extends EventEmitter {
     const delayRiseMs = arrivalMs !== null && this.delayFloor !== null ? Math.max(0, arrivalMs - this.delayFloor) : null;
     const frames = arrival?.n ?? 0;
     const lostPct = frames + this.lostWindow > 0 ? (100 * this.lostWindow) / (frames + this.lostWindow) : 0;
+    // Input -> result on screen, estimated from measured parts: an input needs
+    // half a round trip to reach the host, then waits on average half a frame
+    // for the next capture, then takes the full capture -> screen path.
+    const fps = h.fps || 60;
+    const inputMs = totalMs !== null && Number.isFinite(this.clock.rttMs)
+      ? this.clock.minRttMs / 2 + 500 / fps + totalMs : null;
     const out = {
       synced: this.clock.ready,
+      inputMs,
       rttMs: this.clock.rttMs, minRttMs: this.clock.minRttMs,
       captureMs: h.captureMs, encodeMs: h.encodeMs,
       networkMs, networkP95Ms: arrival ? Math.max(0, arrival.p95 - hostMs) : null,
@@ -622,6 +661,7 @@ export class Viewer extends EventEmitter {
       relayed: transport?.relayed === true,
     };
     out.tips = latencyTips(out);
+    this.engine?.overlay(overlayText(out, this.hostStats, this.viewStats, transport));
     return out;
   }
 

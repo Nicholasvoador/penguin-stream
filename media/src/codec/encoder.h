@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -32,6 +33,12 @@ struct EncoderConfig {
   // keyframes the viewer requests. Frequent IDRs are big frames that either
   // blur (constant bitrate) or add a latency spike.
   int gopSeconds = 10;
+  // Refresh the picture a column at a time (spread over ~1 s) instead of with
+  // periodic keyframes: no periodic blurry/big frame, and a picture damaged by
+  // loss heals by itself even if a keyframe request is lost. Keyframes are
+  // still sent on request. Used where it can be verified (NVENC, x264); the
+  // encoder is reopened without it if the driver refuses.
+  bool intraRefresh = true;
   std::string preferred;       // "auto", "vaapi", "nvenc", "x264"
 };
 
@@ -75,9 +82,11 @@ class Encoder {
   int height() const { return cfg_.height; }
   int bitrateKbps() const { return cfg_.bitrateKbps; }
   bool scaling() const { return srcW_ != cfg_.width || srcH_ != cfg_.height; }
+  bool intraRefreshActive() const { return intraRefresh_; }
 
  private:
-  bool tryOpen(const std::string& encoderName, const EncoderConfig& cfg, bool rgbInput, std::string& error);
+  bool tryOpen(const std::string& encoderName, const EncoderConfig& cfg, bool rgbInput, bool intraRefresh,
+               std::string& error);
   void close();
   bool drain(const std::function<void(const EncodedPacket&)>& sink, std::string& error);
 
@@ -92,9 +101,12 @@ class Encoder {
   SwsContext* sws_ = nullptr;
   bool rgbInput_ = false;        // encoder converts BGRA on the GPU; no CPU colour conversion
   int srcW_ = 0, srcH_ = 0;      // input (captured) size
+  bool intraRefresh_ = false;
+  bool zeroCopy_ = !std::getenv("PS_ENCODER_COPY");  // NVENC reads the capture buffer directly
   std::vector<uint8_t> extradata_;
   void applyBitrate(int bitrateKbps);
   static bool hasParameterSets(const uint8_t* data, size_t size);
+  static bool hasIdr(const uint8_t* data, size_t size);
   bool annexBExtradata() const;
   std::vector<uint8_t> keyframeBuffer_;
 

@@ -58,6 +58,17 @@ bool Encoder::hasParameterSets(const uint8_t* data, size_t size) {
   return false;
 }
 
+// True when the access unit holds an IDR slice (NAL type 5) - a frame that
+// decodes on its own. With intra refresh, encoders also flag "recovery point"
+// frames as keyframes, but those only heal a picture that was already
+// decoding; a viewer that lost frames needs a real IDR to resync instantly.
+bool Encoder::hasIdr(const uint8_t* data, size_t size) {
+  for (size_t i = 0; i + 3 < size; ++i) {
+    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && (data[i + 3] & 0x1f) == 5) return true;
+  }
+  return false;
+}
+
 bool Encoder::annexBExtradata() const {
   return extradata_.size() > 4 && extradata_[0] == 0 && extradata_[1] == 0 &&
          (extradata_[2] == 1 || (extradata_[2] == 0 && extradata_[3] == 1));
@@ -101,15 +112,19 @@ bool Encoder::open(const EncoderConfig& cfg, std::string& error) {
     // When scaling, one CPU pass does scale + colour conversion together, so
     // the RGB shortcut no longer saves anything.
     const bool tryRgb = name == "h264_nvenc" && !std::getenv("PS_NVENC_NV12") && !scaling();
+    const bool irCapable = cfg.intraRefresh && !std::getenv("PS_NO_INTRA_REFRESH") &&
+                           (name == "h264_nvenc" || name == "libx264");
     for (const bool rgb : tryRgb ? std::vector<bool>{true, false} : std::vector<bool>{false}) {
-      std::string err;
-      if (tryOpen(name, cfg_, rgb, err)) {
-        backend_ = name;
-        av_log_set_level(savedLevel);
-        return true;
+      for (const bool ir : irCapable ? std::vector<bool>{true, false} : std::vector<bool>{false}) {
+        std::string err;
+        if (tryOpen(name, cfg_, rgb, ir, err)) {
+          backend_ = name;
+          av_log_set_level(savedLevel);
+          return true;
+        }
+        failures += (failures.empty() ? "" : "; ") + name + (rgb ? " (rgb)" : "") + (ir ? " (intra-refresh)" : "") + ": " + err;
+        close();
       }
-      failures += (failures.empty() ? "" : "; ") + name + (rgb ? " (rgb)" : "") + ": " + err;
-      close();
     }
   }
   av_log_set_level(savedLevel);
@@ -117,8 +132,10 @@ bool Encoder::open(const EncoderConfig& cfg, std::string& error) {
   return false;
 }
 
-bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, bool rgbInput, std::string& error) {
+bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, bool rgbInput, bool intraRefresh,
+                      std::string& error) {
   rgbInput_ = rgbInput;
+  intraRefresh_ = intraRefresh;
   const AVCodec* codec = avcodec_find_encoder_by_name(encoderName.c_str());
   if (!codec) { error = "not built into this ffmpeg"; return false; }
 
@@ -134,7 +151,9 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
   // Single-frame VBV (as game streamers use): no frame may exceed one frame's
   // worth of bits, so no frame takes longer than a frame interval to send.
   ctx_->rc_buffer_size = static_cast<int>(ctx_->bit_rate / cfg.fps);
-  ctx_->gop_size = cfg.fps * cfg.gopSeconds;
+  // With intra refresh the "GOP" is the refresh wave: the whole picture is
+  // rebuilt over one second, a strip per frame, with no IDR frames at all.
+  ctx_->gop_size = intraRefresh ? std::max(2, cfg.fps) : cfg.fps * cfg.gopSeconds;
   ctx_->max_b_frames = 0;                          // B-frames add reorder latency
   ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
   // Several slices per frame let the viewer decode one frame on several cores
@@ -181,6 +200,7 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     av_opt_set(ctx_->priv_data, "delay", "0", 0);
     av_opt_set(ctx_->priv_data, "zerolatency", "1", 0);
     av_opt_set(ctx_->priv_data, "forced-idr", "1", 0);
+    if (intraRefresh) av_opt_set(ctx_->priv_data, "intra-refresh", "1", 0);
   } else if (encoderName == "h264_amf") {
     ctx_->pix_fmt = AV_PIX_FMT_NV12;
     av_opt_set(ctx_->priv_data, "usage", "ultralowlatency", 0);
@@ -204,6 +224,7 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     av_opt_set(ctx_->priv_data, "tune", "zerolatency", 0);
     av_opt_set(ctx_->priv_data, "profile", "baseline", 0);
     av_opt_set(ctx_->priv_data, "x264-params", "no-mbtree=1:sync-lookahead=0:rc-lookahead=0:sliced-threads=1", 0);
+    if (intraRefresh) av_opt_set(ctx_->priv_data, "intra-refresh", "1", 0);
   }
 
   int ret = avcodec_open2(ctx_, codec, nullptr);
@@ -229,6 +250,8 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     if (ret < 0) { error = "av_hwframe_get_buffer: " + avErr(ret); return false; }
   }
 
+  srcFrame_ = av_frame_alloc();
+  if (!srcFrame_) { error = "av_frame_alloc failed"; return false; }
   if (!rgbInput_) {
     // Colour conversion (+ scaling) is the one per-frame CPU pass. Split it
     // across cores: measured 4.6 ms -> 1.1 ms for 1440p -> 1080p on a desktop
@@ -239,8 +262,6 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
     av_opt_set_int(sws_, "sws_flags", scaling() ? SWS_AREA : SWS_POINT, 0);
     av_opt_set_int(sws_, "threads", std::min(8u, std::max(1u, cores / 2)), 0);
-    srcFrame_ = av_frame_alloc();
-    if (!srcFrame_) { error = "av_frame_alloc failed"; return false; }
   }
 
   pkt_ = av_packet_alloc();
@@ -260,7 +281,7 @@ bool Encoder::drain(const std::function<void(const EncodedPacket&)>& sink, std::
 
     EncodedPacket out{};
     out.pts_us = static_cast<uint64_t>(pkt_->pts < 0 ? 0 : pkt_->pts);
-    out.keyframe = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
+    out.keyframe = (pkt_->flags & AV_PKT_FLAG_KEY) != 0 && hasIdr(pkt_->data, static_cast<size_t>(pkt_->size));
     out.data = pkt_->data;
     out.size = static_cast<size_t>(pkt_->size);
     // Every keyframe must be decodable on its own (loss recovery, late
@@ -286,7 +307,28 @@ bool Encoder::encodeBGRA(const uint8_t* bgra, int stride, uint64_t pts_us,
   int ret = av_frame_make_writable(swFrame_);
   if (ret < 0) { error = "av_frame_make_writable: " + avErr(ret); return false; }
 
-  if (rgbInput_) {
+  AVFrame* toEncode = swFrame_;
+  bool borrowed = false;
+  if (rgbInput_ && zeroCopy_) {
+    // NVENC copies a system-memory frame into its own input surface while
+    // the frame is sent (delay 0), so it can read the capture's pixels
+    // directly - no full-frame copy into a staging frame first. The buffer
+    // is wrapped with a no-op free: we still own the memory.
+    av_frame_unref(srcFrame_);
+    srcFrame_->format = ctx_->pix_fmt;
+    srcFrame_->width = cfg_.width;
+    srcFrame_->height = cfg_.height;
+    srcFrame_->colorspace = AVCOL_SPC_SMPTE170M;
+    srcFrame_->color_range = AVCOL_RANGE_MPEG;
+    const size_t bytes = static_cast<size_t>(stride) * (cfg_.height - 1) + static_cast<size_t>(cfg_.width) * 4;
+    srcFrame_->buf[0] = av_buffer_create(const_cast<uint8_t*>(bgra), bytes, [](void*, uint8_t*) {}, nullptr,
+                                         AV_BUFFER_FLAG_READONLY);
+    if (!srcFrame_->buf[0]) { error = "av_buffer_create failed"; return false; }
+    srcFrame_->data[0] = const_cast<uint8_t*>(bgra);
+    srcFrame_->linesize[0] = stride;
+    toEncode = srcFrame_;
+    borrowed = true;
+  } else if (rgbInput_) {
     av_image_copy_plane(swFrame_->data[0], swFrame_->linesize[0], bgra, stride, cfg_.width * 4, cfg_.height);
   } else {
     // Wrap the caller's pixels without copying.
@@ -301,7 +343,6 @@ bool Encoder::encodeBGRA(const uint8_t* bgra, int stride, uint64_t pts_us,
     if (ret < 0) { error = "sws_scale_frame: " + avErr(ret); return false; }
   }
 
-  AVFrame* toEncode = swFrame_;
   if (hwFrame_) {
     ret = av_hwframe_transfer_data(hwFrame_, swFrame_, 0);
     if (ret < 0) { error = "av_hwframe_transfer_data: " + avErr(ret); return false; }
@@ -319,10 +360,22 @@ bool Encoder::encodeBGRA(const uint8_t* bgra, int stride, uint64_t pts_us,
   }
 
   ret = avcodec_send_frame(ctx_, toEncode);
-  if (ret < 0) { error = "avcodec_send_frame: " + avErr(ret); return false; }
+  if (ret < 0) {
+    if (borrowed) av_frame_unref(srcFrame_);
+    error = "avcodec_send_frame: " + avErr(ret);
+    return false;
+  }
   ++frameIndex_;
 
-  return drain(sink, error);
+  const bool ok = drain(sink, error);
+  if (borrowed) {
+    // If the encoder still references our pixels it would read them after we
+    // hand them back to the capture. Never observed with NVENC at delay 0,
+    // but if a driver does it, copy from now on.
+    if (av_buffer_get_ref_count(srcFrame_->buf[0]) > 1) zeroCopy_ = false;
+    av_frame_unref(srcFrame_);
+  }
+  return ok;
 }
 
 void Encoder::flush(const std::function<void(const EncodedPacket&)>& sink) {

@@ -228,10 +228,11 @@
           <label class="toggle"><svg class="t-ico"><use href="#i-kbm"/></svg><span class="t-text"><b>Keyboard &amp; mouse</b></span><input type="checkbox" id="live-send-kbm"><i class="switch"></i></label>
           <label class="toggle"><svg class="t-ico"><use href="#i-pad"/></svg><span class="t-text"><b>Controllers <span id="viewer-pad-count" class="muted"></span></b></span><input type="checkbox" id="live-send-pad"><i class="switch"></i></label>
           <label class="toggle"><svg class="t-ico"><use href="#i-bolt"/></svg><span class="t-text"><b>Game mode</b><small>Lock the mouse inside the stream window (3D games)</small></span><input type="checkbox" id="live-capture"><i class="switch"></i></label>
+          <label class="toggle"><svg class="t-ico"><use href="#i-gauge"/></svg><span class="t-text"><b>Stats overlay</b><small>Show latency, fps and bitrate over the stream</small></span><input type="checkbox" id="live-overlay"><i class="switch"></i></label>
         </div>
         <div class="input-status" id="viewer-input-status"></div>
         <p class="muted small keys">In the stream window hold <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd> and press
-          <kbd>M</kbd> keyboard/mouse · <kbd>G</kbd> controllers · <kbd>Z</kbd> game mode · <kbd>X</kbd> fullscreen · <kbd>Q</kbd> disconnect</p>
+          <kbd>M</kbd> keyboard/mouse · <kbd>G</kbd> controllers · <kbd>Z</kbd> game mode · <kbd>X</kbd> fullscreen · <kbd>S</kbd> stats · <kbd>Q</kbd> disconnect</p>
       </div>
 
       <button class="btn danger wide" data-stop>Disconnect</button>
@@ -295,6 +296,7 @@
         </div>
         <div class="toggle-list compact">
           <label class="toggle"><svg class="t-ico"><use href="#i-gauge"/></svg><span class="t-text"><b>Adapt bitrate to the connection</b><small>Lowers the bitrate the moment video starts queueing, then slowly raises it back. Keeps latency low on busy or slow uploads.</small></span><input type="checkbox" id="opt-adaptive" data-setting="adaptiveBitrate"><i class="switch"></i></label>
+          <label class="toggle"><svg class="t-ico"><use href="#i-gauge"/></svg><span class="t-text"><b>Stats overlay in the stream window</b><small>Latency, fps, bitrate and loss drawn over the picture while you play. Toggle any time with Ctrl+Alt+Shift+S.</small></span><input type="checkbox" id="opt-overlay" data-setting="overlay"><i class="switch"></i></label>
           <label class="toggle"><svg class="t-ico"><use href="#i-bolt"/></svg><span class="t-text"><b>Lowest latency display</b><small>Show each frame the instant it is decoded (no V-Sync wait). May tear slightly.</small></span><input type="checkbox" id="opt-low-latency" data-setting="lowLatency"><i class="switch"></i></label>
         </div>
       </div>
@@ -394,7 +396,19 @@
 
     <!-- LOG -------------------------------------------------------------->
     <section class="page" id="page-log">
-      <div class="card"><pre id="log"></pre></div>
+      <div class="card">
+        <div class="card-head"><h2>Troubleshooting log</h2><span class="hint-inline">Kept on this computer. No invitations, passwords or tokens are written, and public IP addresses are shortened.</span></div>
+        <div class="kv log-path"><div class="k">Log file</div><div class="v" id="log-path">—</div></div>
+        <div class="action-row">
+          <button class="btn primary" type="button" id="diag-save">Save diagnostics report</button>
+          <button class="btn" type="button" id="log-open">Open log folder</button>
+          <button class="btn ghost" type="button" id="log-refresh">Refresh</button>
+          <span class="muted small" id="diag-status" role="status"></span>
+        </div>
+        <p class="muted small">Having problems? Click <b>Save diagnostics report</b> on <em>both</em> computers and send the two files. They include versions, the encoder and capture in use, monitors, network check results and the recent log.</p>
+        <pre id="logfile" class="logfile"></pre>
+      </div>
+      <div class="card"><div class="card-head"><h2>This session</h2></div><pre id="log"></pre></div>
     </section>
   </main>
 </div>

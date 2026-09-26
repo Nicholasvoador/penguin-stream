@@ -57,6 +57,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   source: '',
   display: '',
   lowLatency: true,
+  overlay: false,            // stats overlay in the stream window (Ctrl+Alt+Shift+S)
   audio: true,
   audioExcludeVoice: true,   // keep Discord & co. out of the stream (no double voices)
   audioExclude: '',          // extra apps to leave out, comma-separated
@@ -141,7 +142,7 @@ export function sanitizeSettings(input = {}) {
   set('encoder', oneOf(input.encoder, ['', 'auto', 'nvenc', 'amf', 'qsv', 'mf', 'vaapi', 'x264', 'software']));
   set('source', oneOf(input.source, ['', 'dxgi', 'gdi', 'portal', 'x11', 'synthetic']));
   if (typeof input.display === 'string' && /^[0-9]{0,2}$/.test(input.display.trim())) set('display', input.display.trim());
-  for (const k of ['lowLatency', 'adaptiveBitrate', 'audio', 'audioExcludeVoice', 'allowInput', 'allowGamepad', 'sendKbm', 'sendPad', 'forceRelay', 'noStun']) {
+  for (const k of ['lowLatency', 'overlay', 'adaptiveBitrate', 'audio', 'audioExcludeVoice', 'allowInput', 'allowGamepad', 'sendKbm', 'sendPad', 'forceRelay', 'noStun']) {
     if (typeof input[k] === 'boolean') out[k] = input[k];
   }
   set('stun', str(input.stun));
