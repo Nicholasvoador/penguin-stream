@@ -410,7 +410,7 @@ class DxgiSource final : public CaptureSource {
         running_ = false;
         return false;  // error already describes it
       } else if (hr == DXGI_ERROR_WAIT_TIMEOUT && !haveFrame_) {
-        error = "DXGI first-frame timeout after 1000 ms; retry capture on an active desktop";
+        error = "DXGI first-frame timeout after 2 s; retry capture on an active desktop";
         running_ = false;
         return false;
       }

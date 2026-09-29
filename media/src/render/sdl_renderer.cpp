@@ -133,6 +133,23 @@ uint64_t nowUs() {
 
 // Control messages from Node, forwarded to the SDL thread as user events.
 Uint32 g_controlEvent = 0;
+// "A new decoded frame is ready": wakes the render loop out of
+// SDL_WaitEventTimeout - but ONLY while it is actually sleeping there
+// (g_loopIdleWait, i.e. the picture has been still for a while). During
+// streaming the loop waits on the decoder's condition variable instead: on
+// Wayland an SDL wake-up is a compositor round trip (wl_display_sync), which
+// MEASURED +0.2 ms on every frame. At most one wake is queued at a time.
+Uint32 g_frameEvent = 0;
+std::atomic<bool> g_frameWakePending{false};
+std::atomic<bool> g_loopIdleWait{false};
+
+void wakeRenderLoop(bool force = false) {
+  if (!force && !g_loopIdleWait.load()) return;    // not asleep in SDL: the cv wakes it
+  if (g_frameWakePending.exchange(true)) return;   // one already queued
+  SDL_Event ev{};
+  ev.type = g_frameEvent;
+  if (SDL_PushEvent(&ev) <= 0) g_frameWakePending = false;
+}
 
 std::vector<uint8_t> hexToBytes(const std::string& hex) {
   std::vector<uint8_t> out;
@@ -485,7 +502,9 @@ class Viewer {
         break;
       }
       default:
-        if (ev.type == g_controlEvent) {
+        if (ev.type == g_frameEvent) {
+          g_frameWakePending = false;   // the loop is awake; the next frame may wake it again
+        } else if (ev.type == g_controlEvent) {
           std::unique_ptr<std::string> json(static_cast<std::string*>(ev.user.data1));
           if (json) handleControl(*json);
         }
@@ -630,8 +649,34 @@ int Viewer::run(std::shared_ptr<SharedFrame> sharedOwner, bool vsync) {
 
   uint64_t statsAt = nowUs(), presented = 0, lastPts = 0;
   double displaySum = 0, displayMax = 0, pipeSum = 0;
+  // Two ways to wait for work:
+  //  - streaming (a frame in the last 50 ms): wait on the decoder's condition
+  //    variable, 2 ms slices, events polled in between - exactly 1.4.0, the
+  //    fastest frame path (no SDL/compositor wake per frame).
+  //  - still picture (static desktop): sleep in SDL_WaitEventTimeout so a
+  //    key or mouse event is handled the moment it arrives instead of up to
+  //    2 ms later (MEASURED on Wayland: p50 1.13 -> 0.11 ms). The decoder
+  //    wakes it for the next frame.
+  // Only where SDL can really be woken from another thread; elsewhere
+  // (offscreen, KMSDRM) its "wait" is a 1 ms poll. PS_VIEW_POLL=1 disables it.
+  const char* drv = SDL_GetCurrentVideoDriver();
+  const std::string driver = drv ? drv : "";
+  const bool eventWake = !std::getenv("PS_VIEW_POLL") &&
+                         (driver == "wayland" || driver == "x11" || driver == "windows" || driver == "cocoa");
+  constexpr uint64_t kIdleAfterUs = 50000;
+  uint64_t lastFrameUs = nowUs();
   while (!g_quit) {
     SDL_Event ev;
+    if (eventWake && !redraw_ && nowUs() - lastFrameUs > kIdleAfterUs) {
+      g_loopIdleWait = true;
+      bool frameReady;
+      {
+        std::lock_guard<std::mutex> lock(shared.mu);
+        frameReady = shared.dirty;   // re-check AFTER publishing idle: no lost wake-up
+      }
+      if (!frameReady && !g_quit && SDL_WaitEventTimeout(&ev, 100)) handleEvent(ev);
+      g_loopIdleWait = false;
+    }
     while (SDL_PollEvent(&ev)) handleEvent(ev);
     flushMotion();
 
@@ -656,6 +701,7 @@ int Viewer::run(std::shared_ptr<SharedFrame> sharedOwner, bool vsync) {
         framePts = shared.pts;
         shared.dirty = false;
         present = true;
+        lastFrameUs = nowUs();
       }
     }
     if (present) {
@@ -725,10 +771,10 @@ int Viewer::run(std::shared_ptr<SharedFrame> sharedOwner, bool vsync) {
       char buf[320];
       std::snprintf(buf, sizeof(buf),
                     "{\"t\":\"view-stats\",\"presented\":%llu,\"replaced\":%llu,\"decodeMs\":%.2f,"
-                    "\"displayMs\":%.2f,\"displayMaxMs\":%.2f,\"viewerMs\":%.2f,\"vsync\":%s,\"pts\":%llu,\"now\":%llu}",
+                    "\"displayMs\":%.2f,\"displayMaxMs\":%.2f,\"viewerMs\":%.2f,\"vsync\":%s,\"wake\":\"%s\",\"pts\":%llu,\"now\":%llu}",
                     static_cast<unsigned long long>(presented), static_cast<unsigned long long>(replaced), decodeAvg,
                     presented ? displaySum / presented : 0.0, displayMax, presented ? pipeSum / presented : 0.0,
-                    vsync ? "true" : "false", static_cast<unsigned long long>(lastPts),
+                    vsync ? "true" : "false", eventWake ? "event" : "poll", static_cast<unsigned long long>(lastPts),
                     static_cast<unsigned long long>(now));
       emitControl(buf);
       statsAt = now;
@@ -790,7 +836,8 @@ int runView(int argc, char** argv) {
     return 1;
   }
   SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT601);  // matches the host's BGRA->YUV conversion
-  g_controlEvent = SDL_RegisterEvents(1);
+  g_controlEvent = SDL_RegisterEvents(2);
+  g_frameEvent = g_controlEvent + 1;
 
   auto shared = std::make_shared<SharedFrame>();
 
@@ -892,6 +939,7 @@ int runView(int argc, char** argv) {
             shared->dirty = true;
           }
           shared->cv.notify_one();
+          wakeRenderLoop();
         }, derr);
       } else if (msg.type == MsgType::Control) {
         SDL_Event ev{};
@@ -900,10 +948,12 @@ int runView(int argc, char** argv) {
         if (SDL_PushEvent(&ev) <= 0) delete static_cast<std::string*>(ev.user.data1);
       } else if (msg.type == MsgType::Shutdown) {
         g_quit = true;
+        wakeRenderLoop(true);   // the loop may be asleep in SDL_WaitEventTimeout
         return;
       }
     }
     g_quit = true;  // pipe closed
+    wakeRenderLoop(true);
   });
 
   Viewer viewer(kbm, pad, overlay, title);
@@ -912,7 +962,11 @@ int runView(int argc, char** argv) {
   g_quit = true;
   if (reader.joinable()) reader.detach();  // blocked on stdin; process exit reaps it
   SDL_Quit();
+#ifdef _WIN32
+  _exit(0);
+#else
   return 0;
+#endif
 }
 
 }  // namespace ps

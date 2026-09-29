@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.4.1 — 2026-09-29
+
+Bug fixes and a small latency cut. Same wire protocol: 1.4.1 talks to 1.4.0 and 1.3.1.
+
+### Lower latency: input on a still screen
+- The stream window used to check for work every 2 ms. On a still picture (a static desktop, a paused game) every key
+  press or mouse move sat there ~1 ms on average, up to 2 ms, before it was even read. Once no new frame has arrived for
+  50 ms the window now sleeps until something happens and handles it at once. Measured on Wayland (Fedora 44,
+  KDE Plasma 6), time for the window to pick up an event:
+
+  | Still screen | 1.4.0 | 1.4.1 |
+  |---|---|---|
+  | p50 | 1.10 ms | **0.11 ms** |
+  | p95 | 2.10 ms | **0.53 ms** |
+
+- **While frames are arriving nothing changes**: the window waits exactly as 1.4.0 did. A first version that woke the
+  window through SDL on every frame was measured *slower* (+0.2 ms per frame on Wayland, where each wake is a compositor
+  round trip) and was not shipped. Capture → screen, 1.4.0 vs 1.4.1 alternating on Wayland (3 × 12 s each):
+
+  | Stream | 1.4.0 | 1.4.1 |
+  |---|---|---|
+  | 1080p60 NVENC | 3.12 ms | 3.17 ms |
+  | 1440p60 NVENC | 4.97 ms | 4.94 ms |
+  | 1440p120 NVENC | 4.90 ms | 4.87 ms |
+  | 1080p60 x264 | 2.41 ms | 2.41 ms |
+
+  All within run-to-run noise (1.4.0 itself moved 0.15 ms between two runs).
+- Used where SDL can really be woken from another thread (Wayland, X11, Windows, macOS). Elsewhere the old loop is kept,
+  as it was measured faster there. The mode is recorded in the viewer's stats (`wake: event|poll`); `PS_VIEW_POLL=1`
+  switches back to the 1.4.0 loop.
+
+### Fixed
+- **A frozen stream window is force-closed.** A window stuck in a GPU driver ignored SIGTERM and stayed open forever;
+  it now gets SIGKILL after 3.5 s.
+- **A stream window that sends corrupt data is closed once**, instead of logging an error for every chunk forever and
+  staying open.
+- **No crash without `xdg-open`.** Opening the log folder (or the browser) on a system without it, e.g. minimal or
+  immutable distros, crashed the whole app.
+- **Allow / Refuse** keep the prompt open until the answer is accepted. If the request had already expired you now see
+  *"That request expired … your invitation still works"*; before, the click silently did nothing.
+- Old diagnostics reports are cleaned up (the newest 5 are kept; the log itself is never touched).
+- **Windows:** the stream window can no longer hang on exit in Microsoft's C runtime while waiting for input, and the
+  capture engine can no longer touch freed memory if its input thread is stopped late. *Compiled and exercised under
+  Wine (every shutdown path exits cleanly), but Wine does not reproduce the original hang, so these two are not proven
+  on real Windows.*
+- Windows capture error message said "after 1000 ms"; it waits 2 s.
+- `.deb` file names now match what GitHub serves (`penguin-stream_<version>.<distro>_amd64.deb`); the README install
+  commands were wrong for 1.4.0 downloads. The package version inside is unchanged in form, so apt upgrades normally.
+
+### Tests
+- 149 automated tests (5 new). Each new test fails on the 1.4.0 code and passes on 1.4.1.
+
 ## 1.4.0 — 2026-09-29
 
 ### Fixed: viewers disconnected after a few minutes

@@ -2,7 +2,7 @@
 # Builds Ubuntu/Debian packages, one per release (each links that release's
 # own FFmpeg/PipeWire/SDL; their sonames differ, so one binary can't serve all):
 #
-#   scripts/build-deb.sh            -> dist/penguin-stream_<v>~<distro>_amd64.deb
+#   scripts/build-deb.sh            -> dist/penguin-stream_<v>.<distro>_amd64.deb
 #   scripts/build-deb.sh ubuntu24.04
 #
 # Needs podman and dist/linux-unpacked (from: scripts/build-desktop.sh linux).
@@ -28,4 +28,4 @@ for t in "${TARGETS[@]}"; do
     -v "$ROOT:/src:ro,Z" -v "$ROOT/dist/linux-unpacked:/app:ro,Z" -v "$ROOT/dist:/out:Z" \
     "$img" bash /src/packaging/debian/build-in-container.sh
 done
-ls -la "$ROOT"/dist/penguin-stream_"$VERSION"~*_amd64.deb
+ls -la "$ROOT"/dist/penguin-stream_"$VERSION".*_amd64.deb

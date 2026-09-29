@@ -795,8 +795,25 @@ $('copy-invitation').onclick = async () => {
   setTimeout(() => { $('copy-status').textContent = ''; }, 4000);
 };
 
-$('consent-allow').onclick = async () => { $('consent-overlay').hidden = true; await api('consent', { approve: true }).catch(() => {}); };
-$('consent-deny').onclick = async () => { $('consent-overlay').hidden = true; await api('consent', { approve: false }).catch(() => {}); };
+// 1.4.0 hid the prompt first and swallowed every error, so clicking Allow
+// after the request had expired looked like it worked while nothing happened.
+async function answerConsent(approve) {
+  const buttons = [$('consent-allow'), $('consent-deny')];
+  buttons.forEach((b) => { b.disabled = true; });
+  try {
+    await api('consent', { approve });
+    $('consent-overlay').hidden = true;
+  } catch (e) {
+    $('consent-overlay').hidden = true;
+    toast(/nothing awaiting/.test(e.message)
+      ? 'That request expired or was cancelled. Ask them to connect again - your invitation still works.'
+      : `Could not ${approve ? 'allow' : 'refuse'} the connection: ${e.message}`, true);
+  } finally {
+    buttons.forEach((b) => { b.disabled = false; });
+  }
+}
+$('consent-allow').onclick = () => answerConsent(true);
+$('consent-deny').onclick = () => answerConsent(false);
 
 /* ------------------------------ live updates ------------------------------ */
 

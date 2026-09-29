@@ -382,17 +382,25 @@ class CaptureControls {
 #ifdef _WIN32
     // ReadFile on an anonymous pipe cannot be polled; cancel the blocked read.
     // Retry briefly in case the thread had not yet entered ReadFile.
-    for (int i = 0; i < 100 && !readerDone_; ++i) {
-      if (const DWORD tid = readerThreadId_.load()) {
+    for (int i = 0; i < 100 && !gate_->done; ++i) {
+      if (const DWORD tid = gate_->threadId.load()) {
         if (HANDLE h = OpenThread(THREAD_TERMINATE, FALSE, tid)) {
           CancelSynchronousIo(h);
           CloseHandle(h);
         }
       }
-      if (!readerDone_) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      if (!gate_->done) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (!readerDone_) {
-      thread_.detach();  // process exit reaps it; it can no longer act (running_ is false)
+    {
+      // Decide under the gate: either the reader has finished (join it), or
+      // it is abandoned - and then, whenever its ReadFile finally returns, it
+      // sees `abandoned` and exits WITHOUT touching this object. (1.4.0
+      // detached it and the late read then locked mu_ of a destroyed object.)
+      std::lock_guard<std::mutex> g(gate_->m);
+      if (!gate_->done) {
+        gate_->abandoned = true;
+        thread_.detach();
+      }
     }
 #endif
     if (thread_.joinable()) thread_.join();
@@ -427,13 +435,17 @@ class CaptureControls {
  private:
   void run() {
 #ifdef _WIN32
-    struct Done { std::atomic<bool>& f; ~Done() { f = true; } } done{readerDone_};
-    readerThreadId_ = GetCurrentThreadId();
+    // Own the gate: it outlives this object if the destructor abandons us.
+    const std::shared_ptr<ReaderGate> gate = gate_;
+    struct Done { ReaderGate& g; ~Done() { g.done = true; } } done{*gate};
+    gate->threadId = GetCurrentThreadId();
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
     uint8_t bytes[4096];
     for (;;) {
       DWORD size = 0;
       const BOOL ok = ReadFile(in, bytes, sizeof(bytes), &size, nullptr);
+      std::lock_guard<std::mutex> g(gate->m);
+      if (gate->abandoned) return;   // this object is gone: touch nothing
       if (!ok || size == 0) {
         // Broken pipe / EOF: Node is gone or asked us to stop. Cancellation
         // during shutdown also lands here.
@@ -627,8 +639,14 @@ class CaptureControls {
   std::atomic<bool> failed_{false};
   std::atomic<bool> shutdownRequested_{false};
 #ifdef _WIN32
-  std::atomic<DWORD> readerThreadId_{0};
-  std::atomic<bool> readerDone_{false};
+  // Shared with the stdin reader thread, which may outlive this object.
+  struct ReaderGate {
+    std::mutex m;
+    bool abandoned = false;             // guarded by m
+    std::atomic<bool> done{false};
+    std::atomic<DWORD> threadId{0};
+  };
+  std::shared_ptr<ReaderGate> gate_ = std::make_shared<ReaderGate>();
 #endif
   std::thread thread_;
 };

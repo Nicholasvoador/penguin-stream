@@ -500,6 +500,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     const file = path.join(logbook.dir, `diagnostics-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.txt`);
     fs.mkdirSync(logbook.dir, { recursive: true });
     fs.writeFileSync(file, redact(report), { mode: 0o600 });
+    pruneDiagnostics(logbook.dir);
     logbook.info(`diagnostics written: ${path.basename(file)}`);
     return file;
   }
@@ -743,30 +744,44 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
   return { port: actualPort, token, url: link, close };
 }
 
+/** Keeps only the newest `keep` diagnostics reports (1.4.0 kept every one forever). */
+export function pruneDiagnostics(dir, keep = 5) {
+  try {
+    const old = fs.readdirSync(dir).filter((f) => /^diagnostics-.*\.txt$/.test(f)).sort().slice(0, -keep);
+    for (const f of old) fs.rmSync(path.join(dir, f), { force: true });
+  } catch { /* best effort */ }
+}
+
+/**
+ * Starts a helper program (file manager, browser) and forgets it. A missing
+ * program (no xdg-open on a minimal/immutable distro) is reported by Node as
+ * an ASYNC 'error' event, not a throw - unhandled, it crashed the whole app.
+ * @returns {boolean} false if it could not even be started synchronously
+ */
+export function spawnDetached(cmd, args, options = {}, spawnFn = spawn) {
+  try {
+    const child = spawnFn(cmd, args, { detached: true, stdio: 'ignore', ...options });
+    child.on('error', () => { /* no such program: the UI already shows the path/link */ });
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Opens a folder in the system file manager (log folder). */
 function openPath(dir) {
-  try {
-    if (process.platform === 'win32') {
-      spawn('explorer.exe', [dir], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
-    } else {
-      spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [dir], { detached: true, stdio: 'ignore' }).unref();
-    }
-  } catch { /* no file manager: the path is shown in the UI */ }
+  if (process.platform === 'win32') spawnDetached('explorer.exe', [dir], { windowsHide: false });
+  else spawnDetached(process.platform === 'darwin' ? 'open' : 'xdg-open', [dir]);
 }
 
 function openBrowser(url) {
-  try {
-    if (process.platform === 'win32') {
-      // `start` needs an explicit empty title argument, and Node's argument
-      // quoting would mangle it, so build the command line verbatim. The URL
-      // contains only [A-Za-z0-9:/.#=_-] (base64url token), nothing cmd-special.
-      spawn('cmd.exe', ['/d', '/s', '/c', `start "" "${url}"`], {
-        detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: true,
-      }).unref();
-    } else {
-      spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
-    }
-  } catch {
-    // Headless or no browser: the printed link is the fallback.
+  if (process.platform === 'win32') {
+    // `start` needs an explicit empty title argument, and Node's argument
+    // quoting would mangle it, so build the command line verbatim. The URL
+    // contains only [A-Za-z0-9:/.#=_-] (base64url token), nothing cmd-special.
+    spawnDetached('cmd.exe', ['/d', '/s', '/c', `start "" "${url}"`], { windowsHide: true, windowsVerbatimArguments: true });
+  } else {
+    spawnDetached(process.platform === 'darwin' ? 'open' : 'xdg-open', [url]);
   }
 }

@@ -95,7 +95,9 @@ EOF
 cp "$ROOTDIR/DEBIAN/postinst" "$ROOTDIR/DEBIAN/postrm"
 chmod 755 "$ROOTDIR/DEBIAN/postinst" "$ROOTDIR/DEBIAN/postrm"
 
-OUT="/out/penguin-stream_${PS_VERSION}~${PS_SUFFIX}_amd64.deb"
+# File name uses "." (GitHub rewrites "~" in asset names); the Version field
+# above keeps "~" so apt orders upgrades correctly.
+OUT="/out/penguin-stream_${PS_VERSION}.${PS_SUFFIX}_amd64.deb"
 dpkg-deb --root-owner-group -Zxz --build "$ROOTDIR" "$OUT" >/dev/null
 echo "built $OUT"
 echo "Depends: $DEPS"

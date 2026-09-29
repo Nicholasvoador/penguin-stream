@@ -25,9 +25,9 @@ Get the installers from the **[latest release](https://github.com/Nicholasvoador
 | **Windows 10/11 x64** | `PenguinStream-<version>-Setup.exe` | Installer (per-user, no admin needed) |
 | | `PenguinStream-<version>-Portable.exe` | Runs without installing |
 | **Fedora 44** | `penguin-stream-<version>-1.fc44.x86_64.rpm` | `sudo dnf install ./penguin-stream-*.x86_64.rpm` |
-| **Ubuntu 24.04 LTS** | `penguin-stream_<version>~ubuntu24.04_amd64.deb` | `sudo apt install ./penguin-stream_*~ubuntu24.04_amd64.deb` |
-| **Ubuntu 26.04 LTS** | `penguin-stream_<version>~ubuntu26.04_amd64.deb` | `sudo apt install ./penguin-stream_*~ubuntu26.04_amd64.deb` |
-| **Debian 13** | `penguin-stream_<version>~debian13_amd64.deb` | `sudo apt install ./penguin-stream_*~debian13_amd64.deb` |
+| **Ubuntu 24.04 LTS** | `penguin-stream_<version>.ubuntu24.04_amd64.deb` | `sudo apt install ./penguin-stream_*.ubuntu24.04_amd64.deb` |
+| **Ubuntu 26.04 LTS** | `penguin-stream_<version>.ubuntu26.04_amd64.deb` | `sudo apt install ./penguin-stream_*.ubuntu26.04_amd64.deb` |
+| **Debian 13** | `penguin-stream_<version>.debian13_amd64.deb` | `sudo apt install ./penguin-stream_*.debian13_amd64.deb` |
 
 `SHA256SUMS.txt` in each release lists the checksums. **Both computers need the same version.** Peers on different
 versions refuse to connect instead of half-connecting.
@@ -123,7 +123,7 @@ cmake -S media -B media/build && cmake --build media/build -j
 npm run app                 # run the desktop app from source
 npm test                    # full suite, incl. crypto inside the Electron runtime and a real PipeWire audio session
 npm run dist:linux          # -> dist/penguin-stream-<version>-1.fc44.x86_64.rpm (needs rpmbuild)
-npm run dist:deb            # -> dist/penguin-stream_<version>~<distro>_amd64.deb (needs podman; run dist:linux first)
+npm run dist:deb            # -> dist/penguin-stream_<version>.<distro>_amd64.deb (needs podman; run dist:linux first)
 npm run dist:win            # -> dist/PenguinStream-<version>-Setup.exe + Portable.exe (needs podman)
 ```
 

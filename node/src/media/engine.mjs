@@ -362,12 +362,19 @@ export class ViewEngine extends EventEmitter {
     this.proc = spawn(bin, args, { stdio: ['pipe', 'pipe', 'inherit'] });
     this.proc.stdin.on('error', () => {});   // see CaptureEngine: EPIPE must not crash the app
 
+    const proc = this.proc;
     this.proc.stdout.on('data', (chunk) => {
+      if (this.proc !== proc) return;     // stopped: ignore what was still buffered
       let messages;
       try {
         messages = this.parser.push(chunk);
       } catch (err) {
+        // The byte stream is out of sync; every later chunk would fail too
+        // (1.4.0 kept going and logged an error per chunk, forever). Stop the
+        // window like CaptureEngine does - the session reports it and the
+        // viewer reconnects cleanly.
         this.emit('error', err);
+        this.stop();
         return;
       }
       for (const msg of messages) {
@@ -465,8 +472,13 @@ export class ViewEngine extends EventEmitter {
     this.proc = null;
     try { p.stdin.end(); } catch { /* already closed */ }
     if (p.exitCode !== null || p.signalCode !== null) return;
-    const term = setTimeout(() => { try { p.kill('SIGTERM'); } catch { /* gone */ } }, 1000);
+    // A stream window stuck in a GPU driver ignores SIGTERM; 1.4.0 then left
+    // it running forever. Escalate to SIGKILL.
+    const { termMs = 1000, killMs = 3500 } = this.opts.stopTimeouts ?? {};
+    const term = setTimeout(() => { try { p.kill('SIGTERM'); } catch { /* gone */ } }, termMs);
+    const kill = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* gone */ } }, killMs);
     term.unref?.();
-    p.once('exit', () => clearTimeout(term));
+    kill.unref?.();
+    p.once('exit', () => { clearTimeout(term); clearTimeout(kill); });
   }
 }
