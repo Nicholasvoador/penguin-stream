@@ -33,6 +33,11 @@ const CONNECT_TIMEOUT_MS = 20_000;
 const RESEND_INTERVAL_MS = 2000;
 const BATCH_DELAY_MS = 40;
 const MAX_LOG = 256;
+// A viewer re-sends its signals every RESEND_INTERVAL_MS until ICE connects.
+// If the viewer we locked onto has gone quiet this long without ICE ever
+// connecting (it crashed, lost Wi-Fi, or its user clicked Connect again),
+// a different viewer session may take its place instead of being ignored.
+const PARTNER_STALE_MS = 3 * RESEND_INTERVAL_MS;
 // From first contact to SECURE, including the host's consent prompt (the UI
 // gives the host 120 s to answer).
 const HANDSHAKE_TIMEOUT_MS = 180_000;
@@ -89,8 +94,9 @@ class RendezvousChannel extends EventEmitter {
  */
 async function run({
   role, code, rendezvousUrl, nostr, nostrRelays, identity, iceServers, iceTransportPolicy,
-  onConsentRequest, onCode, onStatus, sessionTimeoutMs = 60_000,
+  onConsentRequest, onCode, onStatus, onHandshake, sessionTimeoutMs = 60_000, signal,
 }) {
+  if (signal?.aborted) throw new Error('cancelled');
   const canonical = normalizeShareCode(code);
   const codeBytes = Buffer.from(canonical.replaceAll('-', ''), 'utf8');
   const key = signalingKey(canonical);
@@ -129,6 +135,8 @@ async function run({
   let sentUpTo = 0;
   let batchTimer = null;
   let signalingDone = false;
+  let partnerSeenAt = 0;              // last time the partner's signals arrived
+  let iceConnected = false;
 
   let settle;
   const secure = new Promise((resolve, reject) => { settle = { resolve, reject }; });
@@ -136,9 +144,14 @@ async function run({
   const finish = (err, info) => {
     if (settled) return;
     settled = true;
-    clearTimeout(waitTimer);
+    if (waitTimer) clearTimeout(waitTimer);
+    signal?.removeEventListener('abort', onAbort);
     if (err) settle.reject(err); else settle.resolve(info);
   };
+  // Stop/Cancel pressed while connecting: tear everything down, never spawn
+  // capture or a stream window afterwards.
+  const onAbort = () => finish(Object.assign(new Error('cancelled'), { code: 'CANCELLED' }));
+  signal?.addEventListener('abort', onAbort, { once: true });
 
   const broadcast = (entries) => {
     if (signalingDone) return;
@@ -200,8 +213,12 @@ async function run({
     peer.on('state', (st) => status(st));
     peer.on('ice-state', (st) => {
       status('ice', st);
-      if (st === 'connected' || st === 'completed') stopSignaling();
+      if (st === 'connected' || st === 'completed') { iceConnected = true; stopSignaling(); }
     });
+    // The verification words exist as soon as the Noise handshake is done,
+    // BEFORE the host approves. The viewer must see them then, or the host
+    // is asked to compare words the viewer cannot show yet.
+    peer.once('handshake-complete', (info) => { try { onHandshake?.(info); } catch { /* UI only */ } });
     peer.once('secure', (info) => finish(null, info));
     peer.once('error', (err) => finish(err));
     peer.once('consent-denied', (reason) => finish(new Error(`connection refused: ${reason}`)));
@@ -224,12 +241,22 @@ async function run({
     if (msg.to && msg.to !== self) return;               // addressed to another session
     if (partner === null) {
       partner = msg.from;
+      partnerSeenAt = Date.now();
       status('peer-joined');
       if (!peer) createPeer();
       resendAll();                                       // answer at once, not on the next tick
     } else if (msg.from !== partner) {
-      return;                                            // one viewer per invitation
+      // One viewer per attempt. But if the current partner went quiet before
+      // ICE ever connected, it is gone: end this attempt so the caller can
+      // start a fresh one for the new viewer (same invitation).
+      if (role === 'host' && !iceConnected && peer?.state !== PeerState.SECURE &&
+          Date.now() - partnerSeenAt > PARTNER_STALE_MS) {
+        finish(Object.assign(new Error('the previous connection attempt went quiet; a new one is starting'),
+          { code: 'PARTNER_STALE' }));
+      }
+      return;
     }
+    partnerSeenAt = Date.now();
     // Apply strictly in sequence: a candidate must never overtake the SDP it
     // belongs to, even if it arrived first through a faster relay.
     for (const entry of msg.entries) {
@@ -247,14 +274,16 @@ async function run({
     }
   };
 
-  const waitTimer = setTimeout(() => {
+  // sessionTimeoutMs <= 0 or Infinity: wait for as long as the caller wants
+  // (a host keeps its invitation open until the user presses Stop).
+  const waitTimer = Number.isFinite(sessionTimeoutMs) && sessionTimeoutMs > 0 ? setTimeout(() => {
     const hint = partner ? '' : role === 'client'
       ? ' - the host was not found: check the invitation and that the host is still sharing'
       : ' - nobody joined';
     finish(new Error(`session did not become secure within ${Math.round(sessionTimeoutMs / 1000)}s ` +
       `(state=${peer?.state ?? 'waiting'})${hint}`));
-  }, sessionTimeoutMs);
-  waitTimer.unref?.();
+  }, sessionTimeoutMs) : null;
+  waitTimer?.unref?.();
 
   let opened = false;
   for (const ch of channels) {

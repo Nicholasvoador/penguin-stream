@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark light">
 <title>Penguin Stream</title>
 <link rel="stylesheet" href="/style.css">
-<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 </head>
 <body>
 <svg class="sprite" aria-hidden="true">
@@ -124,6 +124,10 @@
       <div class="card narrow">
         <h2>Connect to a desktop</h2>
         <p class="muted">Paste the invitation the host sent you. They will be asked to approve you.</p>
+        <div class="reconnect-last" id="reconnect-last" hidden>
+          <button class="btn primary wide" type="button" id="btn-reconnect-last">Reconnect to the last host</button>
+          <small class="muted">Uses the invitation that worked last time. The host keeps the same one unless they make a new code.</small>
+        </div>
         <form id="connect-form">
           <input id="code-input" class="code-input" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" autocomplete="off"
                  spellcheck="false" maxlength="256" aria-label="Invitation">
@@ -148,13 +152,15 @@
       </div>
 
       <div class="card invite-card" id="invite-card">
-        <div class="card-head"><h2>Your private invitation</h2><span class="hint-inline">Expires when you stop sharing</span></div>
+        <div class="card-head"><h2>Your private invitation</h2><span class="hint-inline">Stays the same every time you share</span></div>
         <div class="code-display" id="code-display">…</div>
         <div class="action-row">
           <button id="copy-invitation" class="btn primary" type="button"><svg><use href="#i-copy"/></svg> Copy invitation</button>
+          <button id="new-code" class="btn ghost" type="button" title="Only if the old code was shared with the wrong person">New code</button>
           <span id="copy-status" class="muted" role="status"></span>
         </div>
-        <p class="muted small">Send it privately (chat, DM). Anyone holding it can <em>ask</em> to connect — you still approve each person.</p>
+        <p class="muted small">Send it privately (chat, DM). Your friend can reuse it to reconnect any time you are sharing — you still approve each new device.
+          Make a <b>new code</b> only if it reached someone it should not have: the old one stops working.</p>
       </div>
 
       <div class="status-banner" id="host-status">Waiting for someone to connect…</div>
@@ -199,7 +205,7 @@
       <div class="card sas-card" id="viewer-sas" hidden>
         <div class="card-head"><h2>Verification words</h2></div>
         <div class="sas-words" id="viewer-sas-words"></div>
-        <p class="muted small">Read these to the host. They must see exactly the same four words — if not, disconnect.</p>
+        <p class="muted small" id="viewer-sas-hint">Read these to the host. They must see exactly the same four words — if not, disconnect.</p>
       </div>
 
       <div class="metrics" id="viewer-metrics" hidden>

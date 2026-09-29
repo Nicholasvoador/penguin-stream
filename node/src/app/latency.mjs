@@ -13,7 +13,7 @@
  * few ms over the internet. That is plenty to see where time goes.
  *
  * AdaptiveBitrate lowers the encoder bitrate as soon as the link starts to
- * queue, and creeps back up once it is clean. Too much bitrate for the path
+ * queue, and comes back once it is clean. Too much bitrate for the path
  * never buys quality - it buys delay, because frames wait in buffers.
  */
 
@@ -67,13 +67,28 @@ export class Summary {
 const round = (x) => Math.round(x * 100) / 100;
 
 /**
- * Host-side controller. Feed it observations; it returns a new bitrate (kbps)
- * when one should be applied, else null.
+ * Host-side adaptive bitrate: keeps the stream just under what the path
+ * carries, because a bitrate the path cannot carry does not buy quality - it
+ * buys delay (frames wait in buffers). Latency first, quality second.
  *
- * Signals (any one is enough to back off):
- *   - send queue: bytes waiting in the SCTP buffer, as milliseconds of video
- *   - delay rise: the viewer's frame arrival delay above its recent minimum
- *   - loss: frames the viewer had to abandon
+ * Signals, strongest first:
+ *   - send queue: bytes waiting to leave this machine, in ms at the rate we
+ *     actually send (the SCTP buffer is small, so this is visible at once)
+ *   - queue delay (viewer): how much the FASTEST frames of the last 250 ms
+ *     arrived later than the fastest frames of the last ~10 s. Wi-Fi jitter
+ *     spreads the distribution but leaves its minimum alone; a real queue
+ *     delays every frame. (1.3.1 compared the average with the minimum, so
+ *     ordinary Wi-Fi jitter looked like congestion and the bitrate collapsed
+ *     to the floor and stayed there.)
+ *   - loss: the share of frames that never arrived complete
+ *
+ * Reaction: decrease fast - straight below the rate the viewer actually
+ * receives while a queue stands (that IS the link's rate), else from the rate
+ * really sent - and hold for about one round trip so one congestion episode
+ * is not punished twice. Then come back: at once to just below the capacity
+ * found, carefully around it, and with growing steps once it has clearly
+ * been beaten. Changes are sparse and at least 6% apart (every bitrate change
+ * costs an NVENC keyframe).
  */
 export class AdaptiveBitrate {
   constructor({ maxKbps, minKbps = 1500, enabled = true } = {}) {
@@ -81,10 +96,19 @@ export class AdaptiveBitrate {
     this.minKbps = Math.min(minKbps, maxKbps);
     this.enabled = enabled;
     this.current = maxKbps;
-    this.lastChange = 0;
+    this.lastChange = -Infinity;
+    this.lastDecrease = -Infinity;
     this.cleanSince = 0;
     this.queueMaxMs = 0;
-    this.report = null;   // latest viewer report { delayRiseMs, lost }
+    this.reports = [];        // viewer reports since the last tick
+    this.sentKbps = null;     // measured sending rate (EWMA)
+    this.capacity = null;     // what the link delivered when it last congested
+    this.capacityAt = 0;
+    this.inEpisode = false;   // inside one congestion episode
+    this.probeStep = 0;       // consecutive clean probes above the known capacity
+    this.rttMs = null;
+    this.firstTick = null;
+    this.reason = '';         // why the last change happened (for the log)
   }
 
   setMax(kbps) {
@@ -93,50 +117,155 @@ export class AdaptiveBitrate {
     if (this.current > kbps || !this.enabled) this.current = kbps;
   }
 
-  /** Called for every frame sent. */
+  /** Bytes handed to the network over `ms` milliseconds. */
+  observeSent(bytes, ms) {
+    if (!(ms > 0) || !(bytes >= 0)) return;
+    const kbps = (bytes * 8) / ms;
+    this.sentKbps = this.sentKbps === null ? kbps : this.sentKbps * 0.6 + kbps * 0.4;
+  }
+
+  observeRtt(ms) { if (Number.isFinite(ms) && ms >= 0 && ms < 5000) this.rttMs = ms; }
+
+  /** Called for every frame sent, with the bytes still queued for sending. */
   observeQueue(bufferedBytes) {
-    const ms = (bufferedBytes * 8) / this.current;   // bytes*8 / kbit/s = ms
+    const rate = Math.max(this.sentKbps ?? 0, this.current, 1);
+    const ms = (bufferedBytes * 8) / rate;   // bytes*8 / kbit/s = ms
     if (ms > this.queueMaxMs) this.queueMaxMs = ms;
   }
 
-  observeViewer(report) { this.report = report; }
+  /**
+   * Viewer report. v2 (1.4.0+): { qdMs, lost, frames, rxKbps }. v1 (1.3.x)
+   * only has { delayRiseMs, lost }, an average-minus-minimum that includes
+   * jitter, so it is discounted heavily.
+   */
+  observeViewer(report) { if (report) this.reports.push(report); }
 
-  /** Called on a timer (~every 500 ms). Returns the new kbps or null. */
+  #viewerSignal() {
+    const reps = this.reports;
+    this.reports = [];
+    if (!reps.length) return null;
+    let qd = 0, lost = 0, frames = 0, v2 = false, rx = null;
+    for (const r of reps) {
+      if (Number.isFinite(r.qdMs)) { v2 = true; qd = Math.max(qd, r.qdMs); }
+      else if (Number.isFinite(r.delayRiseMs)) qd = Math.max(qd, r.delayRiseMs - 30);
+      lost += Number.isFinite(r.lost) ? r.lost : 0;
+      frames += Number.isFinite(r.frames) ? r.frames : 0;
+      if (Number.isFinite(r.rxKbps) && r.rxKbps > 0) rx = rx === null ? r.rxKbps : Math.max(rx, r.rxKbps);
+    }
+    // v1 reports carry no frame count: assume a second of 60 fps each.
+    if (!v2 && !frames) frames = 60 * reps.length;
+    return { qd: Math.max(0, qd), lost, rx, lossPct: lost + frames > 0 ? (100 * lost) / (lost + frames) : 0 };
+  }
+
+  /** Called on a timer (~every 250 ms). Returns the new kbps or null. */
   tick(now = Date.now()) {
     const queue = this.queueMaxMs;
     this.queueMaxMs = 0;
-    const rep = this.report;
-    this.report = null;
+    const rep = this.#viewerSignal();
     if (!this.enabled) return null;
+    if (this.firstTick === null) this.firstTick = now;
+    // The viewer's delay baseline needs a moment to form after the start.
+    const warm = now - this.firstTick >= 2000;
+    const qd = warm && rep ? rep.qd : 0;
+    const lossPct = rep && rep.lost >= 2 ? rep.lossPct : 0;
 
-    const congested = queue > 25 || (rep && (rep.delayRiseMs > 30 || rep.lost >= 2));
-    const clean = queue < 6 && (!rep || (rep.delayRiseMs < 10 && rep.lost === 0));
+    const severe = queue > 60 || qd > 80 || lossPct > 10;
+    const congested = severe || queue > 15 || qd > 25 || lossPct > 3;
+    const clean = queue < 5 && qd < 10 && lossPct < 1;
 
     if (congested) {
       this.cleanSince = 0;
-      if (now - this.lastChange < 700) return null;
-      // Back off harder the worse it is: queues drain only when we send less
-      // than the link carries.
-      const factor = queue > 80 || rep?.delayRiseMs > 80 || rep?.lost >= 6 ? 0.6 : 0.8;
-      return this.#set(Math.max(this.minKbps, Math.round(this.current * factor)), now);
-    }
-    if (clean && this.current < this.maxKbps) {
-      if (!this.cleanSince) this.cleanSince = now;
-      // Probe upward slowly (+8% every ~2 s of clean link).
-      if (now - this.cleanSince >= 2000 && now - this.lastChange >= 2000) {
-        return this.#set(Math.min(this.maxKbps, Math.round(this.current * 1.08) + 100), now);
+      this.probeStep = 0;
+      const sent = this.sentKbps && this.sentKbps > 0 ? this.sentKbps : this.current;
+      // While a queue stands, what the viewer receives IS the link's rate.
+      const rx = rep?.rx && qd > 25 ? rep.rx : null;
+      if (!this.inEpisode) {
+        this.inEpisode = true;
+        this.capacity = Math.max(this.minKbps, rx ?? sent * 0.95);
+      } else if (rx !== null) {
+        this.capacity = Math.max(this.minKbps, Math.min(this.capacity, rx));
       }
-    } else if (!clean) {
-      this.cleanSince = 0;
+      this.capacityAt = now;
+      // One round trip (plus a little) for the last change to take effect.
+      const hold = Math.max(400, 2 * (this.rttMs ?? 50) + 150);
+      if (now - this.lastDecrease < hold) return null;
+      // Back off from what really goes out (an encoder can overshoot a low
+      // target; cutting a target it already misses changes nothing). With the
+      // link rate known, go straight below it - far enough below that a
+      // standing queue drains in about a second.
+      const base = Math.min(this.current, Math.max(sent, this.current * 0.5));
+      let next = base * (severe ? 0.65 : 0.85);
+      if (rx !== null) next = Math.min(next, rx * (qd > 200 ? 0.6 : qd > 80 ? 0.75 : 0.85));
+      const why = queue > 15 ? `send queue ${Math.round(queue)} ms` : qd > 25 ? `queue delay ${Math.round(qd)} ms`
+        : `${lossPct.toFixed(1)}% frames lost`;
+      const k = this.#set(Math.max(this.minKbps, Math.round(next)), now, why, 0.03);
+      if (k !== null) this.lastDecrease = now;
+      return k;
+    }
+    if (!clean) { this.cleanSince = 0; return null; }
+    this.inEpisode = false;
+    if (this.current >= this.maxKbps) return null;
+    if (!this.cleanSince) this.cleanSince = now;
+    const cleanFor = now - this.cleanSince;
+    const sinceChange = now - this.lastChange;
+    const known = this.capacity !== null && now - this.capacityAt < 20_000 ? this.capacity : null;
+    if (known !== null && this.current < known * 0.85) {
+      // Well below what the link carried a moment ago: come back at once.
+      if (cleanFor >= 750 && sinceChange >= 1000) {
+        return this.#set(Math.min(this.maxKbps, Math.round(Math.max(this.current * 1.2, known * 0.85))), now, 'link clear, recovering');
+      }
+      return null;
+    }
+    // Near or above the last known capacity: probe. Small steps while the
+    // estimate may be right, growing steps once it has clearly been beaten
+    // (the squeeze is over - get back to full quality quickly).
+    if (known !== null && this.current < known * 1.15) {
+      if (cleanFor >= 2000 && sinceChange >= 2000) {
+        return this.#set(Math.min(this.maxKbps, Math.round(this.current * 1.1) + 100), now, 'link clear, probing up');
+      }
+      return null;
+    }
+    if (cleanFor >= 1500 && sinceChange >= 1500) {
+      const factor = [1.15, 1.25, 1.4, 1.6][Math.min(3, this.probeStep++)];
+      return this.#set(Math.min(this.maxKbps, Math.round(this.current * factor) + 100), now, 'link clear, probing up');
     }
     return null;
   }
 
-  #set(kbps, now) {
-    if (Math.abs(kbps - this.current) < this.current * 0.02) return null;
+  #set(kbps, now, reason, minStep = 0.06) {
+    if (kbps === this.current) return null;
+    if (Math.abs(kbps - this.current) < this.current * minStep && kbps !== this.maxKbps && kbps !== this.minKbps) return null;
     this.current = kbps;
     this.lastChange = now;
+    this.reason = reason;
     return kbps;
+  }
+}
+
+/**
+ * Viewer side of the queue-delay signal. Feed it the raw one-way delay of
+ * every complete frame (viewer clock now - host capture time; the unknown
+ * clock offset between the machines cancels out), take() every ~250 ms.
+ */
+export class QueueDelay {
+  constructor({ baselineMs = 10_000 } = {}) {
+    this.baselineMs = baselineMs;
+    this.windowMin = Infinity;
+    this.ring = [];           // [{ t, v }] window minima within baselineMs
+  }
+
+  add(rawMs) { if (Number.isFinite(rawMs) && rawMs < this.windowMin) this.windowMin = rawMs; }
+
+  /** @returns {number|null} ms the fastest recent frames are late vs. the baseline */
+  take(now = Date.now()) {
+    const w = this.windowMin;
+    this.windowMin = Infinity;
+    if (!Number.isFinite(w)) return null;
+    this.ring.push({ t: now, v: w });
+    while (this.ring.length && now - this.ring[0].t > this.baselineMs) this.ring.shift();
+    let base = Infinity;
+    for (const e of this.ring) if (e.v < base) base = e.v;
+    return Math.max(0, w - base);
   }
 }
 

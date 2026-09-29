@@ -6,6 +6,8 @@
 // that cycle per frame, plus a moving bar and a frame counter bar, so a test
 // can assert that decoded pixels match what was fed in.
 
+#include <cstdlib>
+#include <cstdio>
 #include "capture/source.h"
 
 #include <algorithm>
@@ -30,6 +32,14 @@ class SyntheticSource : public CaptureSource {
   bool start(const CaptureOptions& opts, std::string& error) override {
     width_ = opts.width > 0 ? (opts.width & ~1) : 1280;
     height_ = opts.height > 0 ? (opts.height & ~1) : 720;
+    // Test/benchmark hook: PS_SYNTHETIC_SIZE=2560x1440 exercises encode and
+    // transport at real desktop sizes (capture mode has no size option).
+    if (const char* s = std::getenv("PS_SYNTHETIC_SIZE")) {
+      int w = 0, h = 0;
+      if (std::sscanf(s, "%dx%d", &w, &h) == 2 && w >= 16 && h >= 16 && w <= 8192 && h <= 8192) {
+        width_ = w & ~1; height_ = h & ~1;
+      }
+    }
     fps_ = opts.fps > 0 ? opts.fps : 60;
     buffer_.assign(static_cast<size_t>(width_) * height_ * 4, 0);
     frameIndex_ = 0;

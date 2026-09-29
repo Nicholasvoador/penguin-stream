@@ -1,11 +1,12 @@
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="Penguin Stream: low-latency remote desktop between Windows and Fedora. No port forwarding. Works behind CGNAT." width="100%">
+  <img src="docs/assets/banner.svg" alt="Penguin Stream: low-latency remote desktop for Windows and Linux. No port forwarding. Works behind CGNAT." width="100%">
 </p>
 
 <p align="center">
   <a href="https://github.com/Nicholasvoador/penguin-stream/releases/latest"><img src="https://img.shields.io/github/v/release/Nicholasvoador/penguin-stream?style=for-the-badge&label=latest&color=38bdf8&logo=github" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/Windows-10%20%2F%2011-6366f1?style=for-the-badge&logo=windows" alt="Windows 10/11">
   <img src="https://img.shields.io/badge/Fedora-x86__64-3b82f6?style=for-the-badge&logo=fedora&logoColor=white" alt="Fedora">
+  <img src="https://img.shields.io/badge/Ubuntu%20%2F%20Debian-amd64-e95420?style=for-the-badge&logo=ubuntu&logoColor=white" alt="Ubuntu / Debian">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-7c3aed?style=for-the-badge" alt="MIT license"></a>
 </p>
 
@@ -23,7 +24,10 @@ Get the installers from the **[latest release](https://github.com/Nicholasvoador
 |---|---|---|
 | **Windows 10/11 x64** | `PenguinStream-<version>-Setup.exe` | Installer (per-user, no admin needed) |
 | | `PenguinStream-<version>-Portable.exe` | Runs without installing |
-| **Fedora x86_64** | `penguin-stream-<version>-1.fc44.x86_64.rpm` | `sudo dnf install ./penguin-stream-*.x86_64.rpm` |
+| **Fedora 44** | `penguin-stream-<version>-1.fc44.x86_64.rpm` | `sudo dnf install ./penguin-stream-*.x86_64.rpm` |
+| **Ubuntu 24.04 LTS** | `penguin-stream_<version>~ubuntu24.04_amd64.deb` | `sudo apt install ./penguin-stream_*~ubuntu24.04_amd64.deb` |
+| **Ubuntu 26.04 LTS** | `penguin-stream_<version>~ubuntu26.04_amd64.deb` | `sudo apt install ./penguin-stream_*~ubuntu26.04_amd64.deb` |
+| **Debian 13** | `penguin-stream_<version>~debian13_amd64.deb` | `sudo apt install ./penguin-stream_*~debian13_amd64.deb` |
 
 `SHA256SUMS.txt` in each release lists the checksums. **Both computers need the same version.** Peers on different
 versions refuse to connect instead of half-connecting.
@@ -33,14 +37,22 @@ versions refuse to connect instead of half-connecting.
 >
 > **Fedora codecs:** the RPM works with Fedora's stock FFmpeg libraries, NVENC included. AMD/Intel GPU encoding
 > (VA-API H.264) needs RPM Fusion's Mesa drivers. See [docs/FEDORA.md](docs/FEDORA.md).
+>
+> **Ubuntu/Debian:** pick the `.deb` for your release. Each is built against that release's own FFmpeg, PipeWire and SDL,
+> and `apt` pulls in everything it needs. Use `apt install ./file.deb` (with the `./`), not `dpkg -i`, so dependencies are installed.
 
 <img src="docs/assets/h-use.svg" alt="How to use it" width="100%">
 
 1. **Host** (the computer being shared): open Penguin Stream → **Share this screen**. On Wayland, pick the screen in the
    system dialog (and allow *remote control* if you want the other person to use your keyboard/mouse).
-2. Send the **invitation** privately (chat/DM).
-3. **Viewer:** open Penguin Stream → **Connect to a screen** → paste → **Connect**.
+2. Send the **invitation** privately (chat/DM). It stays the same every time you share, so your friend can keep it and
+   reuse it. **New code** replaces it only when you ask, e.g. if it reached the wrong person.
+3. **Viewer:** open Penguin Stream → **Connect to a screen** → paste → **Connect**. Next time, **Reconnect to the last host**
+   is one click.
 4. Both sides see **four verification words**. The host clicks **Allow** only if they match.
+
+If the connection drops, nobody has to start over: the host keeps sharing on the same invitation, and the viewer
+reconnects by itself and gets straight back in without a new approval. Only **Stop sharing** or **Disconnect** ends it.
 
 The stream opens in its own window. During a session either side can switch control on or off instantly:
 
@@ -55,7 +67,7 @@ host through uinput and on a Windows host as virtual Xbox 360 pads (needs the fr
 
 <img src="docs/assets/h-audio.svg" alt="Audio without the echo" width="100%">
 
-The host's desktop audio streams to the viewer on both Windows and Fedora. If you're in the same **Discord call** while
+The host's desktop audio streams to the viewer on both Windows and Linux. If you're in the same **Discord call** while
 sharing, you don't want your friend hearing everyone twice (themselves included). So by default Penguin Stream **leaves
 voice-chat apps out of the streamed audio**: Discord, TeamSpeak, Zoom, Teams, Mumble and others. You still hear the call
 normally. You can also leave out other apps, or stream only one app (just the game). See [docs/AUDIO.md](docs/AUDIO.md).
@@ -111,11 +123,13 @@ cmake -S media -B media/build && cmake --build media/build -j
 npm run app                 # run the desktop app from source
 npm test                    # full suite, incl. crypto inside the Electron runtime and a real PipeWire audio session
 npm run dist:linux          # -> dist/penguin-stream-<version>-1.fc44.x86_64.rpm (needs rpmbuild)
+npm run dist:deb            # -> dist/penguin-stream_<version>~<distro>_amd64.deb (needs podman; run dist:linux first)
 npm run dist:win            # -> dist/PenguinStream-<version>-Setup.exe + Portable.exe (needs podman)
 ```
 
 The Windows build cross-compiles the media engine with MinGW in a Fedora container and packages it in
-electron-builder's Wine container, so nothing gets installed on the build machine. The CLI (`node node/src/cli.mjs host|connect|doctor`)
+electron-builder's Wine container. The Ubuntu/Debian packages build the engine inside each release's own container. Nothing gets
+installed on the build machine. The CLI (`node node/src/cli.mjs host|connect|doctor`)
 is still available for headless use and scripting.
 
 See [LIMITATIONS.md](LIMITATIONS.md) for exactly what has and hasn't been verified, and [CHANGELOG.md](CHANGELOG.md) for what changed in each release.

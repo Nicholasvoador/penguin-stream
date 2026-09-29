@@ -20,6 +20,25 @@ import { aeadEncrypt, aeadDecrypt, noiseNonce } from './noise.mjs';
 export const HEADER_LEN = 9;
 const TAG_LEN = 16;
 const WINDOW_BITS = 1024;
+// Media gets a much wider window: at 1.5-60 Mbps a few seconds of video plus
+// audio is thousands of records, and reordering on the unordered channel must
+// never look like a replay. Memory: one Set entry per record in the window.
+const MEDIA_WINDOW_BITS = 16384;
+
+/**
+ * Which record channels may arrive on which data channel ("lane"). The sender
+ * uses ONE sequence space for everything (so nonces stay unique per key and
+ * the wire format is unchanged), but the receiver checks each lane on its own:
+ *
+ *   ctl lane   (reliable, ordered SCTP):  strictly increasing seq, no window.
+ *   media lane (unreliable, unordered):   sliding replay window.
+ *
+ * Until 1.4.0 both lanes shared one 1024-record window. A control record that
+ * SCTP retransmitted after a Wi-Fi hiccup arrived after >1024 media records,
+ * was rejected as a "replay", and the rejection tore the whole session down
+ * (seen in the field as "control channel closed" after a few minutes).
+ */
+export const LANE = Object.freeze({ CTL: 'ctl', MEDIA: 'media', ANY: 'any' });
 
 /** Channel ids. Kept small and fixed so the header stays one byte. */
 export const CHANNEL = Object.freeze({
@@ -48,9 +67,11 @@ export class ReplayWindow {
     if (s > this.highest) {
       this.highest = s;
       this.seen.add(s);
-      // Evict everything that has slid out of the window.
-      const floor = this.highest - BigInt(this.bits);
-      if (this.seen.size > this.bits) {
+      // Evict what slid out of the window - in batches, so the per-record
+      // cost stays O(1) on the media hot path (a full sweep per record was
+      // O(window) BigInt compares, i.e. millions per second at high bitrate).
+      if (this.seen.size > this.bits + Math.max(16, this.bits >> 3)) {
+        const floor = this.highest - BigInt(this.bits);
         for (const v of this.seen) if (v <= floor) this.seen.delete(v);
       }
       return true;
@@ -73,7 +94,8 @@ export class SecureSession {
     this.sendKey = sendKey;
     this.recvKey = recvKey;
     this.txSeq = 0n;
-    this.replay = new ReplayWindow();
+    this.replay = new ReplayWindow(MEDIA_WINDOW_BITS);   // media lane (and legacy callers)
+    this.ctlHighest = -1n;                                // ctl lane: last accepted seq
     this.stats = { sealed: 0, opened: 0, rejected: 0, replayed: 0 };
   }
 
@@ -109,10 +131,12 @@ export class SecureSession {
 
   /**
    * @param {Buffer} record
+   * @param {'ctl'|'media'|'any'} [lane] data channel the record arrived on.
+   *   'any' (default, for tests/tools): window check only, any channel id.
    * @returns {{channel: number, seq: bigint, plaintext: Buffer}}
-   * @throws if the record is malformed, forged, or a replay
+   * @throws if the record is malformed, forged, a replay, or on the wrong lane
    */
-  open(record) {
+  open(record, lane = LANE.ANY) {
     if (!Buffer.isBuffer(record) || record.length < HEADER_LEN + TAG_LEN) {
       this.stats.rejected++;
       throw new Error('record too short');
@@ -131,9 +155,27 @@ export class SecureSession {
       throw new Error(`record authentication failed: ${err.message}`);
     }
 
-    if (!this.replay.accept(seq)) {
-      this.stats.replayed++;
-      throw new Error(`replayed or stale record (seq=${seq})`);
+    if (lane === LANE.CTL) {
+      // Reliable + ordered: every genuine record is newer than the last one,
+      // however late SCTP delivered it. Media records never enter this check.
+      if (channel === CHANNEL.VIDEO || channel === CHANNEL.AUDIO) {
+        this.stats.rejected++;
+        throw new Error(`media record on the control channel (seq=${seq})`);
+      }
+      if (seq <= this.ctlHighest) {
+        this.stats.replayed++;
+        throw new Error(`replayed control record (seq=${seq})`);
+      }
+      this.ctlHighest = seq;
+    } else {
+      if (lane === LANE.MEDIA && channel !== CHANNEL.VIDEO && channel !== CHANNEL.AUDIO) {
+        this.stats.rejected++;
+        throw new Error(`non-media record on the media channel (seq=${seq})`);
+      }
+      if (!this.replay.accept(seq)) {
+        this.stats.replayed++;
+        throw new Error(`replayed or stale record (seq=${seq})`);
+      }
     }
 
     this.stats.opened++;

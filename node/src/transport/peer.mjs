@@ -16,7 +16,7 @@ import { EventEmitter } from 'node:events';
 import dc from 'node-datachannel';
 
 import { HandshakeState } from '../crypto/noise.mjs';
-import { SecureSession, CHANNEL } from '../crypto/session.mjs';
+import { SecureSession, CHANNEL, LANE } from '../crypto/session.mjs';
 import { deriveSAS } from '../crypto/sas.mjs';
 
 export const PeerState = Object.freeze({
@@ -37,12 +37,17 @@ function initLogger(level = 'error') {
   if (loggerReady) return;
   try { dc.initLogger(level); } catch { /* signature varies by build; non-fatal */ }
   try {
-    // Ultra-low latency SCTP settings:
-    // delayedSackTime: 0 disables delayed SACK timers (eliminating up to 200ms of ACK delay)
-    // 4MB send/recv buffers prevent keyframe bursts from stalling the SCTP queue
+    // Low-latency SCTP settings:
+    // - delayedSackTime 0: no delayed-ACK timer (up to 200 ms otherwise).
+    // - sendBufferSize 256 KB (was 4 MB): data inside usrsctp's socket buffer
+    //   is invisible to bufferedAmount. With 4 MB, ~2 s of video could pile up
+    //   before the frame-skip and adaptive-bitrate logic saw ANY queue
+    //   (measured: bufferedAmount stayed 0 until 4.2 MB were queued). 256 KB
+    //   still fits a keyframe and makes congestion visible within a frame or two.
+    // - 4 MB receive buffer is harmless (it only absorbs bursts at the viewer).
     dc.setSctpSettings({
       recvBufferSize: 4 * 1024 * 1024,
-      sendBufferSize: 4 * 1024 * 1024,
+      sendBufferSize: 256 * 1024,
       maxChunksOnQueue: 8192,
       delayedSackTime: 0,
     });
@@ -190,8 +195,12 @@ export class Peer extends EventEmitter {
 
   _createChannels() {
     this._attachCtl(this.pc.createDataChannel('ctl', { ordered: true, protocol: 'penguin-ctl-1' }));
+    // node-datachannel's native API takes `unordered`, NOT the browser-style
+    // `ordered: false` (which it silently ignores). Until 1.4.0 the media
+    // channel was therefore ORDERED: one lost packet held back every later
+    // video/audio message until the gap was skipped (>= 1 RTT per loss).
     this._attachMedia(this.pc.createDataChannel('media', {
-      ordered: false,
+      unordered: true,
       maxRetransmits: 0,
       protocol: 'penguin-media-1',
     }));
@@ -231,7 +240,7 @@ export class Peer extends EventEmitter {
         await this._onHandshakeMessage(buf);
         return;
       }
-      const { channel, plaintext } = this.session.open(buf);
+      const { channel, plaintext } = this.session.open(buf, LANE.CTL);
       this._dispatchSecure(channel, plaintext);
     } catch (err) {
       this._fail(err);
@@ -349,7 +358,7 @@ export class Peer extends EventEmitter {
     if (!this.session) return; // pre-handshake noise; ignore
     const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
     try {
-      const { channel, plaintext, seq } = this.session.open(buf);
+      const { channel, plaintext, seq } = this.session.open(buf, LANE.MEDIA);
       if (this.state !== PeerState.SECURE) return; // not consented yet
       if (channel === CHANNEL.VIDEO) this.emit('video', plaintext, seq);
       else if (channel === CHANNEL.AUDIO) this.emit('audio', plaintext, seq);

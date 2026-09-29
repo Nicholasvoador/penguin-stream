@@ -1,10 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="380" viewBox="0 0 1280 380" role="img" aria-label="Penguin Stream: low-latency remote desktop for Windows and Fedora">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="380" viewBox="0 0 1280 380" role="img" aria-label="Penguin Stream: low-latency remote desktop for Windows and Linux">
 <defs>
   <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#6366f1"/></linearGradient>
   <linearGradient id="ice" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f0f9ff"/><stop offset="1" stop-color="#bae6fd"/></linearGradient>
   <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1e3a8a" stop-opacity=".55"/><stop offset="1" stop-color="#1e1b4b" stop-opacity=".85"/></linearGradient>
   <filter id="blur" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="40"/></filter>
   <clipPath id="card"><rect width="1280" height="380" rx="28"/></clipPath>
+<linearGradient id="p-coat" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#2a3957"/><stop offset=".55" stop-color="#131c30"/><stop offset="1" stop-color="#0b1220"/>
+  </linearGradient>
+  <linearGradient id="p-belly" x1=".2" y1="0" x2=".8" y2="1">
+    <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#dce8fb"/>
+  </linearGradient>
+  <linearGradient id="p-flip" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#34466b"/><stop offset="1" stop-color="#0b1220"/>
+  </linearGradient>
+  <linearGradient id="p-orange" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#fdba74"/><stop offset="1" stop-color="#f97316"/>
+  </linearGradient>
+  <radialGradient id="p-shadow" cx=".5" cy=".5" r=".5">
+    <stop offset="0" stop-color="#0b1220" stop-opacity=".35"/><stop offset="1" stop-color="#0b1220" stop-opacity="0"/>
+  </radialGradient>
 </defs>
 <g clip-path="url(#card)">
   <rect width="1280" height="380" fill="url(#sky)"/>
@@ -20,27 +35,56 @@
   <!-- ice floe -->
   <path d="M870 318 L905 292 L1180 290 L1230 316 L1200 338 L900 340 Z" fill="url(#ice)"/>
   <path d="M905 292 L1180 290 L1230 316 L1200 322 L910 320 L870 318 Z" fill="#fff" opacity=".7"/>
-  <!-- signal arcs (streaming) -->
-  <g fill="none" stroke="#e0f2fe" stroke-width="9" stroke-linecap="round">
-    <path d="M1165 108 a38 38 0 0 1 28 36" opacity=".9"><animate attributeName="opacity" values=".2;1;.2" dur="1.8s" repeatCount="indefinite"/></path>
-    <path d="M1170 76 a70 70 0 0 1 56 68" opacity=".7"><animate attributeName="opacity" values=".2;1;.2" dur="1.8s" begin=".3s" repeatCount="indefinite"/></path>
-    <path d="M1176 44 a102 102 0 0 1 84 100" opacity=".5"><animate attributeName="opacity" values=".2;1;.2" dur="1.8s" begin=".6s" repeatCount="indefinite"/></path>
+  <!-- speed trails behind the sliding penguin -->
+  <g stroke="#f0f9ff" stroke-linecap="round" fill="none">
+    <path d="M760 214 H880" stroke-width="12" opacity=".85"><animate attributeName="opacity" values=".45;.9;.45" dur="1.6s" repeatCount="indefinite"/></path>
+    <path d="M800 246 H890" stroke-width="12" opacity=".6"><animate attributeName="opacity" values=".3;.7;.3" dur="1.6s" begin=".25s" repeatCount="indefinite"/></path>
+    <path d="M780 278 H884" stroke-width="12" opacity=".4"><animate attributeName="opacity" values=".15;.5;.15" dur="1.6s" begin=".5s" repeatCount="indefinite"/></path>
   </g>
-  <g transform="translate(1045 172) scale(1.0)">
-  <ellipse cx="0" cy="128" rx="92" ry="12" fill="#0b1220" opacity=".18"/>
-  <ellipse cx="-38" cy="122" rx="30" ry="11" fill="#fbbf24"/>
-  <ellipse cx="38" cy="122" rx="30" ry="11" fill="#fbbf24"/>
-  <ellipse cx="0" cy="0" rx="100" ry="125" fill="#0b1220"/>
-  <ellipse cx="0" cy="32" rx="68" ry="86" fill="#f8fafc"/>
-  <circle cx="-30" cy="-46" r="20" fill="#f8fafc"/><circle cx="30" cy="-46" r="20" fill="#f8fafc"/>
-  <circle cx="-26" cy="-44" r="9" fill="#0b1220"/><circle cx="34" cy="-44" r="9" fill="#0b1220"/>
-  <circle cx="-23" cy="-48" r="3" fill="#fff"/><circle cx="37" cy="-48" r="3" fill="#fff"/>
-  <path d="M-18 -20 H18 L0 4 Z" fill="#fbbf24" stroke="#f59e0b" stroke-width="2" stroke-linejoin="round"/>
-  
-</g>
+  <!-- mascot (same art as the app icon) -->
+  <g transform="translate(850 16) scale(0.62)">
+  <ellipse cx="312" cy="462" rx="118" ry="16" fill="url(#p-shadow)"/>
+  <g transform="rotate(14 300 300)">
+    <!-- feet: tucked under the body so they connect -->
+    <path d="M244 430 c-8 20 2 30 18 30 h46 c9 0 10 -9 3 -15 l-22 -22 z" fill="url(#p-orange)"/>
+    <path d="M300 432 c-8 20 2 30 18 30 h46 c9 0 10 -9 3 -15 l-22 -22 z" fill="url(#p-orange)"/>
+    <!-- coat -->
+    <path d="M306 84
+             C368 84 404 130 406 188
+             C408 234 394 262 398 300
+             C404 382 372 452 296 456
+             C226 460 186 414 184 356
+             C182 300 206 262 214 212
+             C226 136 252 84 306 84 Z" fill="url(#p-coat)"/>
+    <!-- belly: starts at the chin, chest line curves down and back -->
+    <path d="M402 214
+             C400 246 394 266 396 300
+             C400 380 368 438 298 440
+             C254 441 230 410 232 368
+             C234 324 262 300 290 284
+             C330 262 372 250 402 214 Z" fill="url(#p-belly)"/>
+    <!-- soft shadow the flipper casts on the belly -->
+    <path d="M258 292 C244 336 238 382 244 424 C270 396 286 352 290 306 Z" fill="#0b1220" opacity=".22"/>
+    <!-- chin shadow: head sits over the chest -->
+    <path d="M402 214 C372 250 330 262 292 284 C330 270 372 262 400 240 Z" fill="#0b1220" opacity=".16"/>
+    <!-- flipper: swept back, with a lit leading edge for volume -->
+    <path d="M244 256
+             C214 296 192 350 186 412
+             C218 392 256 346 272 300
+             C278 280 262 250 244 256 Z" fill="url(#p-flip)"/>
+    <path d="M246 262 C224 296 206 340 196 392" stroke="#5a6f96" stroke-width="6" fill="none" stroke-linecap="round" opacity=".9"/>
+    <!-- beak: upper and lower mandible -->
+    <path d="M396 166 C428 168 454 180 466 194 C446 196 420 194 398 190 Z" fill="url(#p-orange)"/>
+    <path d="M398 192 C420 196 444 198 460 198 C448 208 424 212 400 206 Z" fill="#ea580c"/>
+    <!-- eye -->
+    <circle cx="358" cy="160" r="19" fill="#fff"/>
+    <circle cx="364" cy="162" r="10" fill="#0b1220"/>
+    <circle cx="367" cy="158" r="3.6" fill="#fff"/>
+  </g>
+  </g>
   <!-- title -->
   <text x="72" y="150" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="76" font-weight="800" fill="#fff" letter-spacing="-1.5">Penguin Stream</text>
-  <text x="74" y="198" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="27" font-weight="500" fill="#f0f9ff" opacity=".95">Low-latency remote desktop between Windows and Fedora.</text>
+  <text x="74" y="198" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="27" font-weight="500" fill="#f0f9ff" opacity=".95">Low-latency remote desktop for Windows and Linux.</text>
   <text x="74" y="234" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="27" font-weight="500" fill="#f0f9ff" opacity=".95">No port forwarding. Works behind CGNAT.</text>
   <g font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="18" font-weight="700" fill="#fff">
     <rect x="72" y="262" width="186" height="38" rx="19" fill="#fff" opacity=".2"/><text x="165" y="287" text-anchor="middle">Direct peer-to-peer</text>

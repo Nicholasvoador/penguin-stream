@@ -23,7 +23,7 @@ import { CaptureEngine, ViewEngine } from '../media/engine.mjs';
 import { AudioCapture, AudioPlayer } from '../media/audio.mjs';
 import { createInputValidator, inputClass } from '../media/input.mjs';
 import { resolveRelay, describeRelay } from '../net/relay.mjs';
-import { AdaptiveBitrate, ClockSync, Summary, nowUs, latencyTips } from './latency.mjs';
+import { AdaptiveBitrate, ClockSync, QueueDelay, Summary, nowUs, latencyTips } from './latency.mjs';
 
 /** Optional self-hosted rendezvous. Pairing uses public Nostr relays by default. */
 export const DEFAULT_RENDEZVOUS = process.env.PENGUIN_RENDEZVOUS || undefined;
@@ -35,6 +35,8 @@ export const APP_VERSION = (() => {
 })();
 /** Bumped whenever the peer-to-peer message formats change incompatibly. */
 export const PROTOCOL_VERSION = 2;
+
+const cancelled = () => Object.assign(new Error('cancelled'), { code: 'CANCELLED' });
 
 /** Warns when the peer never introduces itself (Penguin Stream 0.9 and older). */
 function expectHello(peer, emit) {
@@ -142,6 +144,7 @@ export class Host extends EventEmitter {
     // Live-switchable: the host can grant or revoke control mid-session.
     this.permissions = { kbm: opts.allowInput === true, pad: opts.allowGamepad === true };
     this.inputStatus = null;
+    this._abort = new AbortController();   // Stop pressed while waiting/connecting
   }
 
   /** Grants/revokes keyboard+mouse and controller control during a session. */
@@ -172,8 +175,10 @@ export class Host extends EventEmitter {
    */
   async start(approve) {
     const iceServers = await iceServersFor(this.opts, (...a) => this.emit(...a));
+    if (this._closed) throw cancelled();
 
-    this.session = await hostSession({
+    const session = await hostSession({
+      signal: this._abort.signal,
       code: this.opts.code,
       rendezvousUrl: this.opts.rendezvousUrl || DEFAULT_RENDEZVOUS,
       nostr: this.opts.nostr,
@@ -204,8 +209,13 @@ export class Host extends EventEmitter {
         }
         return ok;
       },
-      sessionTimeoutMs: this.opts.sessionTimeoutMs ?? 30 * 60_000,   // how long an invitation waits for a viewer
+      // No idle timer: an invitation waits for a viewer until the host stops
+      // sharing (1.3.1 silently gave up after 30 minutes).
+      sessionTimeoutMs: this.opts.sessionTimeoutMs ?? 0,
     });
+    // Stop pressed in the last instant: never start capturing afterwards.
+    if (this._closed) { session.close(); throw cancelled(); }
+    this.session = session;
 
     this.#startMedia();
     this.emit('secure', this.session.transport);
@@ -243,11 +253,15 @@ export class Host extends EventEmitter {
       if (peer.state !== 'secure') return;
       const queued = peer.bufferedAmount;
       this.abr.observeQueue(queued);
-      // Never let video pile up behind the network: if more than ~2 frames are
-      // still waiting to be sent, skip this frame. Every later frame references
-      // the skipped one, so sending them would only show a corrupted picture:
-      // hold them back too, and ask for a fresh keyframe once the queue drains.
-      const budget = Math.max(64 * 1024, (this.abr.current * 1000 / 8) * (2 / (this.opts.fps ?? 60)));
+      // Never let video pile up behind the network: if more than ~2 frames'
+      // worth of time is still waiting to be sent, skip this frame. Every
+      // later frame references the skipped one, so sending them would only
+      // show a corrupted picture: hold them back too, and ask for a fresh
+      // keyframe once the queue drains. The budget is TIME at the rate we
+      // really send (an encoder can overshoot a low target), with a floor of
+      // one typical keyframe so a single IDR never triggers a skip.
+      const rateKbps = Math.max(this.abr.sentKbps ?? 0, this.abr.current);
+      const budget = Math.max(48 * 1024, (rateKbps * 1000 / 8) * (2 / (this.opts.fps ?? 60)));
       if (!v.keyframe && (queued > budget || this._awaitingKeyframe)) {
         this.stats.dropped++;
         if (!this._awaitingKeyframe) {
@@ -277,6 +291,7 @@ export class Host extends EventEmitter {
       }
       this.stats.framesSent++;
       this.stats.bytesSent += v.data.length;
+      this._abrBytes = (this._abrBytes ?? 0) + v.data.length;
     });
 
     this.engine.on('stats', (s) => {
@@ -318,7 +333,11 @@ export class Host extends EventEmitter {
 
     // Handle control messages from viewer (keyframe requests, dynamic bitrate adjustments)
     peer.on('control', (msg) => {
-      if (msg?.t === 'keyframe-request') this.engine?.requestKeyframe();
+      if (msg?.t === 'keyframe-request') {
+        // Coalesce: several viewer requests for one loss burst need ONE IDR.
+        const now = Date.now();
+        if (now - (this._lastIdrAt ?? 0) >= 200) { this._lastIdrAt = now; this.engine?.requestKeyframe(); }
+      }
       if (msg?.t === 'set-bitrate' && Number.isFinite(msg.kbps) && msg.kbps >= 500 && msg.kbps <= 200000) {
         this.setBitrate(Math.round(msg.kbps));
       }
@@ -326,14 +345,21 @@ export class Host extends EventEmitter {
       if (msg?.t === 'ping' && Number.isFinite(msg.t0)) {
         try { peer.sendControl({ t: 'pong', t0: msg.t0, th: nowUs() }); } catch { /* closing */ }
       }
-      if (msg?.t === 'viewer-report' && Number.isFinite(msg.delayRiseMs)) {
+      if (msg?.t === 'viewer-report' && (Number.isFinite(msg.delayRiseMs) || Number.isFinite(msg.qdMs))) {
+        const clamp = (v, hi) => (Number.isFinite(v) ? Math.max(0, Math.min(hi, v)) : undefined);
         const rep = {
-          delayRiseMs: Math.max(0, Math.min(10000, msg.delayRiseMs)),
+          // 1.4.0+: queue delay from the fastest frames (jitter-proof) + frame count.
+          qdMs: clamp(msg.qdMs, 10000),
+          frames: Number.isInteger(msg.frames) ? Math.max(0, Math.min(100000, msg.frames)) : undefined,
+          rxKbps: clamp(msg.rxKbps, 1_000_000),
+          // 1.3.x viewers send only this (average minus floor: includes jitter).
+          delayRiseMs: clamp(msg.delayRiseMs, 10000),
           lost: Number.isInteger(msg.lost) ? Math.max(0, Math.min(100000, msg.lost)) : 0,
           totalMs: Number.isFinite(msg.totalMs) ? msg.totalMs : null,
           networkMs: Number.isFinite(msg.networkMs) ? msg.networkMs : null,
         };
-        this.viewerReport = rep;
+        // Stats for the UI only when the report carries them (fast reports don't).
+        if (rep.totalMs !== null || !this.viewerReport) this.viewerReport = rep;
         this.abr.observeViewer(rep);
       }
       if (msg?.t === 'viewer-state' && typeof msg.kbm === 'boolean' && typeof msg.pad === 'boolean') {
@@ -357,13 +383,22 @@ export class Host extends EventEmitter {
 
     peer.on('closed', (reason) => this.close(reason));
 
+    // Adaptive bitrate: 4 decisions per second from the send queue, the
+    // measured sending rate, the round trip and the viewer's reports.
+    let abrAt = Date.now();
     this._abrTimer = setInterval(() => {
-      const kbps = this.abr.tick();
+      const now = Date.now();
+      this.abr.observeSent(this._abrBytes ?? 0, now - abrAt);
+      this._abrBytes = 0;
+      abrAt = now;
+      const rtt = peer.transportInfo?.()?.rttMs;
+      if (Number.isFinite(rtt)) this.abr.observeRtt(rtt);
+      const kbps = this.abr.tick(now);
       if (kbps) {
         this.engine?.setBitrate(kbps);
-        this.emit('log', `bitrate ${kbps >= this.abr.maxKbps ? 'restored' : 'adapted'} to ${(kbps / 1000).toFixed(1)} Mbps`);
+        this.emit('log', `bitrate ${kbps >= this.abr.maxKbps ? 'restored' : 'adapted'} to ${(kbps / 1000).toFixed(1)} Mbps (${this.abr.reason})`);
       }
-    }, 500);
+    }, 250);
     this._abrTimer.unref?.();
 
     this.engine.start();
@@ -398,6 +433,7 @@ export class Host extends EventEmitter {
   close(reason = 'closed') {
     if (this._closed) return;
     this._closed = true;
+    this._abort.abort();
     if (this._abrTimer) clearInterval(this._abrTimer);
     this.engine?.sendInput({ t: 'release_all' });
     void this.audio?.stop();
@@ -448,12 +484,13 @@ export class Viewer extends EventEmitter {
     this._keyframeTimer = null;
     this.clock = new ClockSync();
     this.lat = { network: new Summary(), arrival: new Summary() };
-    this.delayFloor = null;       // lowest (arrival - capture) seen recently: the "no queue" baseline
-    this.delayFloorAt = 0;
+    this.qd = new QueueDelay();   // queue delay for the host's bitrate control
+    this.framesWindow = 0;        // complete frames since the last fast report
     this.hostStats = null;
     this.viewStats = null;
     this.lostWindow = 0;
     this.latency = null;
+    this._abort = new AbortController();
   }
 
   async start() {
@@ -466,16 +503,26 @@ export class Viewer extends EventEmitter {
       if (!rendezvousUrl && parsed.rendezvousUrl) rendezvousUrl = parsed.rendezvousUrl;
     } catch { /* keep raw */ }
 
-    this.session = await joinSession({
+    const iceServers = await iceServersFor(this.opts, (...a) => this.emit(...a));
+    if (this._closed) throw cancelled();
+    const session = await joinSession({
+      signal: this._abort.signal,
       code,
       rendezvousUrl: rendezvousUrl || DEFAULT_RENDEZVOUS,
       nostr: this.opts.nostr,
       identity: this.identity.keypair,
-      iceServers: await iceServersFor(this.opts, (...a) => this.emit(...a)),
+      iceServers,
       iceTransportPolicy: this.opts.forceRelay ? 'relay' : 'all',
       onStatus: (s, d) => this.emit('status', s, d),
-      sessionTimeoutMs: this.opts.sessionTimeoutMs ?? 120_000,
+      // The words are known once the handshake completes - show them now,
+      // while the host is being asked to compare them.
+      onHandshake: ({ sas }) => this.emit('sas', { phrase: sas.phrase, words: sas.words }),
+      // Finding the host (Nostr) + the host clicking Allow can take a while;
+      // Cancel stops it at any time.
+      sessionTimeoutMs: this.opts.sessionTimeoutMs ?? 180_000,
     });
+    if (this._closed) { session.close(); throw cancelled(); }
+    this.session = session;
 
     const peer = this.session.peer;
 
@@ -486,6 +533,7 @@ export class Viewer extends EventEmitter {
     // Displaying SAS is not proof the viewer verified it. Do not persist trust
     // without an explicit verification action.
 
+    let requestKeyframe = null;   // set once the peer is wired below
     this.engine = new ViewEngine({
       title: this.opts.title || 'Penguin Stream',
       noInput: this.opts.noInput,
@@ -505,6 +553,11 @@ export class Viewer extends EventEmitter {
       try { peer.sendControl({ t: 'viewer-state', kbm: st.kbm, pad: st.pad, pads: st.pads }); } catch { /* closing */ }
     });
     this.engine.on('view-stats', (v) => { this.viewStats = v; });
+    // The decoder saw corruption (loss the reassembler could not see, e.g. a
+    // frame that arrived whole but references a lost one): recover now.
+    this.engine.on('need-keyframe', () => requestKeyframe?.());
+    this.engine.on('behind', ({ queuedBytes }) => this.emit('log',
+      `stream window fell behind (${Math.round(queuedBytes / 1024)} KB waiting): skipping to the next keyframe - lower the resolution if this repeats`));
     this.engine.on('exit', () => this.close('viewer window closed'));
     this.engine.on('error', (e) => this.emit('error', e));
     this.engine.start();
@@ -554,20 +607,33 @@ export class Viewer extends EventEmitter {
     try { peer.sendControl({ t: 'hello', app: 'penguin-stream', version: APP_VERSION, protocol: PROTOCOL_VERSION }); } catch { /* closing */ }
     expectHello(peer, (...a) => this.emit(...a));
 
+    // Keyframe requests: ask at once when a frame is lost, then wait for the
+    // keyframe to arrive (or ~1.5 round trips) before asking again. Frames
+    // already in flight when we asked are lost too; re-asking for each of
+    // them made an IDR storm on lossy links (each IDR is 5-20x a P-frame,
+    // which causes more loss). With intra refresh the picture also heals on
+    // its own within a second.
     let lastKeyframeReq = 0;
-    const requestKeyframeImmediate = () => {
+    let awaitingKeyframe = false;
+    const requestKeyframeImmediate = requestKeyframe = () => {
       const now = Date.now();
-      if (now - lastKeyframeReq > 100 && peer.state === 'secure') {
+      const rtt = this.clock.minRttMs ?? 50;
+      const wait = awaitingKeyframe ? Math.max(250, 1.5 * rtt + 100) : 100;
+      if (now - lastKeyframeReq > wait && peer.state === 'secure') {
         lastKeyframeReq = now;
+        awaitingKeyframe = true;
         try {
           peer.sendControl({ t: 'keyframe-request' });
           this.reassembler.acknowledgeKeyframe();
         } catch { /* closing */ }
+      } else {
+        this.reassembler.acknowledgeKeyframe();   // already asked; this loss is covered
       }
     };
 
     peer.on('video', (payload) => {
       this.stats.bytesReceived += payload.length;
+      this.rxWindow = (this.rxWindow ?? 0) + payload.length;
       const droppedBefore = this.reassembler.stats.dropped;
       const done = this.reassembler.push(payload);
       this.lostWindow += Math.max(0, this.reassembler.stats.dropped - droppedBefore);
@@ -577,44 +643,59 @@ export class Viewer extends EventEmitter {
         requestKeyframeImmediate();
       }
       if (!done) return;
+      if (done.keyframe) awaitingKeyframe = false;
       this.stats.framesShown++;
+      this.framesWindow++;
+      const arrived = nowUs();
+      // Queue delay needs no clock sync: (viewer now - host capture time)
+      // carries a constant unknown offset that cancels against its own
+      // minimum. Using the synced offset instead made the baseline jump
+      // whenever a faster ping refined it - that read as "congestion".
+      this.qd.add((arrived - Number(done.ptsUs)) / 1000);
       // capture (host clock) -> complete frame here (viewer clock), via the offset.
       const offset = this.clock.offset;
       if (offset !== null && this.clock.ready) {
-        const arrivedHostClock = nowUs() + offset;
-        const ms = (arrivedHostClock - Number(done.ptsUs)) / 1000;
-        if (ms > -50 && ms < 10000) {
-          this.lat.arrival.add(ms);
-          const now = Date.now();
-          // Track the floor (the no-queueing delay) and let it age out slowly,
-          // so a route change does not leave a stale baseline.
-          if (this.delayFloor === null || ms < this.delayFloor || now - this.delayFloorAt > 10_000) {
-            this.delayFloor = ms;
-            this.delayFloorAt = now;
-          }
-        }
+        const ms = (arrived + offset - Number(done.ptsUs)) / 1000;
+        if (ms > -50 && ms < 10000) this.lat.arrival.add(ms);
       }
-      this.engine.sendVideo({ ptsUs: done.ptsUs, keyframe: done.keyframe, frame: done.frame });
+      if (!this.engine.sendVideo({ ptsUs: done.ptsUs, keyframe: done.keyframe, frame: done.frame })) this.stats.viewerSkipped = (this.stats.viewerSkipped ?? 0) + 1;
     });
 
     peer.on('closed', (reason) => this.close(reason));
 
+    // Fast congestion feedback for the host's bitrate control, 4x a second:
+    // a queue shows up here within ~250 ms instead of up to a second.
+    let reportAt = Date.now();
+    this._reportTimer = setInterval(() => {
+      if (peer.state !== 'secure') return;
+      const now = Date.now();
+      const rxKbps = Math.round(((this.rxWindow ?? 0) * 8) / Math.max(1, now - reportAt));
+      this.rxWindow = 0;
+      reportAt = now;
+      const qdMs = this.qd.take();
+      const frames = this.framesWindow, lost = this.lostWindow - (this._lostReported ?? 0);
+      this.framesWindow = 0;
+      this._lostReported = this.lostWindow;
+      this.lastQdMs = qdMs;
+      if (qdMs === null && !lost) return;
+      // delayRiseMs keeps 1.3.x hosts adapting (they ignore the new fields).
+      try { peer.sendControl({ t: 'viewer-report', qdMs: qdMs ?? 0, delayRiseMs: qdMs ?? 0, frames, lost: Math.max(0, lost), rxKbps }); }
+      catch { /* closing */ }
+    }, 250);
+    this._reportTimer.unref?.();
+
     // If we are losing frames, ask for a keyframe - but rate-limited, or a
     // lossy link would turn into a keyframe storm and make things worse.
     this._keyframeTimer = setInterval(() => {
-      if (this.reassembler.needsKeyframe && peer.state === 'secure') {
-        try {
-          peer.sendControl({ t: 'keyframe-request' });
-          this.reassembler.acknowledgeKeyframe();
-        } catch { /* closing */ }
-      }
+      if (this.reassembler.needsKeyframe && peer.state === 'secure') requestKeyframeImmediate();
       const transport = peer.transportInfo();
       this.latency = this.#latencyBreakdown(transport);
       try {
-        peer.sendControl({ t: 'viewer-report', delayRiseMs: this.latency.delayRiseMs ?? 0, lost: this.lostWindow,
+        peer.sendControl({ t: 'viewer-report', qdMs: this.lastQdMs ?? 0, delayRiseMs: this.lastQdMs ?? 0, frames: 0, lost: 0,
           totalMs: this.latency.totalMs, networkMs: this.latency.networkMs });
       } catch { /* closing */ }
       this.lostWindow = 0;
+      this._lostReported = 0;
       this.emit('stats', { ...this.stats, ...this.reassembler.stats, transport, latency: this.latency });
     }, 1000);
     this._keyframeTimer.unref?.();
@@ -638,7 +719,7 @@ export class Viewer extends EventEmitter {
     const networkMs = arrivalMs !== null ? Math.max(0, arrivalMs - hostMs) : null;
     const viewerMs = Number.isFinite(v.viewerMs) ? v.viewerMs : null;
     const totalMs = arrivalMs !== null && viewerMs !== null ? arrivalMs + viewerMs : null;
-    const delayRiseMs = arrivalMs !== null && this.delayFloor !== null ? Math.max(0, arrivalMs - this.delayFloor) : null;
+    const delayRiseMs = Number.isFinite(this.lastQdMs) ? this.lastQdMs : null;
     const frames = arrival?.n ?? 0;
     const lostPct = frames + this.lostWindow > 0 ? (100 * this.lostWindow) / (frames + this.lostWindow) : 0;
     // Input -> result on screen, estimated from measured parts: an input needs
@@ -678,7 +759,9 @@ export class Viewer extends EventEmitter {
   close(reason = 'closed') {
     if (this._closed) return;
     this._closed = true;
+    this._abort.abort();
     if (this._keyframeTimer) clearInterval(this._keyframeTimer);
+    if (this._reportTimer) clearInterval(this._reportTimer);
     if (this._pingTimer) clearInterval(this._pingTimer);
     void this.audio?.stop();
     this.engine?.stop();

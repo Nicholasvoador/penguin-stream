@@ -52,6 +52,7 @@ extern "C" {
 #endif
 #include <windows.h>
 #include <timeapi.h>
+#include <avrt.h>
 #endif
 
 #ifndef PS_VERSION
@@ -616,10 +617,12 @@ class CaptureControls {
   bool padUnavailable_ = false;
   std::string padError_, padBackendName_;
   int lastPadCount_ = 0;
-  std::unique_ptr<VirtualGamepads> gamepads_;
+  // Declared before gamepads_ so they outlive it: the driver's feedback
+  // thread may still take rumbleMu_ while the gamepads are being destroyed.
   std::mutex rumbleMu_;
   std::pair<double, double> rumble_[kMaxPads] = {};
   bool rumbleDirty_[kMaxPads] = {};
+  std::unique_ptr<VirtualGamepads> gamepads_;
   std::vector<uint8_t> buffer_;
   std::atomic<bool> failed_{false};
   std::atomic<bool> shutdownRequested_{false};
@@ -652,8 +655,9 @@ int runCapture(int argc, char** argv) {
   // Hosts that may enable keyboard/mouse later must request it up front.
   const bool kbmCapable = allowKbm || hasFlag(argc, argv, "--input-capable");
   const std::string backend = getArg(argc, argv, "--source", "");
-  const int fps = intArg(argc, argv, "--fps", 60);
-  const int bitrate = intArg(argc, argv, "--bitrate", 15000);
+  // Clamped: --fps 0 used to crash the encoder (division by zero).
+  const int fps = std::clamp(intArg(argc, argv, "--fps", 60), 1, 480);
+  const int bitrate = std::clamp(intArg(argc, argv, "--bitrate", 15000), 100, 200000);
   const int maxFrames = intArg(argc, argv, "--max-frames", 0);
   const std::string preferred = getArg(argc, argv, "--encoder", "auto");
 
@@ -836,9 +840,21 @@ int main(int argc, char** argv) {
   SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
   PROCESS_POWER_THROTTLING_STATE throttle{};
   throttle.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-  throttle.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+  // Windows 11 may silently ignore timeBeginPeriod for a process it
+  // considers background/throttled (1 ms sleeps become 15.6 ms). Opting out
+  // of timer-resolution throttling keeps the 1 ms timer honoured.
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+  throttle.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
   throttle.StateMask = 0;  // never run this process in efficiency mode
   SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttle, sizeof(throttle));
+  // Multimedia Class Scheduler: the main (capture/encode or render) thread
+  // gets "Games" scheduling, so a busy game cannot starve the stream.
+  {
+    DWORD taskIndex = 0;
+    AvSetMmThreadCharacteristicsW(L"Games", &taskIndex);
+  }
 #endif
 
   if (argc < 2) {

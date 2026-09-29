@@ -107,6 +107,7 @@ class Encoder {
   void applyBitrate(int bitrateKbps);
   static bool hasParameterSets(const uint8_t* data, size_t size);
   static bool hasIdr(const uint8_t* data, size_t size);
+  static size_t stripTrailingFiller(const uint8_t* data, size_t size);
   bool annexBExtradata() const;
   std::vector<uint8_t> keyframeBuffer_;
 

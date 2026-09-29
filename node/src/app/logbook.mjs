@@ -31,6 +31,8 @@ const INVITE_RE = /\b[0-9A-HJKMNP-TV-Z]{4}(?:-[0-9A-HJKMNP-TV-Z]{4}){7}\b(?:@\S+
 const SECRET_KV_RE = /\b(token|password|passwd|secret|credential|cfToken|turnPassword|authorization)(["']?\s*[:=]\s*["']?)([^\s"',}]+)/gi;
 const BEARER_RE = /\bBearer\s+[\w.~+/=-]+/gi;
 const URL_TOKEN_RE = /([#?&]token=)[\w.~-]+/gi;
+// TURN credential URLs (Metered & co.) carry the account key as ?apiKey=...
+const URL_KEY_RE = /([?&](?:api_?key|apikey|key|secret|password|auth|access_token)=)[^&\s"']+/gi;
 const IPV4_RE = /\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g;
 const IPV6_RE = /\b([0-9a-f]{1,4}):([0-9a-f]{1,4}):(?:[0-9a-f]{0,4}:){1,6}[0-9a-f]{0,4}\b/gi;
 
@@ -43,6 +45,7 @@ export function redact(text) {
     .replace(INVITE_RE, '[invitation]')
     .replace(BEARER_RE, 'Bearer [hidden]')
     .replace(URL_TOKEN_RE, '$1[hidden]')
+    .replace(URL_KEY_RE, '$1[hidden]')
     .replace(SECRET_KV_RE, '$1$2[hidden]')
     .replace(IPV4_RE, (m, a, b) => {
       const n = [a, b].map(Number);

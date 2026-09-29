@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { configDir } from '../crypto/identity.mjs';
+import { generateShareCode, normalizeShareCode, parseInvitation } from '../signal/code.mjs';
 
 export const RELAY_MODES = ['none', 'cloudflare', 'url', 'manual'];
 const SECRETS = ['cfToken', 'turnPassword'];
@@ -70,6 +71,11 @@ export const DEFAULT_SETTINGS = Object.freeze({
   noStun: false,
   stun: '',
   rendezvous: '',
+  // Pairing: the host keeps ONE invitation code until the user asks for a new
+  // one, so a friend can always reconnect with the code they already have.
+  shareCode: '',             // created on first share; never shown in diagnostics
+  lastInvitation: '',        // viewer: the last invitation that connected (one-click reconnect)
+  autoReconnect: true,       // viewer retries after a drop; host re-admits a device it approved this share
   relay: Object.freeze({
     mode: 'none', cfKeyId: '', cfToken: '', url: '', turn: '', turnUser: '', turnPassword: '',
   }),
@@ -142,7 +148,13 @@ export function sanitizeSettings(input = {}) {
   set('encoder', oneOf(input.encoder, ['', 'auto', 'nvenc', 'amf', 'qsv', 'mf', 'vaapi', 'x264', 'software']));
   set('source', oneOf(input.source, ['', 'dxgi', 'gdi', 'portal', 'x11', 'synthetic']));
   if (typeof input.display === 'string' && /^[0-9]{0,2}$/.test(input.display.trim())) set('display', input.display.trim());
-  for (const k of ['lowLatency', 'overlay', 'adaptiveBitrate', 'audio', 'audioExcludeVoice', 'allowInput', 'allowGamepad', 'sendKbm', 'sendPad', 'forceRelay', 'noStun']) {
+  if (typeof input.shareCode === 'string') {
+    try { out.shareCode = input.shareCode === '' ? '' : normalizeShareCode(input.shareCode); } catch { /* invalid: ignore */ }
+  }
+  if (typeof input.lastInvitation === 'string' && input.lastInvitation.length <= 512) {
+    try { if (input.lastInvitation === '' || parseInvitation(input.lastInvitation)) out.lastInvitation = input.lastInvitation.trim(); } catch { /* invalid */ }
+  }
+  for (const k of ['lowLatency', 'overlay', 'adaptiveBitrate', 'audio', 'audioExcludeVoice', 'allowInput', 'allowGamepad', 'sendKbm', 'sendPad', 'forceRelay', 'noStun', 'autoReconnect']) {
     if (typeof input[k] === 'boolean') out[k] = input[k];
   }
   set('stun', str(input.stun));
@@ -224,10 +236,25 @@ export class SettingsStore {
     return this.update({ profiles: this.values.profiles.filter((p) => p.id !== id) });
   }
 
+  /** The host's invitation code: the saved one, or a new one saved on first use. */
+  shareCode() {
+    if (!this.values.shareCode) this.update({ shareCode: generateShareCode() });
+    return this.values.shareCode;
+  }
+
+  /** Replaces the invitation code (the old one stops working). */
+  newShareCode() {
+    return this.update({ shareCode: generateShareCode() }).shareCode;
+  }
+
   /** Safe to hand to the UI: secrets become booleans. */
   publicSettings() {
     const v = this.get();
     delete v.portalTokens;   // opaque compositor grants; the UI has no use for them
+    // Invitations let someone ASK to connect: never in settings dumps or
+    // diagnostics. The UI gets them through the session state instead.
+    delete v.shareCode;
+    delete v.lastInvitation;
     v.builtinProfiles = BUILTIN_PROFILES;
     for (const k of SECRETS) {
       v.relay[`${k}Set`] = Boolean(v.relay[k]);

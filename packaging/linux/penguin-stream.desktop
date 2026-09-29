@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Penguin Stream
+GenericName=Remote Desktop
+Comment=Share or control a desktop over the Internet with low latency
+Exec=/opt/penguin-stream/penguin-stream %U
+Icon=penguin-stream
+Terminal=false
+Type=Application
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;stream;screen;share;
+StartupWMClass=Penguin Stream

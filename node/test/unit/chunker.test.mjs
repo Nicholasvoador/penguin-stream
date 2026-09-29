@@ -145,3 +145,35 @@ test('survives sustained random loss and still delivers most frames', () => {
 test('rejects a maxPayload too small to hold a header', () => {
   assert.throws(() => new Chunker({ maxPayload: 10 }), /maxPayload/);
 });
+
+// Regression (1.4.0): a frame of which NO chunk arrives must still count as
+// lost, or the viewer never asks for recovery and the loss meter shows 0%.
+test('frames lost entirely are detected (single- and multi-chunk)', () => {
+  const c = new Chunker({ maxPayload: MAX });
+  const r = new Reassembler();
+  const frames = [];
+  for (let i = 0; i < 12; i++) frames.push(c.split(crypto.randomBytes(i === 5 ? 5_000 : 500), { ptsUs: i }));
+  for (let i = 0; i < 12; i++) {
+    if (i === 3 || i === 4 || i === 5) continue;           // 3,4 single-chunk; 5 multi-chunk: all gone
+    for (const ch of frames[i]) r.push(ch);
+  }
+  assert.equal(r.stats.lost, 3, `lost=${r.stats.lost}`);
+  assert.equal(r.needsKeyframe, true);
+  r.acknowledgeKeyframe();
+  assert.equal(r.needsKeyframe, false);
+  assert.equal(r.stats.lost, 3, 'the cumulative counter survives a keyframe request');
+});
+
+test('no loss is reported for a clean or mildly reordered stream', () => {
+  const c = new Chunker({ maxPayload: MAX });
+  const r = new Reassembler();
+  const frames = [];
+  for (let i = 0; i < 50; i++) frames.push(c.split(crypto.randomBytes(300 + (i % 7) * 900), { ptsUs: i }));
+  // swap neighbours: the unordered channel may deliver frame N+1 before N
+  for (let i = 0; i < 50; i += 2) {
+    for (const ch of frames[i + 1]) r.push(ch);
+    for (const ch of frames[i]) r.push(ch);
+  }
+  assert.equal(r.stats.lost, 0);
+  assert.equal(r.needsKeyframe, false);
+});

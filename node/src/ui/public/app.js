@@ -38,7 +38,7 @@ let lastState = null;
 function sessionPage(state = lastState) {
   if (!state) return null;
   if (state.mode.startsWith('hosting')) return 'hosting';
-  if (state.mode === 'connecting' || state.mode === 'viewing') return 'viewing';
+  if (state.mode === 'connecting' || state.mode === 'reconnecting' || state.mode === 'viewing') return 'viewing';
   return null;
 }
 
@@ -627,20 +627,28 @@ function render(state, statsOnly = false) {
       break;
     }
     case 'connecting':
+    case 'reconnecting':
     case 'viewing': {
       if (state.sas) { $('viewer-sas').hidden = false; renderSasWords($('viewer-sas-words'), state.sas); }
       else $('viewer-sas').hidden = true;
       const s = $('viewer-status');
-      if (state.mode === 'viewing') {
+      if (state.mode === 'reconnecting') {
+        const r = state.reconnect;
+        s.textContent = `Connection lost${r?.reason ? ` (${r.reason})` : ''} — reconnecting automatically${r?.attempt > 1 ? ` (attempt ${r.attempt})` : ''}…`;
+        s.className = 'status-banner warn';
+        setPill('Reconnecting…', 'wait');
+        $('viewer-metrics').hidden = true;
+      } else if (state.mode === 'viewing') {
         const t = state.stats?.transport?.connected ? state.stats.transport : state.transport;
         s.textContent = t?.relayed ? 'Connected through a relay' : 'Connected directly peer-to-peer';
         s.className = 'status-banner live';
         setPill('Connected', 'live');
         renderMetrics('viewer', state);
       } else {
-        s.textContent = 'Finding the host and securing the connection…';
+        s.textContent = state.sas ? 'Read the four words below to the host — they approve you when the words match.'
+          : 'Finding the host and securing the connection…';
         s.className = 'status-banner';
-        setPill('Connecting…', 'wait');
+        setPill(state.sas ? 'Waiting for approval' : 'Connecting…', 'wait');
         $('viewer-metrics').hidden = true;
       }
       break;
@@ -648,6 +656,8 @@ function render(state, statsOnly = false) {
     default:
       setPill('Ready');
   }
+
+  $('reconnect-last').hidden = !state.lastInvitation || state.mode !== 'idle';
 
   if (state.pendingConsent) showConsent(state.pendingConsent);
   else $('consent-overlay').hidden = true;
@@ -692,6 +702,27 @@ for (const b of document.querySelectorAll('[data-back]')) b.onclick = () => go('
 for (const b of document.querySelectorAll('[data-stop]')) {
   b.onclick = async () => { await api('stop', {}).catch(() => {}); refresh(); };
 }
+
+async function connectTo(code) {
+  try {
+    await api('connect', {
+      code, ...sessionOptions(), overlay: settings?.overlay === true,
+      sendKbm: $('view-send-kbm').checked,
+      sendPad: $('view-send-pad').checked,
+    });
+    refresh();
+  } catch (err) { toast(err.message, true); }
+}
+$('btn-reconnect-last').onclick = () => { if (lastState?.lastInvitation) connectTo(lastState.lastInvitation); };
+
+$('new-code').onclick = async () => {
+  if (!confirm('Make a new invitation code?\n\nThe current code stops working. Only do this if it reached someone it should not have — your friend will need the new code.')) return;
+  try {
+    await api('new-code', {});
+    $('copy-status').textContent = 'New code created — send it to your friend';
+    refresh();
+  } catch (e) { toast(e.message, true); }
+};
 
 $('connect-form').onsubmit = async (e) => {
   e.preventDefault();

@@ -24,7 +24,7 @@ Recommends:     (xdg-desktop-portal-kde or xdg-desktop-portal-gnome)
 Recommends:     pipewire
 
 %description
-Penguin Stream shares a desktop between Windows and Fedora with hardware
+Penguin Stream shares a desktop between Windows and Linux with hardware
 H.264, direct peer-to-peer UDP (also behind CGNAT) with optional relay
 fallback, end-to-end encryption and keyboard, mouse and controller input
 that each side can switch on and off live.
@@ -57,6 +57,15 @@ EOF
 %{_datadir}/icons/hicolor/512x512/apps/penguin-stream.png
 
 %changelog
+* Mon Sep 28 2026 Penguin Stream contributors <noreply@github.com> - 1.4.0-1
+- Ubuntu/Debian packages, lower latency, new mascot and icons, bug fixes
+
+* Sat Sep 26 2026 Penguin Stream contributors <noreply@github.com> - 1.3.1-1
+- Zero-copy capture paths, intra-refresh loss recovery, stream overlay, logbook
+
+* Sat Sep 26 2026 Penguin Stream contributors <noreply@github.com> - 1.2.0-1
+- One monitor by default, stream resolution, latency meter, adaptive bitrate
+
 * Fri Sep 25 2026 Penguin Stream contributors <noreply@github.com> - 1.1.0-1
 - Windows audio, native audio player, voice-chat apps kept out of the stream
 

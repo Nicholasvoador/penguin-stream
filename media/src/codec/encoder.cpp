@@ -58,6 +58,26 @@ bool Encoder::hasParameterSets(const uint8_t* data, size_t size) {
   return false;
 }
 
+// Length of the access unit without trailing filler-data NAL units (type 12).
+// Encoders put filler last, after every slice, so this only trims the tail.
+size_t Encoder::stripTrailingFiller(const uint8_t* data, size_t size) {
+  size_t i = 0;
+  size_t keep = size;        // where the current run of filler NALs starts
+  bool inFiller = false;
+  while (i + 3 < size) {
+    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+      const size_t sc = (i > 0 && data[i - 1] == 0) ? i - 1 : i;   // 4-byte start code
+      const bool filler = (data[i + 3] & 0x1f) == 12;
+      if (filler && !inFiller) { keep = sc; inFiller = true; }
+      else if (!filler) { inFiller = false; keep = size; }
+      i += 3;
+      continue;
+    }
+    ++i;
+  }
+  return inFiller ? keep : size;
+}
+
 // True when the access unit holds an IDR slice (NAL type 5) - a frame that
 // decodes on its own. With intra refresh, encoders also flag "recovery point"
 // frames as keyframes, but those only heal a picture that was already
@@ -79,7 +99,9 @@ Encoder::Encoder() = default;
 Encoder::~Encoder() { close(); }
 
 void Encoder::close() {
-  if (sws_) sws_free_context(&sws_);
+  // sws_freeContext (not sws_free_context): the latter only exists in FFmpeg
+  // 7.1+, and Ubuntu 24.04 ships 6.1.
+  if (sws_) { sws_freeContext(sws_); sws_ = nullptr; }
   if (srcFrame_) { srcFrame_->data[0] = nullptr; av_frame_free(&srcFrame_); }
   if (pkt_) { av_packet_free(&pkt_); }
   if (swFrame_) { av_frame_free(&swFrame_); }
@@ -187,6 +209,8 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     // Pipeline depth 1 avoids multi-frame driver buffering.
     av_opt_set_int(ctx_->priv_data, "async_depth", 1, 0);
     av_opt_set_int(ctx_->priv_data, "b_depth", 1, 0);
+    // maxrate == bitrate would select CBR, which pads with filler on most drivers.
+    av_opt_set(ctx_->priv_data, "rc_mode", "VBR", 0);
   } else if (encoderName == "h264_nvenc") {
     // BGR0 == the capture's BGRA byte order on little-endian machines. Tag the
     // stream BT.601 limited, which is what NVENC's RGB->YUV produces and what
@@ -196,7 +220,13 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     ctx_->color_range = AVCOL_RANGE_MPEG;
     av_opt_set(ctx_->priv_data, "preset", "p1", 0);      // fastest
     av_opt_set(ctx_->priv_data, "tune", "ull", 0);       // ultra-low latency
-    av_opt_set(ctx_->priv_data, "rc", "cbr", 0);
+    // VBR with maxrate == bitrate and the single-frame VBV below: the size
+    // cap per frame is identical to CBR, but NVENC's CBR+HRD pads EVERY frame
+    // up to bitrate/fps with filler NALs (measured: 86-99.5 % of all bytes on
+    // a quiet desktop). Filler costs send time on every frame and makes the
+    // link look saturated to the bitrate control. PS_NVENC_CBR=1: old mode.
+    av_opt_set(ctx_->priv_data, "rc", std::getenv("PS_NVENC_CBR") ? "cbr" : "vbr", 0);
+    av_opt_set_int(ctx_->priv_data, "multipass", 0, 0);   // one pass: no extra encode latency
     av_opt_set(ctx_->priv_data, "delay", "0", 0);
     av_opt_set(ctx_->priv_data, "zerolatency", "1", 0);
     av_opt_set(ctx_->priv_data, "forced-idr", "1", 0);
@@ -205,7 +235,10 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     ctx_->pix_fmt = AV_PIX_FMT_NV12;
     av_opt_set(ctx_->priv_data, "usage", "ultralowlatency", 0);
     av_opt_set(ctx_->priv_data, "quality", "speed", 0);
-    av_opt_set(ctx_->priv_data, "rc", "cbr", 0);
+    // Peak-constrained VBR, no filler: same per-frame cap, no padding bytes
+    // (same issue as NVENC CBR). Unverified on AMD hardware.
+    av_opt_set(ctx_->priv_data, "rc", "vbr_peak", 0);
+    av_opt_set_int(ctx_->priv_data, "filler_data", 0, 0);
     av_opt_set(ctx_->priv_data, "header_insertion_mode", "idr", 0);
   } else if (encoderName == "h264_qsv") {
     ctx_->pix_fmt = AV_PIX_FMT_NV12;
@@ -262,6 +295,20 @@ bool Encoder::tryOpen(const std::string& encoderName, const EncoderConfig& cfg, 
     const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
     av_opt_set_int(sws_, "sws_flags", scaling() ? SWS_AREA : SWS_POINT, 0);
     av_opt_set_int(sws_, "threads", std::min(8u, std::max(1u, cores / 2)), 0);
+    // Initialise explicitly. FFmpeg 7.1+ would set itself up from the first
+    // frames, but 6.x (Ubuntu 24.04) and 7.0 crash in sws_scale_frame on an
+    // uninitialised context. Explicit init works on every version and keeps
+    // the slice threads. Output is BT.601 limited range, what the viewer expects.
+    av_opt_set_int(sws_, "srcw", srcW_, 0);
+    av_opt_set_int(sws_, "srch", srcH_, 0);
+    av_opt_set_int(sws_, "src_format", AV_PIX_FMT_BGRA, 0);
+    av_opt_set_int(sws_, "dstw", cfg.width, 0);
+    av_opt_set_int(sws_, "dsth", cfg.height, 0);
+    av_opt_set_int(sws_, "dst_format", swFrame_->format, 0);
+    av_opt_set_int(sws_, "src_range", 1, 0);   // full-range RGB in
+    av_opt_set_int(sws_, "dst_range", 0, 0);   // limited-range YUV out
+    ret = sws_init_context(sws_, nullptr, nullptr);
+    if (ret < 0) { error = "sws_init_context: " + avErr(ret); return false; }
   }
 
   pkt_ = av_packet_alloc();
@@ -283,7 +330,9 @@ bool Encoder::drain(const std::function<void(const EncodedPacket&)>& sink, std::
     out.pts_us = static_cast<uint64_t>(pkt_->pts < 0 ? 0 : pkt_->pts);
     out.keyframe = (pkt_->flags & AV_PKT_FLAG_KEY) != 0 && hasIdr(pkt_->data, static_cast<size_t>(pkt_->size));
     out.data = pkt_->data;
-    out.size = static_cast<size_t>(pkt_->size);
+    // Filler NALs (type 12) carry nothing a decoder needs; some drivers add
+    // them even in VBR. They are always trailing, so cut them off in place.
+    out.size = stripTrailingFiller(pkt_->data, static_cast<size_t>(pkt_->size));
     // Every keyframe must be decodable on its own (loss recovery, late
     // joiners, recordings). Some encoders (NVENC, x264 with global headers)
     // only emit SPS/PPS out of band, so prepend them when missing.
@@ -331,15 +380,23 @@ bool Encoder::encodeBGRA(const uint8_t* bgra, int stride, uint64_t pts_us,
   } else if (rgbInput_) {
     av_image_copy_plane(swFrame_->data[0], swFrame_->linesize[0], bgra, stride, cfg_.width * 4, cfg_.height);
   } else {
-    // Wrap the caller's pixels without copying.
+    // Wrap the caller's pixels without copying. The frame must carry a
+    // buffer reference: sws_scale_frame() refs its input, and on a frame
+    // without buf[0] that means a full-frame COPY first (FFmpeg 6.x/7.0),
+    // or worse. A no-op-free buffer over our memory makes the ref free.
     av_frame_unref(srcFrame_);
     srcFrame_->format = AV_PIX_FMT_BGRA;
     srcFrame_->width = srcW_;
     srcFrame_->height = srcH_;
+    srcFrame_->color_range = AVCOL_RANGE_JPEG;
+    const size_t srcBytes = static_cast<size_t>(stride) * (srcH_ - 1) + static_cast<size_t>(srcW_) * 4;
+    srcFrame_->buf[0] = av_buffer_create(const_cast<uint8_t*>(bgra), srcBytes, [](void*, uint8_t*) {}, nullptr,
+                                         AV_BUFFER_FLAG_READONLY);
+    if (!srcFrame_->buf[0]) { error = "av_buffer_create failed"; return false; }
     srcFrame_->data[0] = const_cast<uint8_t*>(bgra);
     srcFrame_->linesize[0] = stride;
     ret = sws_scale_frame(sws_, swFrame_, srcFrame_);
-    srcFrame_->data[0] = nullptr;
+    av_frame_unref(srcFrame_);   // drops our no-op reference; memory stays the caller's
     if (ret < 0) { error = "sws_scale_frame: " + avErr(ret); return false; }
   }
 
@@ -387,6 +444,9 @@ void Encoder::flush(const std::function<void(const EncodedPacket&)>& sink) {
 
 void Encoder::applyBitrate(int bitrateKbps) {
   if (!ctx_ || bitrateKbps < 100 || bitrateKbps > 200000) return;
+  // FFmpeg re-reads bit_rate at runtime only in nvenc and libx264; elsewhere
+  // the change would be reported but never happen.
+  if (backend_ != "h264_nvenc" && backend_ != "libx264") return;
   cfg_.bitrateKbps = bitrateKbps;
   ctx_->bit_rate = static_cast<int64_t>(bitrateKbps) * 1000;
   ctx_->rc_max_rate = ctx_->bit_rate;

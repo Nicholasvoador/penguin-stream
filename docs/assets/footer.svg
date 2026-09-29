@@ -1,24 +1,65 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="170" viewBox="0 0 1280 170" role="img" aria-label="A penguin waddling across the ice">
 <defs><linearGradient id="fs" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#6366f1"/></linearGradient>
-<clipPath id="fc"><rect width="1280" height="170" rx="24"/></clipPath></defs>
+<clipPath id="fc"><rect width="1280" height="170" rx="24"/></clipPath><linearGradient id="p-coat" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#2a3957"/><stop offset=".55" stop-color="#131c30"/><stop offset="1" stop-color="#0b1220"/>
+  </linearGradient>
+  <linearGradient id="p-belly" x1=".2" y1="0" x2=".8" y2="1">
+    <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#dce8fb"/>
+  </linearGradient>
+  <linearGradient id="p-flip" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#34466b"/><stop offset="1" stop-color="#0b1220"/>
+  </linearGradient>
+  <linearGradient id="p-orange" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#fdba74"/><stop offset="1" stop-color="#f97316"/>
+  </linearGradient>
+  <radialGradient id="p-shadow" cx=".5" cy=".5" r=".5">
+    <stop offset="0" stop-color="#0b1220" stop-opacity=".35"/><stop offset="1" stop-color="#0b1220" stop-opacity="0"/>
+  </radialGradient>
+</defs>
 <g clip-path="url(#fc)">
 <rect width="1280" height="170" fill="url(#fs)"/>
 <path d="M0 128 Q160 118 320 128 T640 128 T960 128 T1280 128 V170 H0 Z" fill="#1e3a8a" opacity=".5">
  <animate attributeName="d" dur="5s" repeatCount="indefinite" values="M0 128 Q160 118 320 128 T640 128 T960 128 T1280 128 V170 H0 Z;M0 128 Q160 138 320 128 T640 128 T960 128 T1280 128 V170 H0 Z;M0 128 Q160 118 320 128 T640 128 T960 128 T1280 128 V170 H0 Z"/></path>
 <path d="M0 118 H1280 V130 H0 Z" fill="#e0f2fe" opacity=".9"/>
 <g><animateTransform attributeName="transform" type="translate" values="-120 0;1400 0" dur="16s" repeatCount="indefinite"/>
- <g><animateTransform attributeName="transform" type="rotate" values="-6 0 110;6 0 110;-6 0 110" dur=".7s" repeatCount="indefinite"/><g transform="translate(0 72) scale(0.34)">
-  <ellipse cx="0" cy="128" rx="92" ry="12" fill="#0b1220" opacity=".18"/>
-  <ellipse cx="-38" cy="122" rx="30" ry="11" fill="#fbbf24"/>
-  <ellipse cx="38" cy="122" rx="30" ry="11" fill="#fbbf24"/>
-  <ellipse cx="0" cy="0" rx="100" ry="125" fill="#0b1220"/>
-  <ellipse cx="0" cy="32" rx="68" ry="86" fill="#f8fafc"/>
-  <circle cx="-30" cy="-46" r="20" fill="#f8fafc"/><circle cx="30" cy="-46" r="20" fill="#f8fafc"/>
-  <circle cx="-26" cy="-44" r="9" fill="#0b1220"/><circle cx="34" cy="-44" r="9" fill="#0b1220"/>
-  <circle cx="-23" cy="-48" r="3" fill="#fff"/><circle cx="37" cy="-48" r="3" fill="#fff"/>
-  <path d="M-18 -20 H18 L0 4 Z" fill="#fbbf24" stroke="#f59e0b" stroke-width="2" stroke-linejoin="round"/>
-  
-</g></g></g>
+ <g><animateTransform attributeName="transform" type="rotate" values="-6 0 110;6 0 110;-6 0 110" dur=".7s" repeatCount="indefinite"/><g transform="translate(-75 2) scale(0.25)"><ellipse cx="312" cy="462" rx="118" ry="16" fill="url(#p-shadow)"/>
+<g transform="rotate(14 300 300)">
+  <!-- feet: tucked under the body so they connect -->
+  <path d="M244 430 c-8 20 2 30 18 30 h46 c9 0 10 -9 3 -15 l-22 -22 z" fill="url(#p-orange)"/>
+  <path d="M300 432 c-8 20 2 30 18 30 h46 c9 0 10 -9 3 -15 l-22 -22 z" fill="url(#p-orange)"/>
+  <!-- coat -->
+  <path d="M306 84
+           C368 84 404 130 406 188
+           C408 234 394 262 398 300
+           C404 382 372 452 296 456
+           C226 460 186 414 184 356
+           C182 300 206 262 214 212
+           C226 136 252 84 306 84 Z" fill="url(#p-coat)"/>
+  <!-- belly: starts at the chin, chest line curves down and back -->
+  <path d="M402 214
+           C400 246 394 266 396 300
+           C400 380 368 438 298 440
+           C254 441 230 410 232 368
+           C234 324 262 300 290 284
+           C330 262 372 250 402 214 Z" fill="url(#p-belly)"/>
+  <!-- soft shadow the flipper casts on the belly -->
+  <path d="M258 292 C244 336 238 382 244 424 C270 396 286 352 290 306 Z" fill="#0b1220" opacity=".22"/>
+  <!-- chin shadow: head sits over the chest -->
+  <path d="M402 214 C372 250 330 262 292 284 C330 270 372 262 400 240 Z" fill="#0b1220" opacity=".16"/>
+  <!-- flipper: swept back, with a lit leading edge for volume -->
+  <path d="M244 256
+           C214 296 192 350 186 412
+           C218 392 256 346 272 300
+           C278 280 262 250 244 256 Z" fill="url(#p-flip)"/>
+  <path d="M246 262 C224 296 206 340 196 392" stroke="#5a6f96" stroke-width="6" fill="none" stroke-linecap="round" opacity=".9"/>
+  <!-- beak: upper and lower mandible -->
+  <path d="M396 166 C428 168 454 180 466 194 C446 196 420 194 398 190 Z" fill="url(#p-orange)"/>
+  <path d="M398 192 C420 196 444 198 460 198 C448 208 424 212 400 206 Z" fill="#ea580c"/>
+  <!-- eye -->
+  <circle cx="358" cy="160" r="19" fill="#fff"/>
+  <circle cx="364" cy="162" r="10" fill="#0b1220"/>
+  <circle cx="367" cy="158" r="3.6" fill="#fff"/>
+</g></g></g></g>
 <text x="640" y="62" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="26" font-weight="700" fill="#fff" text-anchor="middle">Share a screen, send an invite, play together.</text>
 <text x="640" y="94" font-family="'Segoe UI', Inter, 'Helvetica Neue', Ubuntu, Cantarell, Arial, sans-serif" font-size="18" fill="#f0f9ff" text-anchor="middle" opacity=".9">MIT licensed · made on Fedora · for Windows and Linux</text>
 <circle cx="305" r="1.9" fill="#fff" opacity="0.57"><animate attributeName="cy" values="-10;180" dur="9.0s" begin="-5.4s" repeatCount="indefinite"/><animate attributeName="cx" values="305;283;305" dur="4.5s" repeatCount="indefinite"/></circle>

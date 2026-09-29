@@ -1,5 +1,105 @@
 # Changelog
 
+## 1.4.0 — 2026-09-29
+
+### Fixed: viewers disconnected after a few minutes
+- **Root cause found in a real Windows ↔ Fedora session log**: every session ended with *"control channel closed"* a few
+  seconds after a network hiccup. Control messages and video/audio shared one replay-protection window of 1024 records.
+  When Wi-Fi stalled, the reliable control channel resent a message *after* more than 1024 video/audio records had already
+  arrived, the message was taken for a replay, and the whole session was torn down. Control and media are now checked
+  separately (control: strictly in order; media: a window of 16384). Same wire format — 1.3.1 and 1.4.0 still talk to
+  each other. Regression test reproduces the exact case.
+- **No idle timers.** A share waits for a viewer until you press Stop (1.3.1 silently gave up after 30 minutes).
+- **Sharing survives a dropped session.** When a session ends — the viewer left, the network dropped, an attempt failed
+  or was refused — the host goes straight back to waiting on the same invitation. Only *Stop sharing* ends it.
+- **Automatic reconnect.** After an unexpected drop the viewer reconnects by itself (first try after 0.3 s, then backing
+  off to every 15 s) until it is back or you press Cancel. A device you approved earlier in the same share gets straight
+  back in without a new prompt; anyone else still has to be approved.
+- While a stream is live the computer and its screen are kept awake, so power-saving can't end the session.
+
+### Your invitation code stays the same
+- The host keeps **one invitation code** from share to share, so your friend can reuse the one they have. A **New code**
+  button replaces it only when you want to (e.g. it reached the wrong person) — the old one then stops working.
+- The viewer remembers the last invitation that worked: **Reconnect to the last host** is one click on the Connect page.
+- Invitation codes are never written to logs or diagnostics reports.
+
+### Adaptive bitrate, rebuilt (latency first)
+- 1.3.1 mistook ordinary Wi-Fi jitter for congestion: in the field log the bitrate fell from 10 to 1.5 Mbps in 10 s with
+  **no** queue anywhere, and never came back. The new controller:
+  - measures queueing from the *fastest* frames of each quarter second against the fastest of the last 10 s — jitter
+    spreads the distribution but leaves its minimum alone, a real queue delays every frame. No clock sync needed.
+  - reacts 4× a second (was once a second), and when a queue stands it drops straight below the rate the viewer actually
+    receives — the link's real capacity — so the queue drains within about a second.
+  - comes back fast: at once to just below the capacity it found, then in growing steps once that is clearly beaten.
+  - backs off from the rate really sent (the encoder cannot go below ~1.4 Mbps on a busy 1080p60 picture; 1.3.1 kept
+    cutting a target it was already missing).
+  - changes the bitrate sparingly (each change costs an NVENC keyframe).
+  - Simulated links in the test suite: jitter-only Wi-Fi keeps ≥ 8 Mbps (1.3.1: 1.5 Mbps), a 6 Mbps bottleneck is found in
+    < 3 s with low delay, a 5 s squeeze to 3 Mbps is followed by a full recovery.
+- The log says *why* the bitrate changed (`send queue 40 ms`, `queue delay 90 ms`, `link clear, recovering` …).
+
+### Lower latency
+- **NVENC no longer pads every frame with filler data.** Constant-bitrate mode made NVENC pad each frame to
+  bitrate ÷ fps with zeros. Same test run: **1.3.1 sent 5.6 MB in 3 s, 86.7 % of it filler; 1.4.0 sends 0.7 MB, 0 %
+  filler**, same picture (PSNR 90 dB), same per-frame size cap. Every frame is now as small as its content, so it leaves
+  sooner, and the link no longer looks saturated to the bitrate control. AMD (AMF) and VAAPI use no-filler modes too
+  (untested on that hardware); trailing filler is stripped for any encoder. `PS_NVENC_CBR=1` restores the old mode.
+- **Video is no longer held behind lost packets.** The media channel was meant to be unordered, but the option was
+  spelled the browser way and silently ignored, so one lost packet held back every later frame for at least a round trip.
+- **Congestion is visible immediately.** The network send buffer was 4 MB: up to ~2 s of video could pile up invisibly
+  before frame-skipping or the bitrate control noticed. Now 256 KB.
+- **Lost frames are detected.** Frames that vanished completely were never counted: no recovery request, loss shown as
+  0 %, the bitrate control blind to it.
+- **No keyframe storms**: after asking for a keyframe the viewer waits for it (or ~1.5 round trips) before asking again,
+  and the host sends one keyframe per loss burst.
+- **The stream window can't fall behind silently**: if decoding can't keep up, it skips to the next keyframe instead of
+  queuing frames without limit (latency used to grow second by second, invisible to the meter).
+- Corruption the decoder sees triggers a keyframe request at once.
+- Engine message parsing is linear: a 3 MB keyframe took 5.2 ms to reassemble, now 0.2 ms. The replay check dropped from
+  2.2 µs to 0.1 µs per packet.
+- Windows: 1 ms timers are kept even when Windows 11 throttles background processes; capture/render threads get
+  multimedia ("Games") scheduling; the viewer uses the Direct3D 11 flip-model renderer instead of Direct3D 9.
+- Viewer audio returns to ~30 ms after a burst instead of lagging by up to 120 ms for minutes.
+- End-to-end benchmark vs 1.3.1: see *Measured* below.
+
+### Measured (this machine, loopback, idle; 1.3.1 and 1.4.0 alternating, 3 × 20 s each, capture → screen p50)
+| Stream | 1.3.1 | 1.4.0 | network stage |
+|---|---|---|---|
+| 1080p60 NVENC | 3.30 ms | **2.87 ms** | 0.39 → 0.15 ms |
+| 1440p60 NVENC | 5.07 ms | **4.89 ms** | 0.35 → 0.19 ms |
+| 1440p120 NVENC | 4.84 ms | **4.70 ms** | 0.25 → 0.16 ms |
+| 1080p60 x264 | 2.32 ms | 2.34 ms | unchanged (x264 never padded) |
+
+Loopback has unlimited bandwidth, so this shows only the local cost of smaller frames. The fixes that matter most on a
+real internet link (no filler, unordered media, small send buffer, the new bitrate control, no disconnects) cannot be
+measured on loopback.
+
+### Security and robustness
+- The viewer now sees the four verification words **while** the host is asked to compare them (before, only after the
+  host had already approved, which made the check impossible).
+- Stop/Cancel while connecting can no longer leave a stream running in the background.
+- An engine that exits while frames are still being written no longer crashes the whole app.
+- A relay credentials URL's `?apiKey=` is hidden in diagnostics reports.
+- `--fps 0` no longer crashes the engine; the stream window redraws after being uncovered or resized.
+
+### Ubuntu and Debian
+- Native `.deb` packages for **Ubuntu 24.04, Ubuntu 26.04 and Debian 13**, each built against that release's own
+  FFmpeg/PipeWire/SDL and install-tested in a clean container.
+
+### Look
+- New penguin: redrawn mascot (proper head, chest and flippers, grounded feet, forward lean) and a separate hand-tuned
+  small icon for 16–32 px taskbars. New README banner.
+
+### Tested / not tested
+- **Tested on this machine** (Fedora 44, RTX 5070): the full suite (144 tests, incl. real host↔viewer sessions over
+  loopback: direct, relay, audio, input, latency), engine self-tests (NVENC, NV12, x264), 1.3.1 ↔ 1.4.0 sessions in both
+  directions, the Windows engine under Wine (version, self-test, probe), `.deb` install tests in clean containers.
+- **Not tested**: a real Windows PC with the new build, real internet paths (the reconnect and bitrate fixes are proven
+  with the field log, unit tests and simulated links, not yet on your friend's connection), AMD/Intel encoders.
+
+### Compatibility
+- Works with 1.3.1 in both directions (tested). For the new bitrate control and reconnect behaviour, update both sides.
+
 ## 1.3.1 — 2026-09-26
 
 ### Zero-copy and memory optimizations

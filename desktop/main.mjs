@@ -7,7 +7,7 @@
  * - that is where the latency budget goes.
  */
 
-import { app, BrowserWindow, shell, Menu, nativeTheme } from 'electron';
+import { app, BrowserWindow, shell, Menu, nativeTheme, powerSaveBlocker } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -51,7 +51,18 @@ if (!process.env.PS_UI_SNAPSHOT && !app.requestSingleInstanceLock()) {
 
   const createWindow = async () => {
     const { startUi } = await import('../node/src/ui/server.mjs');
-    ui = await startUi({ port: 0, open: false, quiet: true });
+    // While a stream is live, keep the machine and its display awake: an idle
+    // timer that sleeps the PC, blanks the screen or throttles the network
+    // adapter ends the session (the viewer "goes idle" from the host's point
+    // of view). Released as soon as the session ends.
+    let blocker = null;
+    const onSessionChange = (live) => {
+      try {
+        if (live && blocker === null) blocker = powerSaveBlocker.start('prevent-display-sleep');
+        else if (!live && blocker !== null) { powerSaveBlocker.stop(blocker); blocker = null; }
+      } catch { /* not supported on this desktop: harmless */ }
+    };
+    ui = await startUi({ port: 0, open: false, quiet: true, onSessionChange });
     const origin = new URL(ui.url).origin;
 
     // PS_UI_SNAPSHOT=out.png renders the UI offscreen to a PNG and exits

@@ -103,23 +103,24 @@ test('summary reports avg, p95 and max, then resets', () => {
   assert.equal(s.take(), null);
 });
 
-test('adaptive bitrate backs off on queueing and recovers slowly', () => {
+test('adaptive bitrate backs off on queueing and recovers', () => {
   const abr = new AdaptiveBitrate({ maxKbps: 20000 });
   let t = 0;
+  abr.tick(t);                              // start (the viewer baseline warms up for 2 s)
   // 200 KB waiting at 20 Mbps = 80 ms of video: heavy congestion.
   abr.observeQueue(200 * 1024);
   const down = abr.tick(t += 1000);
-  assert.ok(down && down <= 12500, `backs off hard (${down})`);
-  // Viewer sees rising delay: back off again (after the hold time).
-  abr.observeViewer({ delayRiseMs: 40, lost: 0 });
-  const down2 = abr.tick(t += 1000);
+  assert.ok(down && down <= 13500, `backs off hard (${down})`);
+  // Viewer sees queue delay: back off again (after the hold time).
+  abr.observeViewer({ qdMs: 40, frames: 15, lost: 0 });
+  const down2 = abr.tick(t += 2000);
   assert.ok(down2 < down, 'keeps backing off while congested');
-  // Clean link: no change for the first 2 s, then +8 % steps, never above max.
+  // Clean link: comes back up, never above max.
   let last = down2;
-  for (let i = 0; i < 80; i++) {
+  for (let i = 0; i < 160; i++) {
     abr.observeQueue(0);
-    abr.observeViewer({ delayRiseMs: 2, lost: 0 });
-    const k = abr.tick(t += 500);
+    abr.observeViewer({ qdMs: 1, frames: 15, lost: 0 });
+    const k = abr.tick(t += 250);
     if (k) { assert.ok(k > last && k <= 20000); last = k; }
   }
   assert.equal(abr.current, 20000, 'fully recovers on a clean link');

@@ -79,7 +79,10 @@ bool Decoder::drain(const std::function<void(const DecodedFrame&)>& sink, std::s
   for (;;) {
     int ret = avcodec_receive_frame(ctx_, frame_);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) return true;
-    if (ret < 0) { error = "avcodec_receive_frame: " + avErr(ret); return false; }
+    if (ret < 0) { ++decodeErrors_; error = "avcodec_receive_frame: " + avErr(ret); return false; }
+    // The decoder concealed missing/corrupt data in this picture: the viewer
+    // should ask for a clean keyframe now, not after the loss detector does.
+    if (frame_->decode_error_flags || (frame_->flags & AV_FRAME_FLAG_CORRUPT)) ++decodeErrors_;
 
     DecodedFrame out{};
     out.width = frame_->width;

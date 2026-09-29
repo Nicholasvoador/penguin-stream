@@ -201,6 +201,9 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
 }
 .status-banner { padding: 13px 16px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--muted); }
 .status-banner.live { color: var(--text); border-color: color-mix(in srgb, var(--good) 45%, transparent); background: color-mix(in srgb, var(--good) 10%, transparent); }
+.status-banner.warn { color: var(--text); border-color: color-mix(in srgb, var(--warn, #e0a030) 50%, transparent); background: color-mix(in srgb, var(--warn, #e0a030) 10%, transparent); }
+.reconnect-last { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 16px; padding: 12px 14px; border-radius: 12px; border: 1px dashed var(--border); }
+.reconnect-last small { font-size: 12px; }
 .metrics, .net-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .metric { padding: 14px 16px; border-radius: 14px; background: var(--panel); border: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .metric span { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }

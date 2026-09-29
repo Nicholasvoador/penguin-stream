@@ -8,6 +8,9 @@ import assert from 'node:assert/strict';
 
 import http from 'node:http';
 import { EventEmitter } from 'node:events';
+// Settings (the saved invitation code, the last host) go to a throwaway
+// config dir. Must run before the server module is loaded (dynamic import below).
+import './isolated-config.mjs';
 
 const hosts = [];
 class FakeHost extends EventEmitter {
@@ -25,16 +28,32 @@ class FakeHost extends EventEmitter {
     this.approve = approve;
     return new Promise((resolve, reject) => { this.resolveStart = resolve; this.rejectStart = reject; });
   }
-  close() { this.emit('closed', 'fake closed'); }
+  close(reason = 'fake closed') {
+    if (this.closedWith) return;
+    this.closedWith = reason;
+    this.emit('closed', reason);
+  }
 }
 
-import { startUi } from '../../src/ui/server.mjs';
+class FakeViewer extends EventEmitter {
+  constructor(opts) { super(); this.opts = opts; viewers.push(this); }
+  async start() { return new Promise((resolve, reject) => { this.resolveStart = resolve; this.rejectStart = reject; }); }
+  close(reason = 'closed') {
+    if (this.closedWith) return;
+    this.closedWith = reason;
+    this.emit('closed', reason);
+  }
+  setInput() {}
+}
+const viewers = [];
+
+const { startUi } = await import('../../src/ui/server.mjs');
 import { cleanupTransport } from '../../src/transport/peer.mjs';
 
 let ui;
 
 test.before(async () => {
-  ui = await startUi({ port: 0, open: false, HostClass: FakeHost, consentTimeoutMs: 100 });
+  ui = await startUi({ port: 0, open: false, HostClass: FakeHost, ViewerClass: FakeViewer, consentTimeoutMs: 100 });
 });
 
 test.after(async () => {
@@ -208,25 +227,124 @@ test('websocket upgrade rejects cross-site Origin and non-loopback Host even wit
   }
 });
 
+const getState = async () => (await call('/api/state')).json();
+const settle = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
+
 test('stopping pending consent cancels it; old callbacks cannot mutate a new session', async () => {
   await call('/api/host', { body: {} });
   const old = hosts.at(-1);
-  const decision = old.approve({ sas: 'old words' });
-  assert.equal((await (await call('/api/state')).json()).mode, 'hosting-consent');
+  const decision = old.approve({ sas: 'old words', fingerprint: 'AAAA' });
+  assert.equal((await getState()).mode, 'hosting-consent');
   await call('/api/stop', { body: {} });
   assert.equal(await decision, false);
-  assert.equal((await (await call('/api/state')).json()).mode, 'idle');
+  assert.equal((await getState()).mode, 'idle');
   await call('/api/host', { body: {} });
   const current = hosts.at(-1);
+  const count = hosts.length;
   old.emit('code', 'STALE'); old.emit('closed', 'late'); old.rejectStart(new Error('late failure'));
-  assert.equal(await old.approve({ sas: 'stale' }), false);
-  await new Promise(resolve => setTimeout(resolve, 130));
-  const state = await (await call('/api/state')).json();
-  assert.equal(state.mode, 'hosting-waiting'); assert.equal(state.code, null);
-  const timed = current.approve({ sas: 'new words' });
+  assert.equal(await old.approve({ sas: 'stale', fingerprint: 'AAAA' }), false);
+  await settle(130);
+  const state = await getState();
+  assert.equal(state.mode, 'hosting-waiting');
+  assert.notEqual(state.code, 'STALE', 'a stale session cannot change the invitation');
+  assert.equal(hosts.length, count, 'a stale session cannot re-arm the share');
+  const timed = current.approve({ sas: 'new words', fingerprint: 'BBBB' });
   assert.equal(await timed, false);
-  assert.equal((await (await call('/api/state')).json()).mode, 'hosting-waiting');
+  assert.equal((await getState()).mode, 'hosting-waiting');
   await call('/api/stop', { body: {} });
+});
+
+// 1.4.0: the invitation is the same every time, sharing survives a dropped
+// or failed session, and a viewer approved in this share gets back in.
+test('the invitation code stays the same across shares until a new one is requested', async () => {
+  await call('/api/host', { body: {} });
+  const code1 = (await getState()).code;
+  assert.match(code1, /^[0-9A-Z]{4}(-[0-9A-Z]{4}){7}$/);
+  assert.equal(hosts.at(-1).opts.code, code1, 'the host session uses the saved code');
+  await call('/api/stop', { body: {} });
+  await call('/api/host', { body: {} });
+  assert.equal((await getState()).code, code1, 'same code on the next share');
+
+  const res = await call('/api/new-code', { body: {} });
+  assert.equal(res.status, 200);
+  const code2 = (await res.json()).code;
+  assert.notEqual(code2, code1);
+  await settle();
+  assert.equal((await getState()).code, code2, 'the running share switched to the new code');
+  assert.equal(hosts.at(-1).opts.code, code2, 'a fresh attempt listens on the new code');
+  await call('/api/stop', { body: {} });
+  await call('/api/host', { body: {} });
+  assert.equal((await getState()).code, code2, 'and it is kept from then on');
+  await call('/api/stop', { body: {} });
+});
+
+test('a dropped or failed session keeps sharing; an approved device reconnects without asking', async () => {
+  await call('/api/host', { body: {} });
+  const first = hosts.at(-1);
+  const code = (await getState()).code;
+  // viewer approved by the user
+  const decision = first.approve({ sas: 'w o r d', fingerprint: 'FRIEND' });
+  await call('/api/consent', { body: { approve: true } });
+  assert.equal(await decision, true);
+  assert.equal((await getState()).mode, 'hosting-live');
+  // the connection drops (the 1.3.1 field bug)
+  first.emit('closed', 'control channel closed');
+  await settle();
+  let state = await getState();
+  assert.equal(state.mode, 'hosting-waiting', 'still sharing after a drop');
+  assert.equal(state.code, code, 'with the same invitation');
+  const second = hosts.at(-1);
+  assert.notEqual(second, first, 'a new attempt is waiting');
+  // the same device comes back: no prompt
+  assert.equal(await second.approve({ sas: 'x y z w', fingerprint: 'FRIEND' }), true);
+  assert.equal((await getState()).mode, 'hosting-live');
+  assert.equal((await getState()).pendingConsent, null, 'no consent prompt for a device approved in this share');
+  // a stranger still has to ask
+  second.emit('closed', 'peer left');
+  await settle();
+  const third = hosts.at(-1);
+  const strangerDecision = third.approve({ sas: 'a b c d', fingerprint: 'STRANGER' });
+  assert.equal((await getState()).mode, 'hosting-consent');
+  await call('/api/consent', { body: { approve: false } });
+  assert.equal(await strangerDecision, false);
+  // a failed attempt (e.g. ICE) also keeps sharing
+  third.rejectStart(new Error('ICE connection failed'));
+  await settle(1200);   // an instant failure backs off ~1 s
+  state = await getState();
+  assert.equal(state.mode, 'hosting-waiting');
+  assert.ok(hosts.at(-1) !== third, 'a new attempt after a failure');
+  await call('/api/stop', { body: {} });
+  assert.equal((await getState()).mode, 'idle');
+  const after = hosts.length;
+  await settle(1200);
+  assert.equal(hosts.length, after, 'Stop ends the share: nothing re-arms');
+});
+
+test('a viewer reconnects by itself after a drop, and Cancel stops it', async () => {
+  const code = 'ABCD-EFGH-JKMN-PQRS-TVWX-YZ01-2345-6789';
+  assert.equal((await call('/api/connect', { body: { code } })).status, 200);
+  const v1 = viewers.at(-1);
+  v1.emit('secure', { relayed: false });
+  assert.equal((await getState()).mode, 'viewing');
+  assert.equal((await getState()).lastInvitation, code, 'the working invitation is remembered');
+  v1.emit('closed', 'control channel closed');
+  await settle();
+  assert.equal((await getState()).mode, 'reconnecting');
+  await settle(450);
+  const v2 = viewers.at(-1);
+  assert.notEqual(v2, v1, 'a new attempt was started');
+  assert.equal(v2.opts.code, v1.opts.code);
+  await call('/api/stop', { body: {} });
+  assert.equal((await getState()).mode, 'idle');
+  assert.ok(v2.closedWith, 'Cancel closes the attempt');
+  // a deliberate ending (window closed) does not reconnect
+  await call('/api/connect', { body: { code } });
+  const v3 = viewers.at(-1);
+  v3.emit('secure', {});
+  v3.emit('closed', 'viewer window closed');
+  await settle(450);
+  assert.equal((await getState()).mode, 'idle');
+  assert.equal(viewers.at(-1), v3);
 });
 
 test('live input permissions: only while sharing, strictly typed, applied to the host', async () => {

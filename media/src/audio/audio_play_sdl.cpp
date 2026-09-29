@@ -1,8 +1,10 @@
 // Viewer playback: PCM from stdin -> SDL audio device.
 //
 // Latency policy: start once ~30 ms is buffered (absorbs network jitter), and
-// never let more than ~120 ms queue up. If it does (clock drift, a burst after
-// a stall), drop the backlog and re-buffer, so audio stays in step with video.
+// keep it there: if the queue sits above target+20 ms for half a second (a
+// burst after a stall, or the sender's clock running fast), drop the excess
+// so audio returns to ~30 ms instead of lagging video for minutes. Above
+// ~120 ms at once, drop the backlog and re-buffer.
 
 #include "audio/audio.h"
 
@@ -61,6 +63,7 @@ int runAudioPlay(int argc, char** argv) {
   std::vector<uint8_t> buf(msBytes(10));
   bool playing = false;
   size_t carry = 0;   // keep whole frames only
+  int overFor = 0;    // consecutive reads with the queue above target
   for (;;) {
     const size_t n = fread(buf.data() + carry, 1, buf.size() - carry, stdin);
     if (n == 0) break;   // EOF: session over
@@ -75,7 +78,17 @@ int runAudioPlay(int argc, char** argv) {
       SDL_PauseAudioDevice(dev, 1);   // ran dry: re-buffer instead of stuttering
       playing = false;
     }
-    SDL_QueueAudio(dev, buf.data(), Uint32(whole));
+    // Trim a standing excess: skip incoming audio instead of queuing it
+    // (one 10 ms read at a time, which is barely audible).
+    bool skip = false;
+    if (playing && queued > msBytes(startMs + 20)) {
+      if (++overFor >= 50) skip = true;           // ~0.5 s above target
+    } else {
+      overFor = 0;
+    }
+    if (skip && queued <= msBytes(startMs + 5)) overFor = 0;
+    if (!skip) SDL_QueueAudio(dev, buf.data(), Uint32(whole));
+    else if (SDL_GetQueuedAudioSize(dev) <= msBytes(startMs)) overFor = 0;   // back at target
     carry = total - whole;
     if (carry) memmove(buf.data(), buf.data() + whole, carry);
     if (!playing && SDL_GetQueuedAudioSize(dev) >= msBytes(startMs)) {

@@ -64,7 +64,15 @@ export class Reassembler {
   constructor() {
     this.pending = new Map(); // frameId -> { chunks, count, received, ptsUs, keyframe, bytes }
     this.highestCompleted = -1;
-    this.stats = { completed: 0, dropped: 0, duplicates: 0, malformed: 0, bytes: 0 };
+    // Loss accounting. `dropped` resets when a keyframe is requested; `lost`
+    // is cumulative (for the UI). A frame is lost if it never completed by the
+    // time frames REORDER_DEPTH newer have been seen - including frames of
+    // which not a single chunk arrived (the common case: a P-frame is one
+    // SCTP message, and losing any packet of it abandons the whole message).
+    this.stats = { completed: 0, dropped: 0, lost: 0, duplicates: 0, malformed: 0, bytes: 0 };
+    this.seen = new Set();    // ids with at least one chunk, not yet swept
+    this.swept = null;        // every id <= swept has been accounted for
+    this.highestSeen = -1;
   }
 
   /**
@@ -88,6 +96,7 @@ export class Reassembler {
       this.stats.malformed++;
       return null;
     }
+    this.#noteSeen(id);
 
     // Chunk belonging to a frame we already emitted or gave up on.
     if (id <= this.highestCompleted && this.highestCompleted - id < 0x7fffffff) {
@@ -140,9 +149,31 @@ export class Reassembler {
       if (currentId - id > REORDER_DEPTH) {
         this.pending.delete(id);
         this.stats.dropped++;
+        this.stats.lost++;
         void entry;
       }
     }
+  }
+
+  /** Records that frame `id` was (at least partly) received, then sweeps. */
+  #noteSeen(id) {
+    if (this.swept === null) this.swept = id - 1;           // first frame of the stream
+    if (id <= this.swept) return;                            // late chunk of an accounted frame
+    this.seen.add(id);
+    if (id > this.highestSeen) this.highestSeen = id;
+    const limit = this.highestSeen - REORDER_DEPTH;
+    if (limit <= this.swept) return;
+    if (limit - this.swept > 4096) {                         // stream restarted / id jump: resync
+      this.seen.clear();
+      this.swept = limit;
+      return;
+    }
+    for (let x = this.swept + 1; x <= limit; x++) {
+      // Never seen at all -> lost in transit. (Partially received frames are
+      // counted by #expireOlderThan when they are abandoned.)
+      if (!this.seen.delete(x)) { this.stats.dropped++; this.stats.lost++; }
+    }
+    this.swept = limit;
   }
 
   /** True if a keyframe should be requested: we have lost frames recently. */

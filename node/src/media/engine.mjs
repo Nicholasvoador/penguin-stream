@@ -90,30 +90,59 @@ export class EngineClock {
 }
 
 /** Incremental parser for the framed stdio protocol. */
+/** Bytes the stream window may have waiting on its stdin before frames are dropped. */
+const VIEW_QUEUE_LIMIT = 512 * 1024;
+
 export class FrameParser {
   constructor() {
-    this.buf = Buffer.alloc(0);
+    this.buf = Buffer.alloc(0);   // unparsed bytes (less than one header, or a whole tail)
+    this.msg = null;              // message being assembled: { type, body, filled }
   }
 
-  /** @returns {{type:number, payload:Buffer}[]} */
+  /**
+   * Linear in the input: a large message (keyframe) is copied once into a
+   * buffer of its final size as pipe reads arrive, instead of re-joining
+   * the whole partial buffer on every read (1.3.1: O(n^2), 6 ms for a 3 MB
+   * IDR). Small messages are sliced out without a copy.
+   * @returns {{type:number, payload:Buffer}[]}
+   */
   push(chunk) {
-    this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
     const out = [];
-
-    for (;;) {
-      if (this.buf.length < 5) break;
-      const payloadLen = this.buf.readUInt32LE(0);
+    let data = chunk;
+    if (this.msg) {
+      const m = this.msg;
+      const n = Math.min(data.length, m.body.length - m.filled);
+      data.copy(m.body, m.filled, 0, n);
+      m.filled += n;
+      if (m.filled < m.body.length) return out;
+      out.push({ type: m.type, payload: m.body });
+      this.msg = null;
+      data = data.subarray(n);
+    }
+    if (this.buf.length) { data = Buffer.concat([this.buf, data]); this.buf = Buffer.alloc(0); }
+    let off = 0;
+    while (data.length - off >= 5) {
+      const payloadLen = data.readUInt32LE(off);
       if (payloadLen < 1 || payloadLen > MAX_MESSAGE_BYTES) {
         throw new Error(`ps-media sent an implausible message length ${payloadLen}`);
       }
-      const total = 4 + payloadLen;
-      if (this.buf.length < total) break;
-
-      const type = this.buf.readUInt8(4);
-      const payload = this.buf.subarray(5, total);
-      out.push({ type, payload: Buffer.from(payload) });
-      this.buf = this.buf.subarray(total);
+      const type = data.readUInt8(off + 4);
+      const bodyLen = payloadLen - 1;
+      const start = off + 5;
+      if (data.length - start >= bodyLen) {
+        // Complete in this read. Copy so the pipe's chunk can be freed (a
+        // slice would pin the whole 64 KB read for each small message).
+        out.push({ type, payload: Buffer.from(data.subarray(start, start + bodyLen)) });
+        off = start + bodyLen;
+      } else {
+        const body = Buffer.allocUnsafe(bodyLen);
+        const have = data.length - start;
+        data.copy(body, 0, start);
+        this.msg = { type, body, filled: have };
+        return out;
+      }
     }
+    if (off < data.length) this.buf = Buffer.from(data.subarray(off));
     return out;
   }
 }
@@ -184,6 +213,10 @@ export class CaptureEngine extends EventEmitter {
     if (this.opts.inputCapable === true) args.push('--input-capable');
 
     this.proc = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    // EPIPE on a dead engine arrives as an async 'error' event, not a throw.
+    // Unhandled, it crashed the whole app (UI + session). The 'exit' event
+    // reports the engine's death; the pipe error itself is noise.
+    this.proc.stdin.on('error', () => {});
 
     this.proc.stdout.on('data', (chunk) => {
       let messages;
@@ -269,7 +302,7 @@ export class CaptureEngine extends EventEmitter {
   }
 
   #send(type, json) {
-    if (!this.proc || this.proc.killed || !this.proc.stdin.writable) return false;
+    if (!this.proc || this.proc.killed || this.proc.exitCode !== null || !this.proc.stdin.writable) return false;
     try {
       this.proc.stdin.write(encodeMessage(type, Buffer.from(json, 'utf8')));
       return true;
@@ -327,6 +360,7 @@ export class ViewEngine extends EventEmitter {
     // No windowsHide here: on Windows it sets SW_HIDE in STARTUPINFO, which
     // the child's first ShowWindow obeys - the stream window would stay hidden.
     this.proc = spawn(bin, args, { stdio: ['pipe', 'pipe', 'inherit'] });
+    this.proc.stdin.on('error', () => {});   // see CaptureEngine: EPIPE must not crash the app
 
     this.proc.stdout.on('data', (chunk) => {
       let messages;
@@ -344,6 +378,7 @@ export class ViewEngine extends EventEmitter {
             const m = JSON.parse(msg.payload.toString('utf8'));
             if (m?.t === 'viewer-state') this.emit('viewer-state', m);
             else if (m?.t === 'view-stats') { this.clock.observe(m.now); this.emit('view-stats', m); }
+            else if (m?.t === 'need-keyframe') this.emit('need-keyframe');
           } catch { /* ignore */ }
         } else if (msg.type === MsgType.Log) {
           this.emit('log', msg.payload.toString('utf8'));
@@ -361,8 +396,28 @@ export class ViewEngine extends EventEmitter {
     return this.#write(encodeMessage(MsgType.Config, Buffer.from(JSON.stringify(config), 'utf8')));
   }
 
-  /** @param {{ptsUs: bigint, keyframe: boolean, frame: Buffer}} v */
+  /**
+   * @param {{ptsUs: bigint, keyframe: boolean, frame: Buffer}} v
+   * @returns {boolean} false if the frame was dropped (decoder behind)
+   */
   sendVideo({ ptsUs, keyframe, frame }) {
+    // Backpressure: the stream window decodes synchronously as it reads. If
+    // it falls behind (slow CPU, 4K, first-frame GPU init), frames used to
+    // queue here without limit and were shown late, in order - latency that
+    // grew by the second and showed up in no stage of the meter. Keep at
+    // most ~2 frames in flight: drop until the pipe drains, then resync on a
+    // keyframe (later P-frames would reference the dropped ones).
+    const queued = this.proc?.stdin?.writableLength ?? 0;
+    if (!keyframe && (queued > VIEW_QUEUE_LIMIT || this.dropUntilKeyframe)) {
+      this.dropped = (this.dropped ?? 0) + 1;
+      if (!this.dropUntilKeyframe) {
+        this.dropUntilKeyframe = true;
+        this.emit('behind', { queuedBytes: queued });
+      }
+      if (queued <= VIEW_QUEUE_LIMIT / 4) this.emit('need-keyframe');
+      return false;
+    }
+    if (keyframe) this.dropUntilKeyframe = false;
     const payload = Buffer.allocUnsafe(12 + frame.length);
     payload.writeBigUInt64LE(BigInt(ptsUs), 0);
     payload.writeUInt32LE(keyframe ? 1 : 0, 8);
@@ -399,7 +454,7 @@ export class ViewEngine extends EventEmitter {
   }
 
   #write(buf) {
-    if (!this.proc || !this.proc.stdin.writable) return false;
+    if (!this.proc || this.proc.exitCode !== null || !this.proc.stdin.writable) return false;
     try { this.proc.stdin.write(buf); return true; } catch { return false; }
   }
 

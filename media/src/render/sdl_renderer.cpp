@@ -378,6 +378,11 @@ class Viewer {
           releaseKeysAndButtons();
           if (pad_) for (int slot = 0; slot < 4; ++slot) if (pads_[slot].controller) neutralisePad(slot);
           if (capture_) setCapture(false);
+        } else if (ev.window.event == SDL_WINDOWEVENT_EXPOSED || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                   ev.window.event == SDL_WINDOWEVENT_RESTORED) {
+          // A still desktop sends few frames: redraw the last one now instead
+          // of showing a black or stale window until the next frame arrives.
+          redraw_ = true;
         }
         break;
       case SDL_MOUSEMOTION: {
@@ -603,6 +608,13 @@ int Viewer::run(std::shared_ptr<SharedFrame> sharedOwner, bool vsync) {
     } else {
       Uint32 rflags = SDL_RENDERER_ACCELERATED;
       if (vsync) rflags |= SDL_RENDERER_PRESENTVSYNC;
+#ifdef _WIN32
+      // SDL2 would pick Direct3D 9 first: a blt-model swap chain that DWM can
+      // never promote to independent flip. Direct3D 11 uses a flip-model
+      // swap chain (up to one refresh less in borderless fullscreen). SDL
+      // falls back to its normal order if D3D11 is unavailable.
+      SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
+#endif
       renderer_ = SDL_CreateRenderer(window_, -1, rflags);
       if (!renderer_) renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_SOFTWARE);
       if (!renderer_) {
@@ -789,6 +801,7 @@ int runView(int argc, char** argv) {
     decoder.setYuvOutput(true);
     std::vector<uint8_t> work;   // next frame is packed here, then swapped into shared->pixels
     bool decoderOpen = false;
+    uint64_t lastKeyframeAsk = 0;
     Message msg;
     std::string err;
     while (!g_quit && readMessage(stdin, msg, &err)) {
@@ -827,6 +840,19 @@ int runView(int argc, char** argv) {
         if (!parseVideoPacket(msg.payload, hdr, &data, &len)) continue;
         std::string derr;
         const uint64_t recv = nowUs();
+        const uint64_t errsBefore = decoder.decodeErrors();
+        struct ErrorCheck {   // runs after decode(): report corruption at once
+          Decoder& d; uint64_t before; uint64_t& lastAsk;
+          ~ErrorCheck() {
+            if (d.decodeErrors() > before) {
+              const uint64_t t = nowUs();
+              if (t - lastAsk > 250000) {   // rate-limited
+                lastAsk = t;
+                emitControl("{\"t\":\"need-keyframe\"}");
+              }
+            }
+          }
+        } errorCheck{decoder, errsBefore, lastKeyframeAsk};
         decoder.decode(data, len, hdr.pts_us, [&](const DecodedFrame& f) {
           const uint64_t decoded = nowUs();
           // Pack the picture into our own buffer WITHOUT the lock, then swap it

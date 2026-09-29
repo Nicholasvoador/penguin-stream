@@ -271,3 +271,38 @@ test('trust store fails closed on a corrupt file', () => {
   assert.equal(ts.list().length, 0, 'corrupt store must trust nobody');
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// Regression (1.4.0, field bug "disconnected after a few minutes"): control
+// and media share one sequence space. A control record SCTP retransmits after
+// a hiccup arrives after >1024 media records and used to be rejected as a
+// replay, which tore the session down.
+test('a late control record is accepted after thousands of media records', async () => {
+  const { LANE } = await import('../../src/crypto/session.mjs');
+  const [a, b] = sessionPair();
+  const lateCtl = a.seal(CHANNEL.CONTROL, Buffer.from('{"t":"host-stats"}'));
+  for (let i = 0; i < 5000; i++) b.open(a.seal(i % 3 ? CHANNEL.AUDIO : CHANNEL.VIDEO, Buffer.from('m')), LANE.MEDIA);
+  assert.equal(b.open(lateCtl, LANE.CTL).plaintext.toString(), '{"t":"host-stats"}');
+  // ...but a replayed control record is still refused
+  assert.throws(() => b.open(lateCtl, LANE.CTL), /replayed control record/);
+  const older = a.seal(CHANNEL.CONTROL, Buffer.from('1'));
+  const newer = a.seal(CHANNEL.CONTROL, Buffer.from('2'));
+  b.open(newer, LANE.CTL);
+  assert.throws(() => b.open(older, LANE.CTL), /replayed control record/, 'ctl lane is strictly increasing');
+});
+
+test('records are bound to their lane (no media on ctl, no control on media)', async () => {
+  const { LANE } = await import('../../src/crypto/session.mjs');
+  const [a, b] = sessionPair();
+  assert.throws(() => b.open(a.seal(CHANNEL.VIDEO, Buffer.from('v')), LANE.CTL), /media record on the control channel/);
+  assert.throws(() => b.open(a.seal(CHANNEL.CONTROL, Buffer.from('c')), LANE.MEDIA), /non-media record on the media channel/);
+  assert.throws(() => b.open(a.seal(CHANNEL.INPUT, Buffer.from('i')), LANE.MEDIA), /non-media record on the media channel/);
+});
+
+test('media reordering within several seconds is not mistaken for a replay', async () => {
+  const { LANE } = await import('../../src/crypto/session.mjs');
+  const [a, b] = sessionPair();
+  const recs = Array.from({ length: 6000 }, () => a.seal(CHANNEL.VIDEO, Buffer.from('v')));
+  b.open(recs[5999], LANE.MEDIA);                      // newest first
+  for (let i = 1000; i < 5999; i++) b.open(recs[i], LANE.MEDIA);   // 5000 older ones still accepted
+  assert.throws(() => b.open(recs[4000], LANE.MEDIA), /replay/);
+});

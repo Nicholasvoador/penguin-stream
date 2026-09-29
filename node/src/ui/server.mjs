@@ -50,7 +50,7 @@ function isLoopbackHost(value) {
 }
 
 export async function startUi({ port = 47800, open = true, quiet = false, HostClass = Host, ViewerClass = Viewer,
-  consentTimeoutMs = 120_000 } = {}) {
+  consentTimeoutMs = 120_000, onSessionChange = null } = {}) {
   const token = crypto.randomBytes(24).toString('base64url');
   const identity = loadOrCreateIdentity();
   const trust = new TrustStore();
@@ -64,6 +64,8 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
   /** @type {{kind:'host'|'viewer', instance:any}|null} */
   let active = null;
   let pendingConsent = null;   // { request, resolve, timer }
+  let share = null;            // host: the running share (outlives single sessions)
+  let viewerRetry = null;      // viewer: pending automatic reconnect { timer }
   let generation = 0;
   const bindSession = (instance) => {
     const epoch = ++generation;
@@ -92,6 +94,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     remoteViewer: null,    // host: what the viewer is currently sending
     viewerState: null,     // viewer: local switches, as the stream window reports them
     hostPermissions: null, // viewer: what the host allows
+    reconnect: null,       // viewer: { attempt, reason, at } while reconnecting
   };
 
   const pushLog = (line) => {
@@ -131,11 +134,17 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     remoteViewer: state.remoteViewer,
     viewerState: state.viewerState,
     hostPermissions: state.hostPermissions,
+    reconnect: state.reconnect,
+    // The last invitation that worked, for a one-click reconnect. Local UI
+    // only (token-protected); never written to logs or diagnostics.
+    lastInvitation: settings.get().lastInvitation || null,
     platform: process.platform,
     version: APP_VERSION,
   });
 
-  const stopActive = (reason = 'stopped by user') => {
+  // Ends the CURRENT host/viewer instance only. A share (or a viewer's
+  // reconnect loop) may carry on with a fresh instance afterwards.
+  const endSession = (reason) => {
     const previous = active;
     active = null;
     ++generation;
@@ -143,16 +152,27 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     pendingConsent?.resolve?.(false);
     pendingConsent = null;
     try { previous?.instance.close(reason); } catch { /* already closing */ }
-    state.code = null;
     state.sas = null;
     state.transport = null;
     state.mediaConfig = null;
     state.stats = {};
-    state.permissions = null;
-    state.inputStatus = null;
     state.remoteViewer = null;
     state.viewerState = null;
     state.hostPermissions = null;
+    onSessionChange?.(false);
+  };
+
+  // Stops everything: the share, a pending reconnect, the current session.
+  const stopActive = (reason = 'stopped by user') => {
+    clearTimeout(share?.timer);
+    share = null;
+    clearTimeout(viewerRetry?.timer);
+    viewerRetry = null;
+    endSession(reason);
+    state.code = null;
+    state.permissions = null;
+    state.inputStatus = null;
+    state.reconnect = null;
     setMode('idle');
   };
 
@@ -176,8 +196,16 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     };
   }
 
+  /*
+   * Sharing is a loop, not a one-shot: the host keeps its invitation (the
+   * same code every time, unless the user asks for a new one) and, whenever
+   * a session ends - the viewer left, the connection dropped, an attempt
+   * failed or was refused - it simply waits for the next connection. Only
+   * Stop ends the share. A device approved during this share is let back in
+   * without asking again, so a friend can reconnect after any hiccup.
+   */
   async function startHost(opts) {
-    if (active) throw new Error('a session is already running');
+    if (active || share || viewerRetry) throw new Error('a session is already running');
 
     // Stream settings: the request may override the saved ones for this share.
     const saved = settings.get();
@@ -188,68 +216,100 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     const monitor = resolveMonitor(monitors, monitorChoice);
     // Remote-desktop and screen-cast grants are different kinds of token.
     const tokenKey = `${process.platform}:rd:${monitor ? monitor.id : 'all'}`;
-    const restoreToken = saved.portalTokens?.[tokenKey];
     const num = (v) => (v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : undefined);
 
+    share = {
+      code: typeof opts.code === 'string' && opts.code ? opts.code : settings.shareCode(),
+      tokenKey,
+      permissions: { kbm: opts.allowInput === true, pad: opts.allowGamepad === true },
+      approved: new Set(),       // device fingerprints approved during this share
+      fails: 0,
+      timer: null,
+      hostOpts: {
+        ...commonOptions(opts),
+        source: typeof pick('source') === 'string' && /^(dxgi|gdi|portal|x11|synthetic)$/.test(pick('source')) ? pick('source') : undefined,
+        display: typeof opts.display === 'string' && /^[0-9]{1,2}$/.test(opts.display) ? opts.display : undefined,
+        fps: num(pick('fps')),
+        bitrateKbps: num(pick('bitrate')),
+        adaptiveBitrate: pick('adaptiveBitrate') !== false,
+        width: box.width || undefined,
+        height: box.height || undefined,
+        monitor: monitor ?? undefined,
+        workspace: monitor ? workspaceOf(monitors) ?? undefined : undefined,
+        encoder: typeof pick('encoder') === 'string' && /^(auto|nvenc|amf|qsv|mf|vaapi|x264|software)$/.test(pick('encoder'))
+          ? pick('encoder') : undefined,
+        // Ask Wayland for remote-control permission up front, so control can be
+        // switched on later in the session without restarting the share.
+        inputCapable: true,
+        audio: opts.audio === true,
+        audioFilter: { excludeVoice: saved.audioExcludeVoice, exclude: saved.audioExclude, only: saved.audioOnly },
+      },
+    };
+    if (monitor) pushLog(`sharing monitor ${monitor.label || monitor.id}`);
+    logbook.info(`share: fps=${num(pick('fps')) ?? 60} bitrate=${num(pick('bitrate')) ?? 15000} resolution=${pick('resolution')} ` +
+      `adaptive=${pick('adaptiveBitrate') !== false} monitor=${monitor ? monitor.label : 'system picker'} ` +
+      `monitors=${monitors.map((m) => `${m.name}:${m.id}${m.primary ? '*' : ''}`).join(' ') || 'unknown'}`);
+    launchHost();
+    return { ok: true };
+  }
+
+  /** One connection attempt / session of the current share. */
+  function launchHost() {
+    const s = share;
+    if (!s || active) return;
+    const startedAt = Date.now();
     const host = new HostClass({
-      ...commonOptions(opts),
-      source: typeof pick('source') === 'string' && /^(dxgi|gdi|portal|x11|synthetic)$/.test(pick('source')) ? pick('source') : undefined,
-      display: typeof opts.display === 'string' && /^[0-9]{1,2}$/.test(opts.display) ? opts.display : undefined,
-      fps: num(pick('fps')),
-      bitrateKbps: num(pick('bitrate')),
-      adaptiveBitrate: pick('adaptiveBitrate') !== false,
-      width: box.width || undefined,
-      height: box.height || undefined,
-      monitor: monitor ?? undefined,
-      workspace: monitor ? workspaceOf(monitors) ?? undefined : undefined,
-      restoreToken,
-      encoder: typeof pick('encoder') === 'string' && /^(auto|nvenc|amf|qsv|mf|vaapi|x264|software)$/.test(pick('encoder'))
-        ? pick('encoder') : undefined,
-      allowInput: opts.allowInput === true,
-      allowGamepad: opts.allowGamepad === true,
-      // Ask Wayland for remote-control permission up front, so control can be
-      // switched on later in the session without restarting the share.
-      inputCapable: true,
-      audio: opts.audio === true,
-      audioFilter: (() => {
-        const saved = settings.get();
-        return { excludeVoice: saved.audioExcludeVoice, exclude: saved.audioExclude, only: saved.audioOnly };
-      })(),
+      ...s.hostOpts,
+      code: s.code,
+      allowInput: s.permissions.kbm,
+      allowGamepad: s.permissions.pad,
+      // The latest Wayland grant (saved after each share) avoids the picker.
+      restoreToken: settings.get().portalTokens?.[s.tokenKey],
     });
 
     active = { kind: 'host', instance: host };
     const scope = bindSession(host);
     state.permissions = { ...host.permissions };
+    state.code = s.code;
     setMode('hosting-waiting');
-    scope.on('permissions', (p) => { state.permissions = { ...p }; broadcast('state', publicState()); });
+    scope.on('permissions', (p) => { s.permissions = { ...p }; state.permissions = { ...p }; broadcast('state', publicState()); });
     scope.on('input-status', (st) => { state.inputStatus = st; broadcast('state', publicState()); });
     scope.on('viewer-state', (v) => { state.remoteViewer = v; broadcast('state', publicState()); });
 
     scope.on('code', (code) => { state.code = code; broadcast('state', publicState()); });
     // Wayland remembered the screen choice: reuse it next time (no picker).
     scope.on('restore-token', (tok) => {
-      try { settings.update({ portalTokens: { ...(settings.get().portalTokens || {}), [tokenKey]: tok } }); } catch { /* best effort */ }
+      try { settings.update({ portalTokens: { ...(settings.get().portalTokens || {}), [s.tokenKey]: tok } }); } catch { /* best effort */ }
     });
-    if (monitor) pushLog(`sharing monitor ${monitor.label || monitor.id}`);
     scope.on('audio-warning', (w) => { pushLog(`audio warning: ${w}`); broadcast('notice', w); });
     scope.on('log', pushLog);
-    scope.on('stats', (s) => { state.stats = s; broadcast('stats', s); logStats('host', s); });
+    scope.on('stats', (st) => { state.stats = st; broadcast('stats', st); logStats('host', st); });
     scope.on('media-config', (cfg) => {
       state.mediaConfig = cfg;
       logbook.info(`stream ${cfg.width}x${cfg.height}@${cfg.fps} from ${cfg.sourceWidth ?? cfg.width}x${cfg.sourceHeight ?? cfg.height} ` +
         `encoder=${cfg.encoder} capture=${cfg.capture}${cfg.intraRefresh ? ' intra-refresh' : ''}`);
       broadcast('state', publicState());
     });
-    scope.on('secure', (t) => logbook.info(`connected: ${t?.relayed ? 'relay' : 'direct'} ${t?.localType ?? ''}->${t?.remoteType ?? ''} ${t?.protocol ?? ''}`));
+    scope.on('secure', (t) => {
+      s.fails = 0;
+      onSessionChange?.(true);
+      logbook.info(`connected: ${t?.relayed ? 'relay' : 'direct'} ${t?.localType ?? ''}->${t?.remoteType ?? ''} ${t?.protocol ?? ''}`);
+    });
     scope.on('error', (e) => pushLog(`error: ${e.message}`));
-    scope.on('closed', (reason) => { pushLog(`session ended: ${reason}`); stopActive(reason); });
-    logbook.info(`share: fps=${num(pick('fps')) ?? 60} bitrate=${num(pick('bitrate')) ?? 15000} resolution=${pick('resolution')} ` +
-      `adaptive=${pick('adaptiveBitrate') !== false} monitor=${monitor ? monitor.label : 'system picker'} ` +
-      `monitors=${monitors.map((m) => `${m.name}:${m.id}${m.primary ? '*' : ''}`).join(' ') || 'unknown'}`);
+    scope.on('closed', (reason) => {
+      pushLog(`session ended: ${reason} - still sharing, the same invitation works to reconnect`);
+      rearmHost(reason, startedAt, false);
+    });
 
     // Resolved by the /api/consent endpoint when the user clicks.
     host.start(async (request) => {
       if (!scope.current() || pendingConsent) return false;
+      if (s.approved.has(request.fingerprint) && settings.get().autoReconnect !== false) {
+        pushLog(`${request.label || 'viewer'} reconnected (approved earlier in this share)`);
+        state.sas = request.sas;
+        setMode('hosting-live');
+        return true;
+      }
       const consent = { request, resolve: null, timer: null };
       pendingConsent = consent;
       broadcast('consent', request);
@@ -265,6 +325,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
       if (!scope.current() || pendingConsent !== consent) return false;
       pendingConsent = null;
       if (decision) {
+        s.approved.add(request.fingerprint);
         state.sas = request.sas;
         setMode('hosting-live');
       } else {
@@ -274,15 +335,51 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
       return decision;
     }).catch((err) => {
       if (!scope.current()) return;
-      pushLog(`host failed: ${err.message}`);
-      stopActive(err.message);
+      pushLog(`connection attempt ended: ${err.message} - still sharing, the invitation still works`);
+      rearmHost(err.message, startedAt, true);
     });
-
-    return { ok: true };
   }
 
+  /** The session ended: wait for the next one with the same invitation. */
+  function rearmHost(reason, startedAt, failed) {
+    if (!share) return;
+    endSession(reason);
+    // Attempts that fail instantly (no network, signaling down) back off, so
+    // a broken setup never spins; anything else re-arms right away.
+    share.fails = failed && Date.now() - startedAt < 5000 ? share.fails + 1 : 0;
+    const delay = share.fails ? Math.min(30_000, 1000 * 2 ** (share.fails - 1)) : 0;
+    state.code = share.code;
+    setMode('hosting-waiting');
+    clearTimeout(share.timer);
+    share.timer = setTimeout(() => { if (share) { share.timer = null; launchHost(); } }, delay);
+    share.timer.unref?.();
+  }
+
+  /** New invitation code: the old one stops working for new connections. */
+  function newShareCode() {
+    const code = settings.newShareCode();
+    if (share) {
+      share.code = code;
+      share.approved.clear();    // a new code means: start over with who may join
+      state.code = code;
+      // Waiting (not live): restart the attempt so the new code works now.
+      if (state.mode === 'hosting-waiting' || state.mode === 'hosting-consent') {
+        endSession('new invitation code');
+        launchHost();
+      } else {
+        broadcast('state', publicState());
+      }
+    }
+    pushLog('new invitation code created; the old one no longer works');
+    return code;
+  }
+
+  // Deliberate endings: never reconnect after these.
+  const FINAL_REASON = /consent denied|refused|declined|stopped by user|stopped sharing|viewer window closed|shutting down|cancelled|new invitation|does not look right/i;
+
   async function startViewer(opts) {
-    if (active) throw new Error('a session is already running');
+    if (active || share) throw new Error('a session is already running');
+    if (viewerRetry) { clearTimeout(viewerRetry.timer); viewerRetry = null; }
     if (!opts.code) throw new Error('a share code is required');
     // Validate up front: viewer.start() runs detached, so a bad code would
     // otherwise be reported as success and only fail asynchronously.
@@ -296,7 +393,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
       throw new Error(`that share code does not look right: ${err.message}`);
     }
 
-    const viewer = new ViewerClass({
+    const viewerOpts = {
       ...commonOptions({ ...opts, rendezvous }),
       code,
       sendKbm: opts.sendKbm !== false,
@@ -304,18 +401,34 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
       lowLatency: opts.lowLatency !== false,
       overlay: (opts.overlay !== undefined ? opts.overlay : settings.get().overlay) === true,
       audio: opts.audio === true,
+    };
+    state.reconnect = null;
+    launchViewer(viewerOpts, String(opts.code).trim(), 0);
+    return { ok: true };
+  }
+
+  function launchViewer(viewerOpts, invitation, attempt) {
+    const viewer = new ViewerClass({
+      ...viewerOpts,
+      // Reconnect attempts give up sooner and try again (the loop only ends on Cancel).
+      ...(attempt ? { sessionTimeoutMs: 45_000 } : {}),
     });
 
     active = { kind: 'viewer', instance: viewer };
     const scope = bindSession(viewer);
-    setMode('connecting');
+    let wasLive = false;
+    setMode(attempt ? 'reconnecting' : 'connecting');
     scope.on('viewer-state', (v) => { state.viewerState = v; broadcast('state', publicState()); });
     scope.on('host-permissions', (p) => { state.hostPermissions = p; broadcast('state', publicState()); });
     scope.on('log', pushLog);
 
     scope.on('sas', (sas) => { state.sas = sas.phrase; broadcast('state', publicState()); });
     scope.on('secure', (t) => {
+      wasLive = true;
       state.transport = t;
+      state.reconnect = null;
+      onSessionChange?.(true);
+      try { settings.update({ lastInvitation: invitation }); } catch { /* best effort */ }
       logbook.info(`connected: ${t?.relayed ? 'relay' : 'direct'} ${t?.localType ?? ''}->${t?.remoteType ?? ''} ${t?.protocol ?? ''}`);
       setMode('viewing');
     });
@@ -326,15 +439,37 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     });
     scope.on('stats', (s) => { state.stats = s; broadcast('stats', s); logStats('view', s); });
     scope.on('error', (e) => pushLog(`error: ${e.message}`));
-    scope.on('closed', (reason) => { pushLog(`disconnected: ${reason}`); stopActive(reason); });
+    scope.on('closed', (reason) => {
+      pushLog(`disconnected: ${reason}`);
+      retryViewer(viewerOpts, invitation, reason, attempt, wasLive);
+    });
 
     viewer.start().catch((err) => {
       if (!scope.current()) return;
       pushLog(`connect failed: ${err.message}`);
-      stopActive(err.message);
+      retryViewer(viewerOpts, invitation, err.message, attempt, false);
     });
+  }
 
-    return { ok: true };
+  /**
+   * After an unexpected drop the viewer comes back by itself: quickly at
+   * first, then every 15 s at most, until it is connected again or the user
+   * presses Cancel. A first attempt that never connected is not retried
+   * (wrong code, host not sharing: the user needs to see that).
+   */
+  function retryViewer(viewerOpts, invitation, reason, attempt, wasLive) {
+    const again = settings.get().autoReconnect !== false && !FINAL_REASON.test(reason) && (wasLive || attempt > 0);
+    if (!again) { stopActive(reason); return; }
+    endSession(reason);
+    const next = wasLive ? 1 : attempt + 1;
+    const delay = next === 1 ? 300 : Math.min(15_000, 1000 * 2 ** Math.min(4, next - 2));
+    state.reconnect = { attempt: next, reason: String(reason).slice(0, 200), at: Date.now() + delay };
+    setMode('reconnecting');
+    pushLog(`reconnecting in ${(delay / 1000).toFixed(1)} s (attempt ${next})`);
+    viewerRetry = {
+      timer: setTimeout(() => { viewerRetry = null; if (!active) launchViewer(viewerOpts, invitation, next); }, delay),
+    };
+    viewerRetry.timer.unref?.();
   }
 
   /* ---------------------------- diagnostics ---------------------------- */
@@ -477,6 +612,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
           }
           case '/api/host': return json(await startHost(body));
           case '/api/connect': return json(await startViewer(body));
+          case '/api/new-code': return json({ ok: true, code: newShareCode() });
           case '/api/stop': stopActive('stopped by user'); return json({ ok: true });
           case '/api/permissions': {
             if (active?.kind !== 'host') return json({ error: 'not sharing' }, 409);
