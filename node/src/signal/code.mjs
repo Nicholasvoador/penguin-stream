@@ -2,6 +2,16 @@
  * invitation; its confidentiality depends on the full random invitation staying
  * private. This is not a password protocol. Legacy 40-bit codes are rejected.
  * Peer verification still requires SAS comparison and explicit host consent.
+ *
+ * Two kinds of code share the same 160-bit body:
+ *   - invitation  "XXXX-XXXX-…" (8 groups): someone may ASK to connect; the
+ *     host compares words and clicks Allow.
+ *   - access code "PA-XXXX-XXXX-…": unattended remote access to your own PC.
+ *     Holding it IS the permission (no prompt on the PC), so it only works
+ *     while the owner has switched remote access on.
+ * Every value derived from a code (room id, signaling key, Noise prologue,
+ * Nostr topic) is domain-separated by kind, so an invitation can never reach
+ * the remote-access listener or the other way round, even with the same body.
  */
 
 import crypto from 'node:crypto';
@@ -58,18 +68,71 @@ export function normalizeShareCode(input) {
   return canon.match(/.{4}/g).join('-');
 }
 
-function codeBytes(code) {
-  return Buffer.from(normalizeShareCode(code).replaceAll('-', ''), 'utf8');
+/** Remote access codes start with this (then the usual eight groups). */
+export const ACCESS_PREFIX = 'PA';
+
+/** A new remote access code: "PA-" + 160 random bits. */
+export function generateAccessCode() {
+  return `${ACCESS_PREFIX}-${generateShareCode()}`;
 }
+
+/** Drops the transport decorations an invitation may carry (penguin://, @url, #url). */
+function stripDecorations(input) {
+  let text = input.trim();
+  if (text.startsWith('penguin://')) text = text.slice(text.lastIndexOf('/') + 1);
+  else if (text.includes('@')) text = text.slice(0, text.indexOf('@'));
+  else if (text.includes('#')) text = text.slice(0, text.indexOf('#'));
+  return text;
+}
+
+/**
+ * Classifies and canonicalises any code.
+ * @returns {{ scope: 'invite'|'access', canonical: string, bytes: Buffer }}
+ *   canonical: "XXXX-…" for invitations, "PA-XXXX-…" for access codes;
+ *   bytes: the 32-character body, the input to every derivation
+ * @throws if it is neither
+ */
+export function codeInfo(input) {
+  if (typeof input !== 'string') throw new Error('share code must be a string');
+  const raw = stripDecorations(input).toUpperCase().replace(/[^0-9A-Z]/g, '');
+  // Unambiguous by length: an invitation that happens to start with "PA" is
+  // still 32 characters; an access code is the prefix plus 32.
+  if (raw.length === ACCESS_PREFIX.length + CODE_CHARS && raw.startsWith(ACCESS_PREFIX)) {
+    const body = normalizeShareCode(raw.slice(ACCESS_PREFIX.length));
+    return { scope: 'access', canonical: `${ACCESS_PREFIX}-${body}`, bytes: Buffer.from(body.replaceAll('-', ''), 'utf8') };
+  }
+  const body = normalizeShareCode(input);
+  return { scope: 'invite', canonical: body, bytes: Buffer.from(body.replaceAll('-', ''), 'utf8') };
+}
+
+/** True for a remote access code ("PA-…"), false for anything else. */
+export function isAccessCode(input) {
+  try { return codeInfo(input).scope === 'access'; } catch { return false; }
+}
+
+/** Canonical "PA-XXXX-…" form. @throws unless it is an access code. */
+export function normalizeAccessCode(input) {
+  const info = codeInfo(input);
+  if (info.scope !== 'access') throw new Error('not a remote access code (they start with PA-)');
+  return info.canonical;
+}
+
+// Invitation labels are the 1.x wire format: changing them breaks every
+// existing invitation. Access labels are separate so the two never meet.
+const LABELS = {
+  invite: { room: 'penguin-stream room v2', salt: 'penguin-stream signaling salt v2', prologue: 'penguin-stream prologue v2' },
+  access: { room: 'penguin-stream access room v1', salt: 'penguin-stream access signaling salt v1', prologue: 'penguin-stream access prologue v1' },
+};
 
 /**
  * Room identifier handed to the rendezvous server. A malicious server can attempt guesses; 160-bit random invitations make
  * exhaustive guessing infeasible. Do not replace invitations with passwords.
  */
 export function roomIdFor(code) {
+  const { scope, bytes } = codeInfo(code);
   return crypto.createHash('sha256')
-    .update('penguin-stream room v2')
-    .update(codeBytes(code))
+    .update(LABELS[scope].room)
+    .update(bytes)
     .digest('hex')
     .slice(0, 32);
 }
@@ -79,10 +142,11 @@ export function roomIdFor(code) {
  * Derived from the code, so only someone holding the code can read them.
  */
 export function signalingKey(code) {
+  const { scope, bytes } = codeInfo(code);
   return Buffer.from(crypto.hkdfSync(
     'sha256',
-    codeBytes(code),
-    Buffer.from('penguin-stream signaling salt v2'),
+    bytes,
+    Buffer.from(LABELS[scope].salt),
     Buffer.from('signaling'),
     32,
   ));
@@ -90,12 +154,15 @@ export function signalingKey(code) {
 
 /**
  * Binds the Noise transcript to the code and to both roles, so a handshake
- * captured in one room cannot be replayed into another.
+ * captured in one room cannot be replayed into another. For access codes this
+ * is also what makes "has the code" checkable: a peer without it cannot
+ * complete the handshake, so the host never gets as far as asking.
  */
 export function noisePrologue(code) {
+  const { scope, bytes } = codeInfo(code);
   return crypto.createHash('sha256')
-    .update('penguin-stream prologue v2')
-    .update(codeBytes(code))
+    .update(LABELS[scope].prologue)
+    .update(bytes)
     .digest();
 }
 
@@ -131,6 +198,7 @@ export function openSignal(key, b64) {
  *   - "penguin://host:port/K7QA-3ZM2-..."
  *   - "K7QA-3ZM2-...#ws://host:port"
  *   - Standard bare invitation "K7QA-3ZM2-..."
+ *   - Remote access code "PA-K7QA-3ZM2-..." (scope 'access'), same suffixes
  */
 export function parseInvitation(input) {
   if (typeof input !== 'string') throw new Error('invitation must be a string');
@@ -152,6 +220,6 @@ export function parseInvitation(input) {
     rendezvousUrl = raw.slice(hash + 1).trim();
     raw = raw.slice(0, hash);
   }
-  const code = normalizeShareCode(raw);
-  return { code, rendezvousUrl };
+  const { scope, canonical } = codeInfo(raw);
+  return { code: canonical, rendezvousUrl, scope };
 }

@@ -23,7 +23,7 @@ import { EventEmitter } from 'node:events';
 import { WebSocket } from 'ws';
 
 import {
-  generateShareCode, normalizeShareCode, roomIdFor,
+  generateShareCode, codeInfo, roomIdFor,
   signalingKey, noisePrologue, sealSignal, openSignal,
 } from './code.mjs';
 import { NostrChannel, nostrTopicFor } from './nostr.mjs';
@@ -41,6 +41,12 @@ const PARTNER_STALE_MS = 3 * RESEND_INTERVAL_MS;
 // From first contact to SECURE, including the host's consent prompt (the UI
 // gives the host 120 s to answer).
 const HANDSHAKE_TIMEOUT_MS = 180_000;
+// Remote access codes live for months on public relays, so their signals
+// carry the sender's clock and stale ones are ignored: a relay that recorded
+// an old connection cannot replay it later to keep the listener busy.
+// Generous enough for badly set clocks.
+const ACCESS_MAX_SKEW_MS = 10 * 60_000;
+const SPENT_PARTNERS_MAX = 512;
 
 export function nostrEnabled(option) {
   if (option === true || option === false) return option;
@@ -95,10 +101,11 @@ class RendezvousChannel extends EventEmitter {
 async function run({
   role, code, rendezvousUrl, nostr, nostrRelays, identity, iceServers, iceTransportPolicy,
   onConsentRequest, onCode, onStatus, onHandshake, sessionTimeoutMs = 60_000, signal,
+  spentPartners = null,
 }) {
   if (signal?.aborted) throw new Error('cancelled');
-  const canonical = normalizeShareCode(code);
-  const codeBytes = Buffer.from(canonical.replaceAll('-', ''), 'utf8');
+  const { scope, canonical, bytes: codeBytes } = codeInfo(code);
+  const access = scope === 'access';
   const key = signalingKey(canonical);
   const prologue = noisePrologue(canonical);
   const status = (s, detail) => onStatus?.(s, detail);
@@ -110,18 +117,28 @@ async function run({
   // --- transports -----------------------------------------------------------
   const channels = [];
   if (rendezvousUrl) {
+    let ws = null;
     try {
-      const ws = await openSocket(rendezvousUrl);
-      channels.push(new RendezvousChannel(ws, roomIdFor(canonical), role));
+      ws = await openSocket(rendezvousUrl);
     } catch (err) {
       if (!useNostr) throw err;
       status('rendezvous-unavailable', err.message);
     }
+    // Stopped while the socket was opening: an abort that already happened
+    // never fires a listener added later, so without this the attempt kept
+    // listening forever (a "zombie" host that answered the next viewer and
+    // refused it). Seen with a self-hosted rendezvous in 1.4.x.
+    if (signal?.aborted) {
+      try { ws?.close(); } catch { /* closing */ }
+      throw Object.assign(new Error('cancelled'), { code: 'CANCELLED' });
+    }
+    if (ws) channels.push(new RendezvousChannel(ws, roomIdFor(canonical), role));
   }
   if (useNostr) {
-    const { topic, kind } = nostrTopicFor(codeBytes);
+    const { topic, kind } = nostrTopicFor(codeBytes, scope);
     const channel = new NostrChannel({ topic, kind, ...(nostrRelays ? { relays: nostrRelays } : {}) });
     channel.on('relay-error', (url, message) => status('nostr-relay-error', `${url}: ${message}`));
+    channel.on('relays', (n) => status('nostr-relays', n));
     channels.push(channel.start());
   }
 
@@ -152,12 +169,14 @@ async function run({
   // capture or a stream window afterwards.
   const onAbort = () => finish(Object.assign(new Error('cancelled'), { code: 'CANCELLED' }));
   signal?.addEventListener('abort', onAbort, { once: true });
+  if (signal?.aborted) queueMicrotask(onAbort);   // after the setup below (finish() uses waitTimer)
 
   const broadcast = (entries) => {
     if (signalingDone) return;
     let payload;
     try {
-      payload = sealSignal(key, { v: 2, from: self, role, ...(partner ? { to: partner } : {}), entries });
+      payload = sealSignal(key, { v: 2, from: self, role, ...(partner ? { to: partner } : {}),
+        ...(access ? { ts: Date.now() } : {}), entries });
     } catch (err) {
       // Runs from timers: an escaped throw here is an uncaught exception that
       // kills the Electron main process. Fail the session instead.
@@ -239,8 +258,19 @@ async function run({
     if (!msg || msg.v !== 2 || typeof msg.from !== 'string' || !Array.isArray(msg.entries)) return;
     if (msg.from === self || msg.role === role) return;
     if (msg.to && msg.to !== self) return;               // addressed to another session
+    if (access && !(Number.isFinite(msg.ts) && Math.abs(Date.now() - msg.ts) <= ACCESS_MAX_SKEW_MS)) {
+      status('signal-stale');                            // replayed or from a badly wrong clock
+      return;
+    }
     if (partner === null) {
+      // A viewer session this listener already dealt with never gets a second
+      // attempt: a real viewer retries with a fresh session id.
+      if (spentPartners?.has(msg.from)) { status('signal-replay'); return; }
       partner = msg.from;
+      if (spentPartners) {
+        spentPartners.add(partner);
+        if (spentPartners.size > SPENT_PARTNERS_MAX) spentPartners.delete(spentPartners.values().next().value);
+      }
       partnerSeenAt = Date.now();
       status('peer-joined');
       if (!peer) createPeer();

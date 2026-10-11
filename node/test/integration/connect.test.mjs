@@ -213,19 +213,28 @@ test('rendezvous server never sees the share code or plaintext signaling', async
 test('parseInvitation extracts codes and optional embedded rendezvous URLs', () => {
   const code = 'K7QA-3ZM2-K7QA-3ZM2-K7QA-3ZM2-K7QA-3ZM2';
   // Bare code
-  assert.deepEqual(parseInvitation(code), { code, rendezvousUrl: undefined });
+  assert.deepEqual(parseInvitation(code), { code, rendezvousUrl: undefined, scope: 'invite' });
   // With @ws://
   assert.deepEqual(parseInvitation(`${code}@ws://192.168.1.50:8787`), {
     code,
     rendezvousUrl: 'ws://192.168.1.50:8787',
+    scope: 'invite',
   });
   // With penguin:// scheme
   assert.deepEqual(parseInvitation(`penguin://relay.example.com:8787/${code}`), {
     code,
     rendezvousUrl: 'ws://relay.example.com:8787',
+    scope: 'invite',
   });
   // normalizeShareCode also tolerates embedded URL
   assert.equal(normalizeShareCode(`${code}@ws://1.2.3.4:8787`), code);
+  // Remote access codes ("PA-" + the same body) are recognised, sloppily typed or not
+  assert.deepEqual(parseInvitation(`PA-${code}`), { code: `PA-${code}`, rendezvousUrl: undefined, scope: 'access' });
+  assert.deepEqual(parseInvitation(` pa ${code.toLowerCase().replaceAll('-', ' ')} `), { code: `PA-${code}`, rendezvousUrl: undefined, scope: 'access' });
+  assert.deepEqual(parseInvitation(`PA-${code}@ws://192.168.1.50:8787`),
+    { code: `PA-${code}`, rendezvousUrl: 'ws://192.168.1.50:8787', scope: 'access' });
+  // ...and never accepted where only an invitation makes sense
+  assert.throws(() => normalizeShareCode(`PA-${code}`), /32 characters/);
 });
 
 test('resolveIceServers provides resilient STUN defaults for P2P and respects overrides', () => {

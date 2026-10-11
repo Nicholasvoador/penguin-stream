@@ -147,8 +147,7 @@ async function cmdHost(args) {
         `${((lastHostStats.bytesSent || 0) / 1e6).toFixed(1)} MB encoded`);
     }
     console.log(`${c.yellow}session ended: ${reason}${c.reset}`);
-    cleanupTransport();
-    process.exit(0);
+    void cleanupTransport().finally(() => process.exit(0));
   });
 
   const autoAccept = Boolean(args.yes);
@@ -251,8 +250,7 @@ async function cmdConnect(args) {
         (lastViewerStats.dropped ? `, ${lastViewerStats.dropped} frames dropped` : ''));
     }
     console.log(`${c.yellow}disconnected: ${reason}${c.reset}`);
-    cleanupTransport();
-    process.exit(0);
+    void cleanupTransport().finally(() => process.exit(0));
   });
 
   await viewer.start();
@@ -424,6 +422,5 @@ try {
 } catch (err) {
   console.error(`${c.red}${err.message}${c.reset}`);
   if (process.env.PENGUIN_DEBUG) console.error(err.stack);
-  cleanupTransport();
-  process.exit(1);
+  void cleanupTransport().finally(() => process.exit(1));
 }

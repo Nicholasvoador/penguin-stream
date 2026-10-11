@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { configDir } from '../crypto/identity.mjs';
-import { generateShareCode, normalizeShareCode, parseInvitation } from '../signal/code.mjs';
+import { generateShareCode, normalizeShareCode, parseInvitation, generateAccessCode, normalizeAccessCode } from '../signal/code.mjs';
 
 export const RELAY_MODES = ['none', 'cloudflare', 'url', 'manual'];
 const SECRETS = ['cfToken', 'turnPassword'];
@@ -76,6 +76,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
   shareCode: '',             // created on first share; never shown in diagnostics
   lastInvitation: '',        // viewer: the last invitation that connected (one-click reconnect)
   autoReconnect: true,       // viewer retries after a drop; host re-admits a device it approved this share
+  // Remote access (unattended): OFF unless the owner switches it on. The code
+  // ("PA-…") opens this PC without a prompt, so it is a secret like a password:
+  // never in publicSettings(), logs or diagnostics.
+  remoteAccess: false,
+  accessCode: '',
+  remoteKeepAwake: true,     // while remote access is on, the PC does not go to sleep by itself
+  startAtLogin: false,       // desktop app: start (hidden) when you log in
   relay: Object.freeze({
     mode: 'none', cfKeyId: '', cfToken: '', url: '', turn: '', turnUser: '', turnPassword: '',
   }),
@@ -154,7 +161,11 @@ export function sanitizeSettings(input = {}) {
   if (typeof input.lastInvitation === 'string' && input.lastInvitation.length <= 512) {
     try { if (input.lastInvitation === '' || parseInvitation(input.lastInvitation)) out.lastInvitation = input.lastInvitation.trim(); } catch { /* invalid */ }
   }
-  for (const k of ['lowLatency', 'overlay', 'adaptiveBitrate', 'audio', 'audioExcludeVoice', 'allowInput', 'allowGamepad', 'sendKbm', 'sendPad', 'forceRelay', 'noStun', 'autoReconnect']) {
+  if (typeof input.accessCode === 'string') {
+    try { out.accessCode = input.accessCode === '' ? '' : normalizeAccessCode(input.accessCode); } catch { /* invalid: ignore */ }
+  }
+  for (const k of ['lowLatency', 'overlay', 'adaptiveBitrate', 'audio', 'audioExcludeVoice', 'allowInput', 'allowGamepad', 'sendKbm', 'sendPad', 'forceRelay', 'noStun', 'autoReconnect',
+    'remoteAccess', 'remoteKeepAwake', 'startAtLogin']) {
     if (typeof input[k] === 'boolean') out[k] = input[k];
   }
   set('stun', str(input.stun));
@@ -247,6 +258,17 @@ export class SettingsStore {
     return this.update({ shareCode: generateShareCode() }).shareCode;
   }
 
+  /** This PC's remote access code: the saved one, or a new one saved on first use. */
+  accessCode() {
+    if (!this.values.accessCode) this.update({ accessCode: generateAccessCode() });
+    return this.values.accessCode;
+  }
+
+  /** Replaces the remote access code (the old one stops working). */
+  newAccessCode() {
+    return this.update({ accessCode: generateAccessCode() }).accessCode;
+  }
+
   /** Safe to hand to the UI: secrets become booleans. */
   publicSettings() {
     const v = this.get();
@@ -255,6 +277,8 @@ export class SettingsStore {
     // diagnostics. The UI gets them through the session state instead.
     delete v.shareCode;
     delete v.lastInvitation;
+    // The access code opens this PC: only /api/remote-access hands it out.
+    delete v.accessCode;
     v.builtinProfiles = BUILTIN_PROFILES;
     for (const k of SECRETS) {
       v.relay[`${k}Set`] = Boolean(v.relay[k]);

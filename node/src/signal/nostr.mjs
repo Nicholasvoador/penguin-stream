@@ -47,13 +47,28 @@ export const DEFAULT_NOSTR_RELAYS = [
 const REDUNDANCY = 6;          // relays used per session
 const CONNECT_TIMEOUT_MS = 8000;
 const MAX_CONTENT = 32 * 1024; // relays commonly cap events around 64 KiB
+// A host may listen for days (a share waits until Stop; remote access waits
+// until it is switched off). Relays restart, Wi-Fi drops, routers reboot:
+// keep coming back, slowing down to once a minute, and never give up.
+// (1.4.x stopped after 4 failed attempts, ~15 s, leaving a deaf listener.)
+const RECONNECT_BASE_MS = 1500;
+const RECONNECT_MAX_MS = 60_000;
+// A socket can die silently (NAT timeout, suspend/resume, changed address):
+// no 'close' for minutes or hours. Ping it; no pong in time means dead.
+const PING_INTERVAL_MS = 30_000;
 
 const toHex = (u8) => Buffer.from(u8).toString('hex');
 
-/** Topic and event kind for an invitation. Unlinkable to the WS room id. */
-export function nostrTopicFor(canonicalCodeBytes) {
+/**
+ * Topic and event kind for a code. Unlinkable to the WS room id, and
+ * domain-separated: an access code ("PA-…") lives on a different topic from
+ * an invitation with the same body.
+ * @param {Buffer} canonicalCodeBytes the 32-character code body
+ * @param {'invite'|'access'} [scope]
+ */
+export function nostrTopicFor(canonicalCodeBytes, scope = 'invite') {
   const topic = crypto.createHash('sha256')
-    .update('penguin-stream nostr topic v1')
+    .update(scope === 'access' ? 'penguin-stream access nostr topic v1' : 'penguin-stream nostr topic v1')
     .update(canonicalCodeBytes)
     .digest('hex')
     .slice(0, 40);
@@ -86,11 +101,13 @@ export function pickRelays(list, n, topic) {
  * topic; 'data' fires with each distinct payload from someone else.
  *
  * Emits: 'open' (first relay subscribed), 'data' (string), 'relay-error'
- * (url, message), 'closed'.
+ * (url, message), 'relays' (number of relays currently subscribed), 'closed'.
  */
 export class NostrChannel extends EventEmitter {
-  constructor({ topic, kind, relays = relayList(), redundancy = REDUNDANCY, WebSocketImpl = WebSocket } = {}) {
+  constructor({ topic, kind, relays = relayList(), redundancy = REDUNDANCY, WebSocketImpl = WebSocket,
+    reconnectBaseMs = RECONNECT_BASE_MS, reconnectMaxMs = RECONNECT_MAX_MS, pingIntervalMs = PING_INTERVAL_MS } = {}) {
     super();
+    this.timing = { reconnectBaseMs, reconnectMaxMs, pingIntervalMs };
     if (!/^[0-9a-f]{40}$/.test(topic) || !Number.isInteger(kind)) throw new Error('invalid nostr topic');
     this.topic = topic;
     this.kind = kind;
@@ -100,8 +117,9 @@ export class NostrChannel extends EventEmitter {
     this.secretKey = secretKey;
     this.pubkey = toHex(publicKey);
     this.subId = crypto.randomBytes(8).toString('hex');
-    this.sockets = new Map();   // url -> { ws, open }
-    this.attempts = new Map();  // url -> reconnect attempts
+    this.sockets = new Map();   // url -> { ws, open, alive, ping }
+    this.attempts = new Map();  // url -> consecutive failed attempts
+    this.retries = new Set();   // pending reconnect timers
     this.seen = new Set();
     this.closed = false;
     this.opened = false;
@@ -124,7 +142,7 @@ export class NostrChannel extends EventEmitter {
       this.emit('relay-error', url, err.message);
       return;
     }
-    const entry = { ws, open: false };
+    const entry = { ws, open: false, alive: true, ping: null };
     this.sockets.set(url, entry);
     const timer = setTimeout(() => { if (!entry.open) ws.terminate?.(); }, CONNECT_TIMEOUT_MS);
     timer.unref?.();
@@ -137,21 +155,40 @@ export class NostrChannel extends EventEmitter {
       // `since` a little in the past tolerates clock skew between machines.
       const since = Math.floor(Date.now() / 1000) - 60;
       ws.send(JSON.stringify(['REQ', this.subId, { kinds: [this.kind], '#x': [this.topic], since }]));
+      if (typeof ws.ping === 'function') {
+        entry.ping = setInterval(() => {
+          if (!entry.alive) { ws.terminate?.(); return; }   // missed a whole interval: dead
+          entry.alive = false;
+          try { ws.ping(); } catch { /* closing */ }
+        }, this.timing.pingIntervalMs);
+        entry.ping.unref?.();
+      }
+      this.emit('relays', this.connectedRelays);
       if (!this.opened) { this.opened = true; this.emit('open'); }
     });
-    ws.on('message', (raw) => this.#onMessage(url, raw));
+    ws.on('pong', () => { entry.alive = true; });
+    ws.on('message', (raw) => { entry.alive = true; this.#onMessage(url, raw); });
     ws.on('error', (err) => this.emit('relay-error', url, err.message));
     ws.on('close', () => {
       clearTimeout(timer);
+      clearInterval(entry.ping);
+      const wasOpen = entry.open;
       entry.open = false;
-      this.sockets.delete(url);
-      // Relays drop idle or busy clients; come back a few times with backoff.
+      if (this.sockets.get(url) === entry) this.sockets.delete(url);
+      if (wasOpen && !this.closed) this.emit('relays', this.connectedRelays);
+      if (this.closed) return;
+      // Relays drop idle or busy clients and go away for a while: come back
+      // with exponential backoff (jittered so many clients do not stampede).
       const attempt = (this.attempts.get(url) ?? 0) + 1;
       this.attempts.set(url, attempt);
-      if (!this.closed && attempt <= 4) {
-        const t = setTimeout(() => { if (!this.closed) this.#connect(url); }, 1500 * attempt);
-        t.unref?.();
-      }
+      const { reconnectBaseMs, reconnectMaxMs } = this.timing;
+      const delay = Math.min(reconnectMaxMs, reconnectBaseMs * 2 ** Math.min(attempt - 1, 6)) * (0.8 + Math.random() * 0.4);
+      const retry = setTimeout(() => {
+        this.retries.delete(retry);
+        if (!this.closed) this.#connect(url);
+      }, delay);
+      retry.unref?.();
+      this.retries.add(retry);
     });
   }
 
@@ -204,7 +241,10 @@ export class NostrChannel extends EventEmitter {
   close() {
     if (this.closed) return;
     this.closed = true;
-    for (const { ws, open } of this.sockets.values()) {
+    for (const t of this.retries) clearTimeout(t);
+    this.retries.clear();
+    for (const { ws, open, ping } of this.sockets.values()) {
+      clearInterval(ping);
       try {
         if (open) ws.send(JSON.stringify(['CLOSE', this.subId]));
         ws.close();

@@ -1,5 +1,58 @@
 # Changelog
 
+## 1.5.0 — 2026-10-10
+
+Unattended access: reach your own PC from anywhere with nobody there to click *Allow*. It is **off until you switch it
+on**. Invitations are unchanged — 1.5.0 talks to 1.4.1, 1.4.0 and 1.3.1 exactly as before — but remote access itself
+needs 1.5.0 on **both** the PC and the device you connect from.
+
+### New: remote access, off by default
+- The **access code is not a password**: it is 160 random bits made by the app (`PA-…`, eight groups of four) and is
+  never handed to this PC's logs, diagnostics or settings API. Signaling reaches a Nostr topic derived from the code,
+  and the encrypted handshake uses a prologue derived from it, so a device without the code cannot find the PC or
+  finish the handshake. Holding the code *is* the permission, so no prompt appears at the PC.
+- **Every session is visible at the PC**: a banner with **End session**, a desktop notification, the device's
+  fingerprint and route (direct or relayed) in Activity, and a log entry. **New code** retires the old one at once and
+  ends a session using it; **Turn off** stops listening and ends a live session.
+- **One session at a time.** Remote access pauses while you are sharing or viewing, and resumes when that ends. A
+  friend merely *waiting* on your invitation steps aside for the remote session and gets the same invitation back
+  afterwards.
+- **The app stays alive while it is on**: closing the window leaves it in the tray, *Start Penguin Stream when I log
+  in* starts it hidden, and the PC is kept from suspending.
+- **Replay protection for a long-lived code**: signals carry a timestamp (stale ones are dropped) and each PC
+  remembers its last 512 partners, so a captured signal cannot be replayed at it.
+
+### Fixed
+- **Exiting the app could segfault.** The WebRTC library was freed while a connection was still finishing its close
+  (`DataChannelWrapper::CloseAll` destroying a callback in flight). The app now waits — bounded to 1 s — for those
+  closes first, on every shutdown path. Reproduced 4 times in 5 runs before, 0 in 10 after.
+- **A hidden host could keep a PC busy forever (1.4.x).** Pressing Stop while the app was still opening its connection
+  to the relay left a listener behind that refused the next viewer with *"declined"*. Fixed, with a regression test
+  that fails on 1.4.1.
+
+### Wayland: the one-time permission is remembered properly
+- The engine now registers itself with the desktop portal as `penguin-stream` before asking for screen access, so the
+  grant it saves matches the identity it uses every time, whichever way the app was started (menu, autostart, or a
+  terminal). Grants saved by an older build under a different identity are not offered to a new one, which is what a
+  permission prompt on an unattended session looks like.
+- **Real-desktop check (Fedora 44, KDE Plasma 6.7.5, Wayland):** one click to allow screen sharing with *restoring*
+  ticked (8.4 s to answer), then an unattended session: **no prompt**, first video 1.64 s after the viewer connected,
+  1080p60, 480 frames in 8 s, keyboard/mouse ready, *End session* worked and the grant was renewed.
+- If a saved grant has stopped working (revoked, reset, or saved under another identity), the session that could not
+  start now clears it, tells the owner, and the Remote access card asks for the one-time setup again instead of
+  silently failing again.
+
+### Latency: remote access does not cost a frame
+- Measured with a live 1080p60 NVENC share, 20 s per round, 3 rounds: keeping the listener running beside the share
+  moved p50 from 0.770 ms to 0.783 ms (p95 0.787 → 0.803 ms) in every round, so remote access now **pauses for the
+  duration of any other session**. With that, the same measurement is unchanged: p50 0.777 → 0.777 ms,
+  p95 0.790 → 0.793 ms.
+
+### Tests
+- 185 automated tests (36 new). Where the behaviour already existed in 1.4.1 the new tests fail on that code
+  (the lingering listener, the Nostr reconnect, and the screen-grant recovery — checked by putting the old defect
+  back and watching the test fail); the rest cover endpoints and code that only exist in 1.5.0.
+
 ## 1.4.1 — 2026-09-29
 
 Bug fixes and a small latency cut. Same wire protocol: 1.4.1 talks to 1.4.0 and 1.3.1.

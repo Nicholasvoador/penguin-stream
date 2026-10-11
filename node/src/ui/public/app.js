@@ -607,7 +607,23 @@ function render(state, statsOnly = false) {
     case 'hosting-live': {
       $('code-display').textContent = state.code || 'Preparing invitation…';
       const s = $('host-status');
-      if (state.mode === 'hosting-live') {
+      const remoteLive = state.mode === 'hosting-live' && state.remote?.live;
+      $('remote-live').hidden = !remoteLive;
+      $('host-steps').hidden = Boolean(remoteLive);
+      $('host-stop').textContent = remoteLive ? 'End remote session' : 'Stop sharing';
+      if (remoteLive) {
+        const r = state.remote.live;
+        const t = state.transport || state.stats?.transport;
+        $('remote-live-text').textContent = `Someone connected with this PC's access code (device ${r.fingerprint}). ` +
+          'They can see and control this PC. End the session if you did not expect it, and make a new code.';
+        $('remote-live-since').textContent = `since ${new Date(r.since).toLocaleTimeString()}`;
+        s.textContent = t?.relayed ? 'Remote access — streaming through a relay' : 'Remote access — streaming directly peer-to-peer';
+        s.className = 'status-banner live';
+        setPill('Remote access live', 'live');
+        $('invite-card').hidden = true;
+        $('page-title').textContent = 'Remote access';
+        renderMetrics('host', state);
+      } else if (state.mode === 'hosting-live') {
         const t = state.transport || state.stats?.transport;
         s.textContent = t?.relayed ? 'Live — streaming through your relay' : 'Live — streaming directly peer-to-peer';
         s.className = 'status-banner live';
@@ -629,7 +645,8 @@ function render(state, statsOnly = false) {
     case 'connecting':
     case 'reconnecting':
     case 'viewing': {
-      if (state.sas) { $('viewer-sas').hidden = false; renderSasWords($('viewer-sas-words'), state.sas); }
+      // Access codes: holding the code is the permission, nobody compares words.
+      if (state.sas && !state.viewerAccess) { $('viewer-sas').hidden = false; renderSasWords($('viewer-sas-words'), state.sas); }
       else $('viewer-sas').hidden = true;
       const s = $('viewer-status');
       if (state.mode === 'reconnecting') {
@@ -640,10 +657,15 @@ function render(state, statsOnly = false) {
         $('viewer-metrics').hidden = true;
       } else if (state.mode === 'viewing') {
         const t = state.stats?.transport?.connected ? state.stats.transport : state.transport;
-        s.textContent = t?.relayed ? 'Connected through a relay' : 'Connected directly peer-to-peer';
+        s.textContent = `${state.viewerAccess ? 'Connected to your PC' : 'Connected'} ${t?.relayed ? 'through a relay' : 'directly peer-to-peer'}`;
         s.className = 'status-banner live';
         setPill('Connected', 'live');
         renderMetrics('viewer', state);
+      } else if (state.viewerAccess) {
+        s.textContent = 'Finding your PC and securing the connection…';
+        s.className = 'status-banner';
+        setPill('Connecting…', 'wait');
+        $('viewer-metrics').hidden = true;
       } else {
         s.textContent = state.sas ? 'Read the four words below to the host — they approve you when the words match.'
           : 'Finding the host and securing the connection…';
@@ -658,6 +680,11 @@ function render(state, statsOnly = false) {
   }
 
   $('reconnect-last').hidden = !state.lastInvitation || state.mode !== 'idle';
+  const lastIsAccess = looksLikeAccessCode(state.lastInvitation || '');
+  $('btn-reconnect-last').textContent = lastIsAccess ? 'Connect to your PC' : 'Reconnect to the last host';
+  $('reconnect-last-hint').textContent = lastIsAccess ? 'Uses the access code you saved on this device.'
+    : 'Uses the invitation that worked last time. The host keeps the same one unless they make a new code.';
+  renderRemote(state);
 
   if (state.pendingConsent) showConsent(state.pendingConsent);
   else $('consent-overlay').hidden = true;
@@ -724,6 +751,15 @@ $('new-code').onclick = async () => {
   } catch (e) { toast(e.message, true); }
 };
 
+/** "PA-" + 32 code characters, however it was typed. */
+function looksLikeAccessCode(text) {
+  const raw = String(text).split(/[@#]/)[0].toUpperCase().replace(/[^0-9A-Z]/g, '');
+  return raw.length === 34 && raw.startsWith('PA');
+}
+$('code-input').addEventListener('input', () => {
+  $('remember-row').hidden = !looksLikeAccessCode($('code-input').value);
+});
+
 $('connect-form').onsubmit = async (e) => {
   e.preventDefault();
   const code = $('code-input').value.trim();
@@ -733,10 +769,131 @@ $('connect-form').onsubmit = async (e) => {
       code, ...sessionOptions(), overlay: settings?.overlay === true,
       sendKbm: $('view-send-kbm').checked,
       sendPad: $('view-send-pad').checked,
+      remember: looksLikeAccessCode(code) && $('code-remember').checked,
     });
     $('code-input').value = '';
+    $('remember-row').hidden = true;
+    $('code-remember').checked = false;
     refresh();
   } catch (err) { toast(err.message, true); }
+};
+
+/* ------------------------------ remote access ------------------------------ */
+
+let remoteCode = null;     // fetched only when needed; never part of the broadcast state
+let remoteShown = false;
+const MASKED = 'PA-••••-••••-••••-••••-••••-••••-••••-••••';
+
+function renderRemote(state) {
+  const r = state.remote || { enabled: false };
+  $('remote-toggle').checked = r.enabled;
+  $('remote-details').hidden = !r.enabled;
+  if (!r.enabled) {
+    $('remote-hint').textContent = 'Off — nobody can connect without you';
+    remoteCode = null;
+    remoteShown = false;
+    return;
+  }
+  $('remote-hint').textContent = r.status === 'live' ? 'In use right now' : 'On';
+  const st = $('remote-status');
+  if (r.status === 'live') {
+    st.textContent = `Someone is using this PC right now (device ${r.live?.fingerprint ?? '?'}).`;
+    st.className = 'status-banner warn';
+  } else if (r.status === 'paused') {
+    st.textContent = 'Paused while this PC is in another session — it listens again as soon as that ends.';
+    st.className = 'status-banner';
+  } else if (r.status === 'ready') {
+    st.textContent = r.relays === null ? 'Ready — waiting for your access code'
+      : `Ready — reachable from anywhere (${r.relays} relay${r.relays === 1 ? '' : 's'} listening)`;
+    st.className = 'status-banner live';
+  } else {
+    st.textContent = `Connecting to the internet relays…${r.lastError ? ` (last problem: ${r.lastError})` : ''}`;
+    st.className = 'status-banner';
+  }
+  $('remote-code').textContent = remoteShown && remoteCode ? remoteCode : MASKED;
+  $('remote-show').textContent = remoteShown ? 'Hide' : 'Show';
+  $('remote-setup').hidden = !r.needsSetup;
+  $('remote-login-row').hidden = r.startAtLogin === null;
+  $('remote-login').checked = r.startAtLogin === true;
+  $('remote-awake').checked = r.keepAwake !== false;
+}
+
+const remoteAction = (action, extra = {}) => api('remote-access', { action, ...extra });
+async function getRemoteCode() {
+  if (!remoteCode) remoteCode = (await api('remote-access')).code;
+  return remoteCode;
+}
+
+$('remote-toggle').onchange = async () => {
+  const el = $('remote-toggle');
+  if (el.checked) {
+    if (!confirm('Turn on remote access?\n\nAnyone who has this PC\'s access code can see and control it — without anyone here clicking Allow. ' +
+      'Keep the code private, like a password, and use it on your own devices only.\n\nYou can turn it off or make a new code at any time.')) {
+      el.checked = false;
+      return;
+    }
+    try { remoteCode = (await remoteAction('enable')).code; toast('Remote access is on. Copy the access code to your other device.'); }
+    catch (e) { el.checked = false; toast(e.message, true); }
+  } else {
+    if (lastState?.remote?.live && !confirm('Someone is connected right now. Turn off remote access and end their session?')) {
+      el.checked = true;
+      return;
+    }
+    try { await remoteAction('disable'); remoteCode = null; remoteShown = false; toast('Remote access is off'); }
+    catch (e) { el.checked = true; toast(e.message, true); }
+  }
+  refresh();
+};
+$('remote-show').onclick = async () => {
+  remoteShown = !remoteShown;
+  if (remoteShown) { try { await getRemoteCode(); } catch (e) { remoteShown = false; toast(e.message, true); } }
+  if (lastState) renderRemote(lastState);
+};
+$('remote-copy').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(await getRemoteCode());
+    $('remote-copy-status').textContent = '✓ Copied — paste it into Penguin Stream on your other device';
+  } catch (e) {
+    $('remote-copy-status').textContent = `Could not copy: ${e.message}. Click Show and copy it by hand.`;
+  }
+  setTimeout(() => { $('remote-copy-status').textContent = ''; }, 5000);
+};
+$('remote-new').onclick = async () => {
+  if (!confirm('Make a new access code?\n\nThe current code stops working immediately, and a session using it ends. ' +
+    'Your other devices will need the new code.')) return;
+  try {
+    remoteCode = (await remoteAction('new-code')).code;
+    $('remote-copy-status').textContent = 'New code created — the old one no longer works';
+    refresh();
+  } catch (e) { toast(e.message, true); }
+};
+$('remote-prepare').onclick = async () => {
+  const btn = $('remote-prepare');
+  btn.disabled = true;
+  $('remote-prepare-status').textContent = 'Look for the permission prompt on this screen…';
+  try {
+    await remoteAction('prepare');
+    $('remote-prepare-status').textContent = '✓ Saved — remote sessions now start without a prompt';
+  } catch (e) {
+    $('remote-prepare-status').textContent = `✗ ${e.message}`;
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+};
+$('remote-login').onchange = async () => {
+  const el = $('remote-login');
+  try { await remoteAction('start-at-login', { on: el.checked }); }
+  catch (e) { el.checked = !el.checked; toast(e.message, true); }
+};
+$('remote-end').onclick = async () => {
+  try { await remoteAction('end-session'); } catch (e) { toast(e.message, true); }
+  refresh();
+};
+$('remote-off-live').onclick = async () => {
+  if (!confirm('Turn off remote access? The current session ends and the access code stops working until you turn it on again.')) return;
+  try { await remoteAction('disable'); remoteCode = null; remoteShown = false; } catch (e) { toast(e.message, true); }
+  refresh();
 };
 
 const livePermissions = async () => {

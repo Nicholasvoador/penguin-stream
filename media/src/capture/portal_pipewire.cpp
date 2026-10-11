@@ -479,6 +479,28 @@ class PortalSource : public CaptureSource {
     return true;
   }
 
+  // Tell xdg-desktop-portal which app this is (host Registry, portal >= 1.19).
+  // Otherwise a host app's identity comes from the systemd scope it was
+  // started in, which differs between the menu, autostart and a terminal; a
+  // screen grant saved under one identity is not offered to another, so an
+  // unattended session would hit a permission prompt. Must be the first portal
+  // call on this connection (creating a proxy already reads its properties).
+  // Best effort: older portals lack the interface, and it fails harmlessly
+  // without a matching .desktop file (development runs) or when this
+  // connection is already registered.
+  void registerAppId() {
+    const char* appId = std::getenv("PS_PORTAL_APP_ID");
+    if (!appId || !*appId) appId = "penguin-stream";
+    GVariantBuilder opts;
+    g_variant_builder_init(&opts, G_VARIANT_TYPE("a{sv}"));
+    GError* gerr = nullptr;
+    GVariant* r = g_dbus_connection_call_sync(conn_, kPortalBus, kPortalPath, "org.freedesktop.host.portal.Registry",
+                                              "Register", g_variant_new("(sa{sv})", appId, &opts), nullptr,
+                                              G_DBUS_CALL_FLAGS_NONE, 2000, nullptr, &gerr);
+    if (r) g_variant_unref(r);
+    if (gerr) g_error_free(gerr);
+  }
+
   bool openPortalSession(std::string& error) {
     GError* gerr = nullptr;
     conn_ = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &gerr);
@@ -487,6 +509,7 @@ class PortalSource : public CaptureSource {
       if (gerr) g_error_free(gerr);
       return false;
     }
+    registerAppId();
 
     proxy_ = g_dbus_proxy_new_sync(conn_, G_DBUS_PROXY_FLAGS_NONE, nullptr,
                                    kPortalBus, kPortalPath, kScreenCastIface, nullptr, &gerr);

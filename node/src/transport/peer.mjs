@@ -208,6 +208,7 @@ export class Peer extends EventEmitter {
 
   _attachCtl(channel) {
     this.ctl = channel;
+    unsettledChannels.add(channel);
     channel.onOpen(() => {
       this._setState(PeerState.HANDSHAKING);
       this.emit('ctl-open');
@@ -215,13 +216,18 @@ export class Peer extends EventEmitter {
       if (this.initiator) this._send(this.handshake.writeMessage(Buffer.alloc(0)));
     });
     channel.onMessage((msg) => this._onCtlMessage(msg));
-    channel.onClosed(() => { if (!this._closed) this.close('control channel closed'); });
+    channel.onClosed(() => {
+      unsettledChannels.delete(channel);
+      if (!this._closed) this.close('control channel closed');
+    });
     channel.onError((e) => this._fail(new Error(`control channel error: ${e}`)));
   }
 
   _attachMedia(channel) {
     this.media = channel;
+    unsettledChannels.add(channel);
     channel.onOpen(() => this.emit('media-open'));
+    channel.onClosed(() => unsettledChannels.delete(channel));
     channel.onMessage((msg) => this._onMediaMessage(msg));
     channel.onError((e) => this.emit('warning', `media channel error: ${e}`));
   }
@@ -290,13 +296,21 @@ export class Peer extends EventEmitter {
     let approved = false;
     let reason = 'declined';
     try {
-      approved = this.onConsentRequest
+      const verdict = this.onConsentRequest
         ? await this.onConsentRequest({
             sas: this.sas,
             remoteStatic: this.remoteStatic,
             transport: this.transportInfo(),
           })
         : false;
+      // Strict: only `true` or { ok: true } approves. { ok: false, reason }
+      // refuses and tells the viewer why.
+      if (verdict !== null && typeof verdict === 'object') {
+        approved = verdict.ok === true;
+        if (!approved && typeof verdict.reason === 'string' && verdict.reason) reason = verdict.reason.slice(0, 200);
+      } else {
+        approved = verdict === true;
+      }
     } catch (err) {
       approved = false;
       reason = `consent handler failed: ${err.message}`;
@@ -508,7 +522,21 @@ export class Peer extends EventEmitter {
   }
 }
 
-/** Frees libdatachannel's global thread pool; call once at process exit. */
-export function cleanupTransport() {
+/**
+ * Channels whose native close has not been confirmed yet. node-datachannel's
+ * cleanup() force-closes every channel it still knows about, and doing that
+ * while a channel's own 'closed' callback is in flight crashes the process
+ * (SIGSEGV in ~ThreadSafeCallback via DataChannelWrapper::CloseAll).
+ */
+const unsettledChannels = new Set();
+
+/**
+ * Frees libdatachannel's global thread pool; call once at process exit.
+ * Waits (bounded) until every channel has confirmed its close first.
+ */
+export async function cleanupTransport({ timeoutMs = 1000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (unsettledChannels.size > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  await new Promise((r) => setImmediate(r));   // let the last close callback unwind
   try { dc.cleanup(); } catch { /* not initialised */ }
 }

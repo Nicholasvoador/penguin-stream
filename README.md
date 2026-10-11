@@ -65,6 +65,36 @@ The stream opens in its own window. During a session either side can switch cont
 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> toggles fullscreen, …+<kbd>Q</kbd> disconnects. Controllers appear on a Linux
 host through uinput and on a Windows host as virtual Xbox 360 pads (needs the free [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver).
 
+<img src="docs/assets/h-remote.svg" alt="Reach your own PC from anywhere" width="100%">
+
+**Remote access** works like AnyDesk's unattended access, but only for **your own** computer: switch it on once and use
+the PC from another device with nobody there to click *Allow*. It is **off until you turn it on**.
+
+1. **On the PC you want to reach:** Home → **Remote access to this PC** → switch on (you confirm first) → **Copy access
+   code**. Access codes start with `PA-`.
+   - **Wayland (KDE, GNOME):** if the card shows *One-time setup*, click **Allow screen access**, pick the screen and keep
+     *Allow restoring* / *Remember* ticked. Later sessions then start without a prompt.
+   - Optional: **Start Penguin Stream when I log in** (it starts in the tray, no window). **Keep this PC awake** is on by default.
+2. **On the other device:** **Connect to a screen** → paste the access code → **Connect**. Tick *Remember this PC on this
+   device* if you want one-click access next time.
+
+Both devices need Penguin Stream 1.5.0 or newer for this: a 1.4.x device only understands invitations, not access codes.
+
+What keeps it safe:
+
+- The access code is 160 random bits, separate from your invitations, and never chosen by you. Without it a device can't
+  find the PC, let alone complete the encrypted handshake, so it never gets as far as asking. Keep it private, like a
+  password. **New code** retires the old one at once and ends any session that was using it.
+- The PC always shows that someone is connected: a banner with **End session**, a desktop notification, the device's
+  fingerprint and an entry in **Activity**.
+- While remote access is on, closing the window leaves Penguin Stream in the tray. **Turn off remote access**, in the app
+  or the tray menu, stops listening immediately.
+- While the PC is in another live session (sharing with a friend, or viewing someone), remote access pauses and resumes when
+  that session ends. If a friend is only *waiting* on your invitation, the remote session takes the screen first and the
+  invitation works again afterwards.
+- It can't reach a PC that is asleep, switched off, or not logged in: Penguin Stream runs inside your desktop session. Windows'
+  lock screen and UAC prompts run on a protected desktop it can't capture or control.
+
 <img src="docs/assets/h-audio.svg" alt="Audio without the echo" width="100%">
 
 The host's desktop audio streams to the viewer on both Windows and Linux. If you're in the same **Discord call** while
@@ -110,7 +140,8 @@ Every stage is chosen for latency first:
 <img src="docs/assets/h-security.svg" alt="Security" width="100%">
 
 End-to-end encryption uses a Noise XX handshake (`Noise_XX_25519_AESGCM_SHA256`) over DTLS, with 160-bit invitations, four-word
-verification, and explicit host approval for every new device. Relay operators and Nostr relays see only ciphertext. The local control
+verification, and explicit host approval for every new device. **Remote access** is the one exception, and only once you
+switch it on: there, holding your PC's private 160-bit access code replaces the prompt. Relay operators and Nostr relays see only ciphertext. The local control
 UI is loopback-only and token-protected. Read [SECURITY.md](SECURITY.md) for the threat model and what has *not* been independently audited.
 
 <img src="docs/assets/h-build.svg" alt="Build from source" width="100%">

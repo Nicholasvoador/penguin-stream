@@ -199,19 +199,26 @@ export class Host extends EventEmitter {
         };
         this.emit('consent-request', request);
 
-        // Fail closed: if no approver was supplied, refuse.
-        const ok = approve ? await approve(request) : false;
+        // Fail closed: if no approver was supplied, refuse. Only `true` (or
+        // { ok: true }) approves; { ok: false, reason } refuses with a reason
+        // the viewer gets to see ("busy", ...).
+        const verdict = approve ? await approve(request) : false;
+        const ok = verdict === true || (verdict !== null && typeof verdict === 'object' && verdict.ok === true);
         if (ok) {
           this.trust.trust(info.remoteStatic, {
-            label: this.opts.peerLabel || known?.label || 'paired viewer',
+            label: known?.label || this.opts.peerLabel || 'paired viewer',
             role: 'client',
           });
+          return true;
         }
-        return ok;
+        return verdict !== null && typeof verdict === 'object' && typeof verdict.reason === 'string'
+          ? { ok: false, reason: verdict.reason } : false;
       },
       // No idle timer: an invitation waits for a viewer until the host stops
       // sharing (1.3.1 silently gave up after 30 minutes).
       sessionTimeoutMs: this.opts.sessionTimeoutMs ?? 0,
+      // Remote access: viewer sessions this listener already saw (anti-replay).
+      spentPartners: this.opts.spentPartners ?? null,
     });
     // Stop pressed in the last instant: never start capturing afterwards.
     if (this._closed) { session.close(); throw cancelled(); }
@@ -238,11 +245,29 @@ export class Host extends EventEmitter {
       height: this.opts.height,
       monitor: this.opts.monitor,
       workspace: this.opts.workspace,
-      restoreToken: this.opts.restoreToken,
+      // Read now, not when the share started: grants are single-use and a
+      // listener may have waited for days while another session renewed it.
+      restoreToken: typeof this.opts.restoreToken === 'function' ? this.opts.restoreToken() : this.opts.restoreToken,
     });
     this.engine.on('restore-token', (token) => this.emit('restore-token', token));
 
+    // Unattended (remote access): nobody is at this PC to answer a system
+    // permission prompt, so a capture that does not start in time is ended
+    // and explained instead of leaving the viewer staring at nothing.
+    const startLimit = this.opts.mediaStartTimeoutMs;
+    if (Number.isFinite(startLimit) && startLimit > 0) {
+      this._mediaStartTimer = setTimeout(() => {
+        if (this._closed || this.engine?.config) return;
+        this.notifyViewer(this.opts.mediaStartTimeoutNotice || 'The remote computer could not start sharing its screen in time.');
+        this.emit('log', `screen capture did not start within ${Math.round(startLimit / 1000)} s`);
+        const t = setTimeout(() => this.close('screen capture did not start in time'), 150);   // let the notice flush
+        t.unref?.();
+      }, startLimit);
+      this._mediaStartTimer.unref?.();
+    }
+
     this.engine.on('config', (config) => {
+      clearTimeout(this._mediaStartTimer);
       this.emit('log', `capturing with ${config.capture}, encoding with ${config.encoder}`);
       // The viewer needs codec parameters before it can decode anything.
       try { peer.sendControl({ t: 'media-config', config }); } catch { /* closing */ }
@@ -314,7 +339,11 @@ export class Host extends EventEmitter {
           fps: Math.round(s.fps ?? 0), maxFrameBytes: s.maxFrameBytes ?? 0, dropped: this.stats.dropped });
       } catch { /* closing */ }
     });
-    this.engine.on('log', (m) => this.emit('log', m));
+    this.engine.on('log', (m) => {
+      // Before capture is up, the engine's last word is the reason it is not.
+      if (!this.engine?.config) this._captureError = m.replace(/^capture start failed: /, '').slice(0, 240);
+      this.emit('log', m);
+    });
     this.engine.on('input-status', (st) => {
       this.inputStatus = st;
       this.emit('input-status', st);
@@ -328,6 +357,13 @@ export class Host extends EventEmitter {
     this.engine.on('error', (e) => this.emit('error', e));
     this.engine.on('exit', ({ code }) => {
       this.emit('log', `capture engine exited (code ${code})`);
+      // Tell the viewer why, instead of a bare disconnect (older viewers ignore it).
+      if (!this.engine?.config && this._captureError && this.session?.peer?.state === 'secure') {
+        this.notifyViewer(`The remote computer could not start screen capture: ${this._captureError}`);
+        const t = setTimeout(() => this.close('capture ended'), 150);   // let the notice flush
+        t.unref?.();
+        return;
+      }
       this.close('capture ended');
     });
 
@@ -417,6 +453,13 @@ export class Host extends EventEmitter {
     }
   }
 
+  /** A short message shown on the viewer's side (why a session ended, etc.). */
+  notifyViewer(text) {
+    const peer = this.session?.peer;
+    if (!peer || peer.state !== 'secure') return;
+    try { peer.sendControl({ t: 'host-notice', text: String(text).slice(0, 300) }); } catch { /* closing */ }
+  }
+
   /** Live bitrate change (UI or viewer): becomes the new ceiling for adaptation. */
   setBitrate(kbps) {
     if (!Number.isInteger(kbps) || kbps < 500 || kbps > 200000) return;
@@ -430,11 +473,25 @@ export class Host extends EventEmitter {
     if (!this.abr.enabled) { this.abr.current = this.abr.maxKbps; this.engine?.setBitrate(this.abr.current); }
   }
 
-  close(reason = 'closed') {
+  /**
+   * @param {string} [reason]
+   * @param {string|null} [notice] shown to the viewer first (why it ended)
+   */
+  close(reason = 'closed', notice = null) {
     if (this._closed) return;
+    if (notice && !this._closing && this.session?.peer?.state === 'secure') {
+      // Stop sending video now, but give the notice a moment to arrive.
+      this._closing = true;
+      this.notifyViewer(notice);
+      this.engine?.sendInput({ t: 'release_all' });
+      const t = setTimeout(() => this.close(reason), 150);
+      t.unref?.();
+      return;
+    }
     this._closed = true;
     this._abort.abort();
     if (this._abrTimer) clearInterval(this._abrTimer);
+    clearTimeout(this._mediaStartTimer);
     this.engine?.sendInput({ t: 'release_all' });
     void this.audio?.stop();
     this.engine?.stop();
@@ -469,7 +526,7 @@ export function overlayText(l, h = {}, v = {}, t = {}) {
 /**
  * Viewer: connects to a host and displays its screen.
  *
- * Emits: 'secure', 'sas', 'media-config', 'stats', 'closed', 'error'
+ * Emits: 'secure', 'sas', 'media-config', 'stats', 'notice', 'closed', 'error'
  */
 export class Viewer extends EventEmitter {
   constructor(opts = {}) {
@@ -587,6 +644,8 @@ export class Viewer extends EventEmitter {
         this.emit('host-permissions', this.hostPermissions);
       } else if (msg?.t === 'rumble') {
         this.engine.rumble(msg);
+      } else if (msg?.t === 'host-notice' && typeof msg.text === 'string') {
+        this.emit('notice', msg.text.slice(0, 300));
       } else if (msg?.t === 'pong' && Number.isFinite(msg.t0) && Number.isFinite(msg.th)) {
         this.clock.add(msg.t0, msg.th, nowUs());
       } else if (msg?.t === 'host-stats') {

@@ -22,13 +22,14 @@ import { WebSocketServer } from 'ws';
 
 import { Host, Viewer, DEFAULT_RENDEZVOUS, APP_VERSION } from '../app/session.mjs';
 import { normalizeShareCode, parseInvitation } from '../signal/code.mjs';
+import { nostrEnabled } from '../signal/client.mjs';
 import { loadOrCreateIdentity, TrustStore } from '../crypto/identity.mjs';
 import { cleanupTransport } from '../transport/peer.mjs';
 import { SettingsStore, resolutionBox, sanitizeResolution } from '../app/settings.mjs';
 import { listMonitors, resolveMonitor, workspaceOf } from '../app/monitors.mjs';
 import { runNetcheck } from '../net/netcheck.mjs';
 import { Logbook, statLine } from '../app/logbook.mjs';
-import { findMediaBinary } from '../media/engine.mjs';
+import { findMediaBinary, CaptureEngine } from '../media/engine.mjs';
 import { execFile } from 'node:child_process';
 import os from 'node:os';
 
@@ -49,8 +50,16 @@ function isLoopbackHost(value) {
   return name === '127.0.0.1' || name === 'localhost' || name === '[::1]' || name === '::1';
 }
 
+/**
+ * @param {object} [o]
+ * @param {object} [o.desktop] hooks the desktop shell provides (all optional):
+ *   notify(title, body), setStartAtLogin(on) -> boolean, onRemoteAccess(state)
+ * @param {number} [o.remoteMediaStartMs] unattended sessions: how long screen
+ *   capture may take to start before the session is ended and explained
+ */
 export async function startUi({ port = 47800, open = true, quiet = false, HostClass = Host, ViewerClass = Viewer,
-  consentTimeoutMs = 120_000, onSessionChange = null } = {}) {
+  CaptureEngineClass = CaptureEngine, consentTimeoutMs = 120_000, onSessionChange = null, desktop = {},
+  remoteMediaStartMs = 30_000 } = {}) {
   const token = crypto.randomBytes(24).toString('base64url');
   const identity = loadOrCreateIdentity();
   const trust = new TrustStore();
@@ -95,6 +104,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     viewerState: null,     // viewer: local switches, as the stream window reports them
     hostPermissions: null, // viewer: what the host allows
     reconnect: null,       // viewer: { attempt, reason, at } while reconnecting
+    viewerAccess: false,   // viewer: connected with a remote access code (no words to compare)
   };
 
   const pushLog = (line) => {
@@ -138,20 +148,23 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     // The last invitation that worked, for a one-click reconnect. Local UI
     // only (token-protected); never written to logs or diagnostics.
     lastInvitation: settings.get().lastInvitation || null,
+    viewerAccess: state.viewerAccess,
+    remote: remotePublic(),
     platform: process.platform,
     version: APP_VERSION,
   });
 
   // Ends the CURRENT host/viewer instance only. A share (or a viewer's
   // reconnect loop) may carry on with a fresh instance afterwards.
-  const endSession = (reason) => {
+  // `notice` (host only) is shown to the viewer before the connection closes.
+  const endSession = (reason, notice = null) => {
     const previous = active;
     active = null;
     ++generation;
     clearTimeout(pendingConsent?.timer);
     pendingConsent?.resolve?.(false);
     pendingConsent = null;
-    try { previous?.instance.close(reason); } catch { /* already closing */ }
+    try { previous?.instance.close(reason, notice); } catch { /* already closing */ }
     state.sas = null;
     state.transport = null;
     state.mediaConfig = null;
@@ -159,21 +172,32 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     state.remoteViewer = null;
     state.viewerState = null;
     state.hostPermissions = null;
+    state.viewerAccess = false;
+    if (previous?.remote && remote) remote.live = null;
     onSessionChange?.(false);
+    resumeRemoteListener();
+    return previous;
   };
 
   // Stops everything: the share, a pending reconnect, the current session.
+  // Remote access stays on (it is switched off on its own): if the session
+  // being stopped was a remote one, the PC simply listens again.
   const stopActive = (reason = 'stopped by user') => {
     clearTimeout(share?.timer);
     share = null;
     clearTimeout(viewerRetry?.timer);
     viewerRetry = null;
-    endSession(reason);
+    const previous = endSession(reason, /stopped by user/.test(reason) ? 'The session was ended at the remote computer.' : null);
     state.code = null;
     state.permissions = null;
     state.inputStatus = null;
     state.reconnect = null;
     setMode('idle');
+    if (previous?.remote && remote) {
+      pushLog(`remote access session ended: ${reason}`);
+      remoteChanged();
+      void armRemote();
+    }
   };
 
   /* ----------------------------- actions ----------------------------- */
@@ -204,10 +228,11 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
    * Stop ends the share. A device approved during this share is let back in
    * without asking again, so a friend can reconnect after any hiccup.
    */
-  async function startHost(opts) {
-    if (active || share || viewerRetry) throw new Error('a session is already running');
-
-    // Stream settings: the request may override the saved ones for this share.
+  /**
+   * Capture/encode/network options for a host session: the request may
+   * override the saved settings (shares); remote access uses the saved ones.
+   */
+  async function hostOptions(opts = {}) {
     const saved = settings.get();
     const pick = (k) => (opts[k] !== undefined ? opts[k] : saved[k]);
     const box = resolutionBox(sanitizeResolution(pick('resolution')) ?? saved.resolution);
@@ -217,14 +242,8 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     // Remote-desktop and screen-cast grants are different kinds of token.
     const tokenKey = `${process.platform}:rd:${monitor ? monitor.id : 'all'}`;
     const num = (v) => (v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : undefined);
-
-    share = {
-      code: typeof opts.code === 'string' && opts.code ? opts.code : settings.shareCode(),
-      tokenKey,
-      permissions: { kbm: opts.allowInput === true, pad: opts.allowGamepad === true },
-      approved: new Set(),       // device fingerprints approved during this share
-      fails: 0,
-      timer: null,
+    return {
+      tokenKey, monitor, monitors, pick, num,
       hostOpts: {
         ...commonOptions(opts),
         source: typeof pick('source') === 'string' && /^(dxgi|gdi|portal|x11|synthetic)$/.test(pick('source')) ? pick('source') : undefined,
@@ -245,6 +264,22 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
         audioFilter: { excludeVoice: saved.audioExcludeVoice, exclude: saved.audioExclude, only: saved.audioOnly },
       },
     };
+  }
+
+  async function startHost(opts) {
+    if (active || share || viewerRetry) throw new Error('a session is already running');
+    const { tokenKey, monitor, monitors, pick, num, hostOpts } = await hostOptions(opts);
+    if (active || share || viewerRetry) throw new Error('a session is already running');
+    share = {
+      code: typeof opts.code === 'string' && opts.code ? opts.code : settings.shareCode(),
+      tokenKey,
+      permissions: { kbm: opts.allowInput === true, pad: opts.allowGamepad === true },
+      approved: new Set(),       // device fingerprints approved during this share
+      fails: 0,
+      timer: null,
+      paused: false,             // a remote access session borrowed the screen
+      hostOpts,
+    };
     if (monitor) pushLog(`sharing monitor ${monitor.label || monitor.id}`);
     logbook.info(`share: fps=${num(pick('fps')) ?? 60} bitrate=${num(pick('bitrate')) ?? 15000} resolution=${pick('resolution')} ` +
       `adaptive=${pick('adaptiveBitrate') !== false} monitor=${monitor ? monitor.label : 'system picker'} ` +
@@ -256,15 +291,16 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
   /** One connection attempt / session of the current share. */
   function launchHost() {
     const s = share;
-    if (!s || active) return;
+    if (!s || active || s.paused) return;
     const startedAt = Date.now();
     const host = new HostClass({
       ...s.hostOpts,
       code: s.code,
       allowInput: s.permissions.kbm,
       allowGamepad: s.permissions.pad,
-      // The latest Wayland grant (saved after each share) avoids the picker.
-      restoreToken: settings.get().portalTokens?.[s.tokenKey],
+      // The latest Wayland grant (saved after each session) avoids the picker.
+      // Read when capture starts: the share may have waited for hours.
+      restoreToken: () => settings.get().portalTokens?.[s.tokenKey],
     });
 
     active = { kind: 'host', instance: host };
@@ -293,6 +329,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     scope.on('secure', (t) => {
       s.fails = 0;
       onSessionChange?.(true);
+      pauseRemoteListener();
       logbook.info(`connected: ${t?.relayed ? 'relay' : 'direct'} ${t?.localType ?? ''}->${t?.remoteType ?? ''} ${t?.protocol ?? ''}`);
     });
     scope.on('error', (e) => pushLog(`error: ${e.message}`));
@@ -342,7 +379,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
 
   /** The session ended: wait for the next one with the same invitation. */
   function rearmHost(reason, startedAt, failed) {
-    if (!share) return;
+    if (!share || share.paused) return;
     endSession(reason);
     // Attempts that fail instantly (no network, signaling down) back off, so
     // a broken setup never spins; anything else re-arms right away.
@@ -374,8 +411,369 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     return code;
   }
 
+  /* --------------------------- remote access --------------------------- */
+
+  /*
+   * Unattended access to THIS PC with its access code ("PA-…"), for the
+   * owner reaching their own machine from elsewhere. Off unless switched on.
+   * While on, a listener waits on the code's own signaling topic (separate
+   * from invitations). A viewer that completes the Noise handshake WITH the
+   * code is let in without a prompt: holding the code is the permission, and
+   * without it a peer cannot even finish the handshake. The PC still shows
+   * every session (banner, desktop notification, log) and can end it.
+   */
+  let remote = null;   // { code, listener, timer, fails, spent, relays, lastError, live, tokenKey, startedAt }
+  let remoteSetup = { tokenKey: null, needsSetup: false, reason: null };
+
+  const waylandPortal = () => process.platform === 'linux' && (process.env.XDG_SESSION_TYPE === 'wayland' || Boolean(process.env.WAYLAND_DISPLAY))
+    && !/^(x11|synthetic)$/.test(settings.get().source || '');
+
+  function remotePublic() {
+    const s = settings.get();
+    const signaling = nostrEnabled(undefined) ? (remote?.relays ?? 0) : null;   // null: no relays in use
+    return {
+      enabled: Boolean(remote),
+      status: !remote ? 'off' : remote.live ? 'live' : remote.paused ? 'paused'
+        : (signaling === null || signaling > 0) && remote.listener ? 'ready' : 'connecting',
+      relays: signaling,
+      live: remote?.live ? { ...remote.live } : null,
+      lastError: remote?.lastError ?? null,
+      keepAwake: s.remoteKeepAwake !== false,
+      // null: not available (CLI). The desktop shell reports the real login item.
+      startAtLogin: typeof desktop.setStartAtLogin === 'function'
+        ? (typeof desktop.getStartAtLogin === 'function' ? desktop.getStartAtLogin() === true : s.startAtLogin === true) : null,
+      needsSetup: remoteSetup.needsSetup,
+      setupReason: remoteSetup.reason,
+    };
+  }
+
+  const remoteChanged = () => {
+    try { desktop.onRemoteAccess?.(remotePublic()); } catch { /* shell only */ }
+    broadcast('state', publicState());
+  };
+  const notify = (title, body) => { try { desktop.notify?.(title, body); } catch { /* shell only */ } };
+
+  /** Wayland only: is there a saved screen + control grant for the monitor remote access uses? */
+  async function refreshRemoteSetup() {
+    const { tokenKey } = await hostOptions({});
+    const has = Boolean(settings.get().portalTokens?.[tokenKey]);
+    remoteSetup = { tokenKey, needsSetup: waylandPortal() && !has,
+      reason: waylandPortal() && !has ? 'This desktop must allow screen sharing and remote control once, while you are at the PC.' : null };
+    return remoteSetup;
+  }
+
+  async function enableRemote({ startup = false } = {}) {
+    if (!remote) {
+      const code = settings.accessCode();
+      if (!settings.get().remoteAccess) settings.update({ remoteAccess: true });
+      remote = { code, listener: null, timer: null, arming: false, dirty: false, paused: false, fails: 0, spent: new Set(),
+        relays: 0, lastError: null, live: null, tokenKey: null, startedAt: 0 };
+      // Turned on during a live share/view: wait for it to end before listening.
+      if (active && !active.remote && /^(hosting-live|viewing)$/.test(state.mode)) remote.paused = true;
+      pushLog(startup ? 'remote access is on: listening for this PC\'s access code'
+        : 'remote access turned on: anyone with this PC\'s access code can connect without asking');
+    }
+    await refreshRemoteSetup().catch(() => {});
+    await armRemote();
+    remoteChanged();
+    return remotePublic();
+  }
+
+  function disableRemote(reason = 'remote access turned off') {
+    const r = remote;
+    if (r) {
+      remote = null;               // first: nothing re-arms from here on
+      clearTimeout(r.timer);
+      const listener = r.listener;
+      r.listener = null;
+      try { listener?.close(reason); } catch { /* already closed */ }
+      if (active?.remote) finishRemoteLive(reason, 'Remote access was switched off on the remote computer.');
+      pushLog(reason);
+    }
+    if (settings.get().remoteAccess) settings.update({ remoteAccess: false });
+    remoteChanged();
+    return remotePublic();
+  }
+
+  function newAccessCode() {
+    const code = settings.newAccessCode();
+    const r = remote;
+    if (r) {
+      r.code = code;
+      r.spent.clear();
+      clearTimeout(r.timer);
+      r.timer = null;
+      const listener = r.listener;
+      r.listener = null;
+      try { listener?.close('new access code'); } catch { /* already closed */ }
+      if (active?.remote) finishRemoteLive('access code changed', 'The access code of the remote computer was changed.');
+      else void armRemote();
+    }
+    pushLog('new remote access code created; the old one no longer works');
+    remoteChanged();
+    return code;
+  }
+
+  /*
+   * While this PC is in another LIVE session (a share or viewing someone),
+   * remote access would be refused as busy anyway, so the listener steps
+   * aside completely: no relay sockets, pings or timers next to a live stream
+   * (measured: a waiting listener cost +0.01 ms on the host send stage).
+   * It listens again the moment that session ends.
+   */
+  function pauseRemoteListener() {
+    const r = remote;
+    if (!r || r.paused || active?.remote) return;
+    r.paused = true;
+    clearTimeout(r.timer);
+    r.timer = null;
+    const listener = r.listener;
+    r.listener = null;
+    r.relays = 0;
+    try { listener?.close('paused during another session'); } catch { /* closed */ }
+    remoteChanged();
+  }
+  function resumeRemoteListener() {
+    const r = remote;
+    if (!r?.paused) return;
+    r.paused = false;
+    void armRemote();
+    remoteChanged();
+  }
+
+  // Settings a remote session is built from. A waiting listener picks up a
+  // change at once; a live session keeps what it started with.
+  const REMOTE_SESSION_KEYS = new Set(['fps', 'bitrate', 'resolution', 'monitor', 'encoder', 'source', 'display', 'audio',
+    'audioExcludeVoice', 'audioExclude', 'audioOnly', 'adaptiveBitrate', 'allowGamepad', 'forceRelay', 'noStun', 'stun',
+    'rendezvous', 'relay']);
+  function refreshRemoteListener() {
+    const r = remote;
+    if (r?.arming) { r.dirty = true; return; }
+    if (!r?.listener) return;            // paused or live: the next listener reads fresh settings anyway
+    const listener = r.listener;
+    r.listener = null;
+    try { listener.close('settings changed'); } catch { /* closed */ }
+    void armRemote();
+    refreshRemoteSetup().then(remoteChanged, () => {});
+  }
+
+  /** Waits for the next remote viewer (one listener at a time). */
+  async function armRemote(delay = 0) {
+    const r = remote;
+    if (!r || r.listener || r.live || r.timer || r.arming || r.paused) return;
+    if (delay > 0) {
+      r.timer = setTimeout(() => { r.timer = null; void armRemote(); }, delay);
+      r.timer.unref?.();
+      return;
+    }
+    r.arming = true;             // blocks re-entry while the options load
+    let built;
+    try {
+      // Settings changed while loading: load again, never arm with stale ones.
+      do { r.dirty = false; built = await hostOptions({}); } while (r.dirty && remote === r);
+    } finally { r.arming = false; }
+    if (remote !== r || r.listener || r.live || r.timer || r.paused) return;
+    const saved = settings.get();
+    r.tokenKey = built.tokenKey;
+    r.relays = 0;
+    const host = new HostClass({
+      ...built.hostOpts,
+      audio: saved.audio === true,
+      code: r.code,
+      allowInput: true,                      // using your own PC remotely
+      allowGamepad: saved.allowGamepad !== false,
+      restoreToken: () => settings.get().portalTokens?.[built.tokenKey],
+      spentPartners: r.spent,
+      peerLabel: 'remote access',
+      mediaStartTimeoutMs: remoteMediaStartMs,
+      mediaStartTimeoutNotice: waylandPortal()
+        ? 'The remote computer could not start sharing its screen: it is asking for permission and nobody is there to allow it. ' +
+          'At that PC, open Penguin Stream → Remote access and click "Allow screen access" once.'
+        : 'The remote computer could not start sharing its screen in time.',
+    });
+    r.listener = host;
+    r.startedAt = Date.now();
+    host.on('status', (st, detail) => {
+      if (remote !== r || (r.listener !== host && active?.instance !== host)) return;
+      if (st === 'nostr-relays' && Number.isInteger(detail) && detail !== r.relays) {
+        const was = r.relays;
+        r.relays = detail;
+        if ((was === 0) !== (detail === 0)) broadcast('state', publicState());   // reachable <-> not
+      }
+    });
+    host.start(async (request) => approveRemote(r, host, request)).catch((err) => {
+      if (remote !== r) return;
+      if (r.listener === host) {
+        // Still listening when it failed: a handshake that went nowhere, a
+        // refused (busy) attempt, a signaling hiccup. Listen again; back off
+        // only if attempts fail instantly (no network), so it never spins.
+        r.listener = null;
+        try { host.close('listener restart'); } catch { /* closed */ }
+        if (!/cancel/i.test(err.message)) r.lastError = String(err.message).slice(0, 200);
+        r.fails = Date.now() - r.startedAt < 5000 ? r.fails + 1 : 0;
+        void armRemote(r.fails ? Math.min(60_000, 1000 * 2 ** (r.fails - 1)) : 0);
+        broadcast('state', publicState());
+      } else if (active?.instance === host) {
+        finishRemoteLive(err.message);
+      }
+    });
+    broadcast('state', publicState());
+  }
+
+  /** The handshake proved the viewer holds the access code: let it in, unless the PC is busy. */
+  function approveRemote(r, host, request) {
+    if (remote !== r || r.listener !== host) return false;
+    const waitingShare = active?.kind === 'host' && !active.remote && share && state.mode === 'hosting-waiting';
+    if (active && !waitingShare) {
+      pushLog(`remote access: refused device ${request.fingerprint} - this PC is in another session`);
+      notify('Remote access refused', 'A device with your access code tried to connect while another session was running on this PC.');
+      return { ok: false, reason: 'the remote computer is busy with another session' };
+    }
+    if (waitingShare) {
+      // Borrow the screen; the invitation works again once this session ends.
+      clearTimeout(share.timer);
+      share.timer = null;
+      share.paused = true;
+      endSession('paused for a remote access session');
+      pushLog('sharing paused while a remote access session runs; your invitation works again afterwards');
+    }
+    r.listener = null;
+    r.live = { fingerprint: request.fingerprint, label: request.label || null, since: Date.now(),
+      transport: request.transport ?? null };
+    promoteRemote(r, host);
+    return true;
+  }
+
+  function promoteRemote(r, host) {
+    active = { kind: 'host', instance: host, remote: true };
+    const scope = bindSession(host);
+    state.permissions = { ...host.permissions };
+    state.code = null;
+    state.sas = null;
+    state.transport = r.live.transport;
+    setMode('hosting-live');
+    scope.on('permissions', (p) => { state.permissions = { ...p }; broadcast('state', publicState()); });
+    scope.on('input-status', (st) => { state.inputStatus = st; broadcast('state', publicState()); });
+    scope.on('viewer-state', (v) => { state.remoteViewer = v; broadcast('state', publicState()); });
+    scope.on('restore-token', (tok) => {
+      try { settings.update({ portalTokens: { ...(settings.get().portalTokens || {}), [r.tokenKey]: tok } }); } catch { /* best effort */ }
+    });
+    scope.on('audio-warning', (w) => { pushLog(`audio warning: ${w}`); broadcast('notice', w); });
+    scope.on('log', pushLog);
+    scope.on('stats', (st) => { state.stats = st; broadcast('stats', st); logStats('host', st); });
+    scope.on('media-config', (cfg) => {
+      state.mediaConfig = cfg;
+      logbook.info(`stream ${cfg.width}x${cfg.height}@${cfg.fps} from ${cfg.sourceWidth ?? cfg.width}x${cfg.sourceHeight ?? cfg.height} ` +
+        `encoder=${cfg.encoder} capture=${cfg.capture}${cfg.intraRefresh ? ' intra-refresh' : ''}`);
+      broadcast('state', publicState());
+    });
+    scope.on('secure', (t) => {
+      r.fails = 0;
+      r.lastError = null;
+      state.transport = t;
+      if (r.live) r.live.transport = t;
+      onSessionChange?.(true);
+      const route = t?.relayed ? 'through a relay' : 'directly';
+      pushLog(`remote access: device ${r.live?.fingerprint ?? '?'} connected ${route} with this PC's access code`);
+      logbook.info(`connected: ${t?.relayed ? 'relay' : 'direct'} ${t?.localType ?? ''}->${t?.remoteType ?? ''} ${t?.protocol ?? ''} (remote access)`);
+      notify('Someone is using this PC remotely',
+        `Connected with your access code (device ${r.live?.fingerprint ?? 'unknown'}). Open Penguin Stream to end the session.`);
+      remoteChanged();
+    });
+    scope.on('error', (e) => pushLog(`error: ${e.message}`));
+    scope.on('closed', (reason) => finishRemoteLive(reason));
+    remoteChanged();
+  }
+
+  /**
+   * Wayland: capture did not start for a remote session, i.e. the desktop
+   * showed a permission prompt with nobody there. The saved grant is dead
+   * (revoked, reset, or saved under another app identity): forget it so the
+   * Remote access card asks for the one-time setup again, and tell the owner.
+   */
+  function forgetDeadGrant() {
+    const key = remote?.tokenKey;
+    const tokens = { ...(settings.get().portalTokens || {}) };
+    if (key && tokens[key]) {
+      delete tokens[key];
+      try { settings.update({ portalTokens: tokens }); } catch { /* best effort */ }
+      pushLog('remote access: the saved screen permission no longer works - open Remote access and click "Allow screen access" once');
+      notify('Remote access needs your OK once',
+        'Someone connected with your access code, but the desktop asked for screen-sharing permission. ' +
+        'Open Penguin Stream → Remote access → Allow screen access.');
+    }
+    void refreshRemoteSetup().then(() => remoteChanged()).catch(() => {});
+  }
+
+  /** The live remote session is over (any reason): listen again, give a paused share its screen back. */
+  function finishRemoteLive(reason, notice = null) {
+    const wasLive = Boolean(active?.remote);
+    if (wasLive) {
+      pushLog(`remote access session ended: ${reason}`);
+      endSession(reason, notice);
+      state.permissions = null;
+      state.inputStatus = null;
+      if (/did not start in time/.test(reason) && waylandPortal()) forgetDeadGrant();
+    }
+    if (remote) remote.live = null;
+    if (share?.paused) {
+      share.paused = false;
+      pushLog('sharing resumed: your invitation works again');
+      launchHost();
+    } else if (!active && !share && !viewerRetry) {
+      state.code = null;
+      setMode('idle');
+    }
+    if (remote) void armRemote();
+    remoteChanged();
+  }
+
+  /**
+   * Wayland: ask for screen + control permission once, while the owner is at
+   * the PC, and keep the grant ("allow restoring") so unattended sessions
+   * start without a prompt. Also a quick self-test elsewhere.
+   */
+  async function prepareRemote() {
+    if (active || share || viewerRetry) throw new Error('stop the current session first');
+    const { tokenKey, hostOpts } = await hostOptions({});
+    if (!waylandPortal()) {
+      await refreshRemoteSetup().catch(() => {});
+      remoteChanged();
+      return { ok: true, needed: false };
+    }
+    const before = settings.get().portalTokens?.[tokenKey];
+    let saved = null;
+    let lastError = '';
+    const engine = new CaptureEngineClass({
+      source: hostOpts.source, display: hostOpts.display, fps: 30, bitrateKbps: 2000, encoder: hostOpts.encoder,
+      width: 640, height: 360, monitor: hostOpts.monitor, workspace: hostOpts.workspace,
+      restoreToken: before, inputCapable: true, maxFrames: 1,
+    });
+    const result = await new Promise((resolve) => {
+      let configured = false;
+      const timer = setTimeout(() => { lastError = 'nobody answered the permission prompt'; engine.stop?.(); }, 5 * 60_000);
+      timer.unref?.();
+      engine.on('restore-token', (tok) => {
+        saved = tok;
+        try { settings.update({ portalTokens: { ...(settings.get().portalTokens || {}), [tokenKey]: tok } }); } catch { /* best effort */ }
+      });
+      engine.on('config', () => { configured = true; });
+      engine.on('log', (m) => { if (/^capture start failed: /.test(m)) lastError = m.slice(22); });
+      engine.on('error', (e) => { lastError = e.message; });
+      engine.on('exit', () => { clearTimeout(timer); resolve(configured); });
+      try { engine.start(); } catch (e) { lastError = e.message; clearTimeout(timer); resolve(false); }
+    });
+    await refreshRemoteSetup().catch(() => {});
+    remoteChanged();
+    if (!result) throw new Error(`screen access was not granted${lastError ? `: ${lastError}` : ''}`);
+    if (!saved) throw new Error('screen access worked this time, but the desktop did not let Penguin Stream remember it - ' +
+      'run this again and keep "Allow restoring" / "Remember" ticked in the prompt');
+    pushLog('remote access: screen and remote-control permission saved for unattended sessions');
+    return { ok: true, needed: true, reused: Boolean(before) && before !== saved };
+  }
+
   // Deliberate endings: never reconnect after these.
-  const FINAL_REASON = /consent denied|refused|declined|stopped by user|stopped sharing|viewer window closed|shutting down|cancelled|new invitation|does not look right/i;
+  const FINAL_REASON = /consent denied|refused|declined|stopped by user|stopped sharing|viewer window closed|shutting down|cancelled|new invitation|does not look right|access code of this PC/i;
 
   async function startViewer(opts) {
     if (active || share) throw new Error('a session is already running');
@@ -385,13 +783,16 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     // otherwise be reported as success and only fail asynchronously.
     let code = opts.code;
     let rendezvous = opts.rendezvous;
+    let access = false;
     try {
       const parsed = parseInvitation(opts.code);
       code = parsed.code;
+      access = parsed.scope === 'access';
       if (!rendezvous && parsed.rendezvousUrl) rendezvous = parsed.rendezvousUrl;
     } catch (err) {
       throw new Error(`that share code does not look right: ${err.message}`);
     }
+    if (access && remote && code === remote.code) throw new Error('that is the access code of this PC - use it on another computer');
 
     const viewerOpts = {
       ...commonOptions({ ...opts, rendezvous }),
@@ -403,11 +804,14 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
       audio: opts.audio === true,
     };
     state.reconnect = null;
-    launchViewer(viewerOpts, String(opts.code).trim(), 0);
+    // Invitations are remembered for "Reconnect" automatically; an access
+    // code opens a PC without asking, so only when the user ticks Remember.
+    const remember = !access || opts.remember === true;
+    launchViewer(viewerOpts, String(opts.code).trim(), 0, { access, remember });
     return { ok: true };
   }
 
-  function launchViewer(viewerOpts, invitation, attempt) {
+  function launchViewer(viewerOpts, invitation, attempt, how = { access: false, remember: true }) {
     const viewer = new ViewerClass({
       ...viewerOpts,
       // Reconnect attempts give up sooner and try again (the loop only ends on Cancel).
@@ -417,7 +821,9 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     active = { kind: 'viewer', instance: viewer };
     const scope = bindSession(viewer);
     let wasLive = false;
+    state.viewerAccess = how.access;
     setMode(attempt ? 'reconnecting' : 'connecting');
+    scope.on('notice', (text) => { pushLog(`remote computer: ${text}`); broadcast('notice', text); });
     scope.on('viewer-state', (v) => { state.viewerState = v; broadcast('state', publicState()); });
     scope.on('host-permissions', (p) => { state.hostPermissions = p; broadcast('state', publicState()); });
     scope.on('log', pushLog);
@@ -428,7 +834,8 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
       state.transport = t;
       state.reconnect = null;
       onSessionChange?.(true);
-      try { settings.update({ lastInvitation: invitation }); } catch { /* best effort */ }
+      pauseRemoteListener();
+      if (how.remember) { try { settings.update({ lastInvitation: invitation }); } catch { /* best effort */ } }
       logbook.info(`connected: ${t?.relayed ? 'relay' : 'direct'} ${t?.localType ?? ''}->${t?.remoteType ?? ''} ${t?.protocol ?? ''}`);
       setMode('viewing');
     });
@@ -441,13 +848,13 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     scope.on('error', (e) => pushLog(`error: ${e.message}`));
     scope.on('closed', (reason) => {
       pushLog(`disconnected: ${reason}`);
-      retryViewer(viewerOpts, invitation, reason, attempt, wasLive);
+      retryViewer(viewerOpts, invitation, reason, attempt, wasLive, how);
     });
 
     viewer.start().catch((err) => {
       if (!scope.current()) return;
       pushLog(`connect failed: ${err.message}`);
-      retryViewer(viewerOpts, invitation, err.message, attempt, false);
+      retryViewer(viewerOpts, invitation, err.message, attempt, false, how);
     });
   }
 
@@ -457,7 +864,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
    * presses Cancel. A first attempt that never connected is not retried
    * (wrong code, host not sharing: the user needs to see that).
    */
-  function retryViewer(viewerOpts, invitation, reason, attempt, wasLive) {
+  function retryViewer(viewerOpts, invitation, reason, attempt, wasLive, how) {
     const again = settings.get().autoReconnect !== false && !FINAL_REASON.test(reason) && (wasLive || attempt > 0);
     if (!again) { stopActive(reason); return; }
     endSession(reason);
@@ -467,7 +874,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     setMode('reconnecting');
     pushLog(`reconnecting in ${(delay / 1000).toFixed(1)} s (attempt ${next})`);
     viewerRetry = {
-      timer: setTimeout(() => { viewerRetry = null; if (!active) launchViewer(viewerOpts, invitation, next); }, delay),
+      timer: setTimeout(() => { viewerRetry = null; if (!active) launchViewer(viewerOpts, invitation, next, how); }, delay),
     };
     viewerRetry.timer.unref?.();
   }
@@ -534,7 +941,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
       }
 
       const allowed = ['/api/state', '/api/monitors', '/api/logs'].includes(url.pathname) ? ['GET']
-        : url.pathname === '/api/settings' ? ['GET', 'POST'] : ['POST'];
+        : ['/api/settings', '/api/remote-access'].includes(url.pathname) ? ['GET', 'POST'] : ['POST'];
       if (!allowed.includes(req.method)) {
         req.resume(); // Drain rejected bodies so a keep-alive socket remains framed.
         res.writeHead(405, { allow: allowed.join(', ') }).end(); return;
@@ -562,8 +969,40 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
         switch (url.pathname) {
           case '/api/state': return json(publicState());
           case '/api/settings':
-            if (req.method === 'POST') settings.update(body);
+            if (req.method === 'POST') {
+              // Remote access is switched on/off and its code changed only
+              // through /api/remote-access (it starts/stops the listener).
+              const { remoteAccess, accessCode, startAtLogin, ...rest } = body ?? {};
+              settings.update(rest);
+              if ('remoteKeepAwake' in rest) remoteChanged();
+              if (Object.keys(rest).some((k) => REMOTE_SESSION_KEYS.has(k))) refreshRemoteListener();
+            }
             return json(settings.publicSettings());
+          case '/api/remote-access': {
+            if (req.method === 'GET') {
+              return json({ ...remotePublic(), code: remote ? remote.code : null });
+            }
+            switch (body.action) {
+              case 'enable': return json({ ...(await enableRemote()), code: remote?.code ?? null });
+              case 'disable': return json(disableRemote());
+              case 'new-code': return json({ ...remotePublic(), code: newAccessCode() });
+              case 'end-session':
+                if (!active?.remote) return json({ error: 'no remote access session is running' }, 409);
+                finishRemoteLive('ended at this PC', 'The session was ended at the remote computer.');
+                return json(remotePublic());
+              case 'prepare': return json({ ...(await prepareRemote()), ...remotePublic() });
+              case 'start-at-login': {
+                if (typeof body.on !== 'boolean') return json({ error: 'on must be boolean' }, 400);
+                if (typeof desktop.setStartAtLogin !== 'function') return json({ error: 'only the desktop app can start with your computer' }, 409);
+                const ok = await desktop.setStartAtLogin(body.on);
+                if (ok === false) return json({ error: 'could not change the login item' }, 500);
+                settings.update({ startAtLogin: body.on });
+                remoteChanged();
+                return json(remotePublic());
+              }
+              default: return json({ error: 'action must be enable, disable, new-code, end-session, prepare or start-at-login' }, 400);
+            }
+          }
           case '/api/monitors': return json({ monitors: await listMonitors({ fresh: true }) });
           case '/api/logs': return json({ path: logbook.file, dir: logbook.dir, text: logbook.tail(500) });
           case '/api/logs/open': openPath(logbook.dir); return json({ ok: true, dir: logbook.dir });
@@ -577,6 +1016,7 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
             else if (body.action === 'save') settings.saveProfile(String(body.name ?? ''));
             else if (body.action === 'delete') settings.deleteProfile(String(body.id ?? ''));
             else return json({ error: 'action must be apply, save or delete' }, 400);
+            if (body.action === 'apply') refreshRemoteListener();
             const s = settings.get();
             // A live share follows the new bitrate right away.
             if (active?.kind === 'host' && body.action === 'apply') {
@@ -725,7 +1165,20 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
 
   if (open) openBrowser(link);
 
+  // Remote access survives restarts: it was on, so listen again.
+  if (settings.get().remoteAccess === true) {
+    enableRemote({ startup: true }).catch((err) => pushLog(`remote access could not start: ${err.message}`));
+  }
+
   const close = async () => {
+    // Stop listening without switching remote access off (it resumes next start).
+    if (remote) {
+      const r = remote;
+      remote = null;
+      clearTimeout(r.timer);
+      try { r.listener?.close('shutting down'); } catch { /* closed */ }
+      r.listener = null;
+    }
     stopActive('shutting down');
     logbook.info('=== Penguin Stream stop ===');
     process.off('SIGINT', shutdown);
@@ -735,13 +1188,22 @@ export async function startUi({ port = 47800, open = true, quiet = false, HostCl
     await new Promise(resolve => server.close(resolve));
   };
   const shutdown = () => {
-    void close().then(() => { cleanupTransport(); process.exit(0); });
+    void close().then(() => cleanupTransport()).finally(() => process.exit(0));
     setTimeout(() => process.exit(0), 1500).unref();
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  return { port: actualPort, token, url: link, close };
+  return {
+    port: actualPort, token, url: link, close,
+    // For the desktop shell (tray menu): same actions as the UI.
+    remoteAccess: {
+      state: () => remotePublic(),
+      enable: () => enableRemote(),
+      disable: () => disableRemote(),
+      endSession: () => { if (active?.remote) finishRemoteLive('ended at this PC', 'The session was ended at the remote computer.'); },
+    },
+  };
 }
 
 /** Keeps only the newest `keep` diagnostics reports (1.4.0 kept every one forever). */

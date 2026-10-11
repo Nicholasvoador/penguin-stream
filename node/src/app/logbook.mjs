@@ -26,8 +26,9 @@ import { configDir } from '../crypto/identity.mjs';
 const MAX_BYTES = 1024 * 1024;
 const KEEP = 3;
 
-// 160-bit invitations: 8 groups of 4 Crockford characters (optionally @url).
-const INVITE_RE = /\b[0-9A-HJKMNP-TV-Z]{4}(?:-[0-9A-HJKMNP-TV-Z]{4}){7}\b(?:@\S+)?/gi;
+// 160-bit invitations: 8 groups of 4 Crockford characters (optionally @url),
+// and remote access codes: the same with a "PA-" prefix.
+const INVITE_RE = /\b(?:PA-)?[0-9A-HJKMNP-TV-Z]{4}(?:-[0-9A-HJKMNP-TV-Z]{4}){7}\b(?:@\S+)?/gi;
 const SECRET_KV_RE = /\b(token|password|passwd|secret|credential|cfToken|turnPassword|authorization)(["']?\s*[:=]\s*["']?)([^\s"',}]+)/gi;
 const BEARER_RE = /\bBearer\s+[\w.~+/=-]+/gi;
 const URL_TOKEN_RE = /([#?&]token=)[\w.~-]+/gi;

@@ -27,6 +27,8 @@
   <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
   <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 18a9 9 0 1 1 16 0"/><path d="m12 13 4-5"/><circle cx="12" cy="13" r="1.3"/></symbol>
   <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4.5 6v5.5c0 4.5 3.2 8.2 7.5 9.5 4.3-1.3 7.5-5 7.5-9.5V6z"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4.5"/><path d="m11.2 11.8 8.3-8.3M16.5 6.5l2.5 2.5M14 9l2 2"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M6.6 6.8a8 8 0 1 0 10.8 0"/></symbol>
 </svg>
 
 <div class="app">
@@ -112,6 +114,37 @@
         </div>
       </div>
 
+      <div class="card remote-card" id="remote-card">
+        <div class="card-head"><h2><svg class="h-ico"><use href="#i-key"/></svg> Remote access to this PC</h2><span class="hint-inline" id="remote-hint">Off — nobody can connect without you</span></div>
+        <div class="toggle-list">
+          <label class="toggle"><svg class="t-ico"><use href="#i-key"/></svg><span class="t-text"><b>Allow remote access with an access code</b><small>Use this PC from anywhere, with no one here to click Allow. Off by default.</small></span><input type="checkbox" id="remote-toggle"><i class="switch"></i></label>
+        </div>
+        <div id="remote-details" hidden>
+          <div class="status-banner" id="remote-status">Starting…</div>
+          <div class="remote-code-row">
+            <div class="code-display secret" id="remote-code" aria-label="Access code">PA-••••-••••-••••-••••-••••-••••-••••-••••</div>
+          </div>
+          <div class="action-row">
+            <button id="remote-copy" class="btn primary" type="button"><svg><use href="#i-copy"/></svg> Copy access code</button>
+            <button id="remote-show" class="btn" type="button">Show</button>
+            <button id="remote-new" class="btn ghost" type="button" title="The old code stops working at once">New code</button>
+            <span id="remote-copy-status" class="muted" role="status"></span>
+          </div>
+          <div class="setup-box" id="remote-setup" hidden>
+            <b>One-time setup on this PC</b>
+            <p class="muted small" id="remote-setup-text">Your desktop must allow screen sharing and remote control once. Click the button, pick the screen, and keep <b>Allow restoring</b> (or <b>Remember</b>) ticked.</p>
+            <button id="remote-prepare" class="btn primary" type="button">Allow screen access</button>
+            <span id="remote-prepare-status" class="muted small" role="status"></span>
+          </div>
+          <div class="toggle-list compact">
+            <label class="toggle" id="remote-login-row"><svg class="t-ico"><use href="#i-power"/></svg><span class="t-text"><b>Start Penguin Stream when I log in</b><small>So remote access keeps working after a restart (in the tray, no window)</small></span><input type="checkbox" id="remote-login"><i class="switch"></i></label>
+            <label class="toggle"><svg class="t-ico"><use href="#i-bolt"/></svg><span class="t-text"><b>Keep this PC awake</b><small>A PC that goes to sleep cannot be reached</small></span><input type="checkbox" id="remote-awake" data-setting="remoteKeepAwake"><i class="switch"></i></label>
+          </div>
+          <p class="muted small">Treat the access code like a password: it opens this PC without asking. Use it on your own devices only.
+            If it ever leaks, click <b>New code</b> — the old one stops working at once. Every connection is shown here, as a desktop notification and in the Activity log.</p>
+        </div>
+      </div>
+
       <div class="feature-row">
         <div class="feature"><svg><use href="#i-bolt"/></svg><div><b>Low latency</b><small>Hardware H.264, no frame buffering, direct UDP</small></div></div>
         <div class="feature"><svg><use href="#i-shield"/></svg><div><b>End-to-end encrypted</b><small>Noise handshake + words you verify</small></div></div>
@@ -123,15 +156,16 @@
     <section class="page" id="page-connect">
       <div class="card narrow">
         <h2>Connect to a desktop</h2>
-        <p class="muted">Paste the invitation the host sent you. They will be asked to approve you.</p>
+        <p class="muted">Paste the invitation the host sent you — they will be asked to approve you. Or paste the <b>access code</b> of your own PC (starts with PA-) to use it remotely.</p>
         <div class="reconnect-last" id="reconnect-last" hidden>
           <button class="btn primary wide" type="button" id="btn-reconnect-last">Reconnect to the last host</button>
-          <small class="muted">Uses the invitation that worked last time. The host keeps the same one unless they make a new code.</small>
+          <small class="muted" id="reconnect-last-hint">Uses the invitation that worked last time. The host keeps the same one unless they make a new code.</small>
         </div>
         <form id="connect-form">
-          <input id="code-input" class="code-input" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" autocomplete="off"
-                 spellcheck="false" maxlength="256" aria-label="Invitation">
+          <input id="code-input" class="code-input" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX  or  PA-XXXX-…" autocomplete="off"
+                 spellcheck="false" maxlength="256" aria-label="Invitation or access code">
           <div class="toggle-list compact">
+            <label class="toggle" id="remember-row" hidden><svg class="t-ico"><use href="#i-key"/></svg><span class="t-text"><b>Remember this PC on this device</b><small>One click next time. Anyone using this device could then open that PC.</small></span><input type="checkbox" id="code-remember"><i class="switch"></i></label>
             <label class="toggle"><svg class="t-ico"><use href="#i-kbm"/></svg><span class="t-text"><b>Send my keyboard &amp; mouse</b></span><input type="checkbox" id="view-send-kbm" data-setting="sendKbm"><i class="switch"></i></label>
             <label class="toggle"><svg class="t-ico"><use href="#i-pad"/></svg><span class="t-text"><b>Send my controllers</b></span><input type="checkbox" id="view-send-pad" data-setting="sendPad"><i class="switch"></i></label>
           </div>
@@ -145,6 +179,15 @@
 
     <!-- HOSTING ---------------------------------------------------------->
     <section class="page" id="page-hosting">
+      <div class="card remote-live" id="remote-live" hidden>
+        <div class="card-head"><h2><svg class="h-ico"><use href="#i-key"/></svg> Remote access session</h2><span class="hint-inline" id="remote-live-since"></span></div>
+        <p id="remote-live-text">Someone connected with this PC's access code. They can see and control this PC.</p>
+        <div class="action-row">
+          <button class="btn danger" id="remote-end" type="button">End session</button>
+          <button class="btn ghost" id="remote-off-live" type="button">Turn off remote access</button>
+        </div>
+      </div>
+
       <div class="steps" id="host-steps">
         <div class="step" data-step="invite"><i>1</i><span>Send invitation</span></div>
         <div class="step" data-step="verify"><i>2</i><span>Verify words</span></div>
@@ -195,7 +238,7 @@
         <div class="input-status" id="host-input-status"></div>
       </div>
 
-      <button class="btn danger wide" data-stop>Stop sharing</button>
+      <button class="btn danger wide" data-stop id="host-stop">Stop sharing</button>
     </section>
 
     <!-- VIEWING ---------------------------------------------------------->
